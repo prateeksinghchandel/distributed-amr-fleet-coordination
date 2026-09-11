@@ -123,7 +123,7 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
             const robot = worldRef.current.getSelectedRobot();
             if (robot) {
                 robot.setTarget(worldPos.x, worldPos.y);
-                onLog(`R1 target set to (${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)})`);
+                onLog(`${robot.id} target set to (${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)})`);
             }
             return;
         }

@@ -15,6 +15,8 @@ export class World {
 
     addRobot(id, x = 5 + Math.random() * 40, y = 3 + Math.random() * 24) {
         const robot = new Robot(id, x, y);
+        robot.x = robot.clampToBounds(robot.x, robot.radius, this.width);
+        robot.y = robot.clampToBounds(robot.y, robot.radius, this.height);
         this.robots.push(robot);
         if (!this.selectedRobotId) {
             this.selectedRobotId = robot.id;
@@ -52,9 +54,8 @@ export class World {
     }
 
     update(dt) {
-        const robot = this.getSelectedRobot();
-        if (robot) {
-            robot.update(dt, this.obstacles);
+        for (const robot of this.robots) {
+            robot.update(dt, this.obstacles, { width: this.width, height: this.height });
         }
     }
 

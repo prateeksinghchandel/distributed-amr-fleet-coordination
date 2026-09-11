@@ -20,10 +20,20 @@ export class Robot {
         this.blocked = false;
     }
 
-    update(dt, obstacles = []) {
+    update(dt, obstacles = [], bounds = null) {
         if (this.status !== "MOVING" || this.targetX === null || this.targetY === null) {
             this.speed = 0;
             return;
+        }
+
+        // Keep the robot's whole footprint inside the warehouse, not just its
+        // centre point.  Clamp targets as well as the next motion step so an
+        // externally supplied target cannot move a robot outside the world.
+        if (bounds) {
+            this.targetX = this.clampToBounds(this.targetX, this.radius, bounds.width);
+            this.targetY = this.clampToBounds(this.targetY, this.radius, bounds.height);
+            this.x = this.clampToBounds(this.x, this.radius, bounds.width);
+            this.y = this.clampToBounds(this.y, this.radius, bounds.height);
         }
 
         const dx = this.targetX - this.x;
@@ -52,7 +62,7 @@ export class Robot {
             let newX = this.x + vx * dt;
             let newY = this.y + vy * dt;
 
-            if (this.checkCollision(newX, newY, obstacles)) {
+            if (this.checkCollision(newX, newY, obstacles) || !this.isWithinBounds(newX, newY, bounds)) {
                 this.blocked = true;
                 this.speed = 0;
                 return;
@@ -77,6 +87,22 @@ export class Robot {
             }
         }
         return false;
+    }
+
+    clampToBounds(value, radius, size) {
+        // A warehouse smaller than a robot can only safely hold its centre.
+        const min = Math.min(radius, size / 2);
+        const max = Math.max(min, size - radius);
+        return Math.max(min, Math.min(value, max));
+    }
+
+    isWithinBounds(x, y, bounds) {
+        return !bounds || (
+            x - this.radius >= 0 &&
+            x + this.radius <= bounds.width &&
+            y - this.radius >= 0 &&
+            y + this.radius <= bounds.height
+        );
     }
 }
 
