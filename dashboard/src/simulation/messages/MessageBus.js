@@ -9,6 +9,10 @@ export class MessageBus {
         this.nowFn = () => 0;
     }
 
+    get transportKind() {
+        return 'in-memory';
+    }
+
     setClock(fn) {
         this.nowFn = fn;
     }

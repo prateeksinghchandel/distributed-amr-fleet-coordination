@@ -5,4 +5,5 @@ export const TOPICS = {
     BID_PLACED: 'auction/bids',
     AUCTION_RESULT: 'auction/results',
     ROBOT_TELEMETRY: 'robots/telemetry',
+    WORLD_STATE: 'world/state',
 };

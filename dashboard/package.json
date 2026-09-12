@@ -8,9 +8,15 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test:sim": "node sim-smoke.test.mjs"
+    "test:sim": "node sim-smoke.test.mjs",
+    "test:transport": "node transport.test.mjs",
+    "test:distributed": "node test/distributed-fleet.test.mjs",
+    "fleet": "bash scripts/start-fleet.sh",
+    "fleet:stop": "bash scripts/start-fleet.sh --stop",
+    "zenohd": "bash scripts/zenohd.sh"
   },
   "dependencies": {
+    "@eclipse-zenoh/zenoh-ts": "^1.10.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

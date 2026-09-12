@@ -151,9 +151,14 @@ export class FleetAgent {
     tryFinalize(taskId, now) {
         const round = this.rounds.get(taskId);
         if (!round || round.done) return;
+        if (this.hooks.disableFinalize) return;
         const allResponded = round.bids.size >= round.rosterSize;
         const deadlinePassed = now >= round.deadline;
         if (allResponded || deadlinePassed) this.finalize(taskId);
+    }
+
+    forgetRound(taskId) {
+        this.rounds.delete(taskId);
     }
 
     finalize(taskId) {
@@ -164,9 +169,18 @@ export class FleetAgent {
         const bids = [...round.bids.values()];
         const winner = selectWinner(bids);
         let committed = false;
-        if (winner && winner === this.robot.id) {
-            committed = this.hooks.onAssign(taskId);
-            this.hooks.onEvent(`[AUCTION] ${taskId} ${committed ? 'assigned to' : 'commit failed for'} ${this.robot.id}`);
+        if (winner) {
+            if (typeof this.hooks.coordinatorCommit === 'function') {
+                committed = this.hooks.coordinatorCommit(taskId, winner, bids);
+                this.hooks.onEvent(
+                    committed
+                        ? `[AUCTION] ${taskId} committed for ${winner} by coordinator`
+                        : `[AUCTION] ${taskId} commit failed for ${winner}`
+                );
+            } else if (winner === this.robot.id) {
+                committed = this.hooks.onAssign(taskId);
+                this.hooks.onEvent(`[AUCTION] ${taskId} ${committed ? 'assigned to' : 'commit failed for'} ${this.robot.id}`);
+            }
         }
         this.bus.publish(TOPICS.AUCTION_RESULT, { taskId, winner, bids, committed }, { sender: this.robot.id });
     }
@@ -177,6 +191,7 @@ export class FleetAgent {
             this.telemetryTimer += AUCTION_CONSTANTS.TELEMETRY_PERIOD;
             this.publishTelemetry();
         }
+        if (this.hooks.disableFinalize) return;
         for (const round of this.rounds.values()) {
             if (!round.done && now >= round.deadline) {
                 this.finalize(round.taskId);
@@ -185,6 +200,7 @@ export class FleetAgent {
     }
 
     publishTelemetry() {
+        if (this.hooks.suppressTelemetry) return;
         const robot = this.robot;
         this.bus.publish(TOPICS.ROBOT_TELEMETRY, {
             robotId: robot.id,

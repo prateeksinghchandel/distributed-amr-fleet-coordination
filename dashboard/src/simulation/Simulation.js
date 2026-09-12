@@ -2,7 +2,7 @@ import { Warehouse, clampNum } from './Warehouse.js';
 import { Robot, ROBOT_STATUS } from './Robot.js';
 import { Task, TASK_STATUS } from './Task.js';
 import { validateTask, TASK_POINT_PADDING } from './TaskGenerator.js';
-import { MessageBus } from './messages/MessageBus.js';
+import { createTransport } from './messages/transport.js';
 import { TOPICS } from './messages/topics.js';
 import { FleetAgent, AUCTION_CONSTANTS, telemetryOf } from './fleet/FleetAgent.js';
 
@@ -18,7 +18,7 @@ const MAX_EVENTS = 500;
 const MAX_AUCTION_HISTORY = 20;
 
 export class Simulation {
-    constructor(width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT) {
+    constructor(width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT, transportOptions) {
         this.warehouse = new Warehouse(width, height);
         this.selectedRobotId = null;
         this.selectedObstacleId = null;
@@ -27,8 +27,8 @@ export class Simulation {
         this.time = 0;
         this.events = [];
         this.onEvent = null;
-        this.bus = new MessageBus();
-        this.bus.setClock(() => this.time);
+        this.transportOptions = transportOptions || {};
+        this.bus = createTransport(() => this.time, this.transportOptions);
         this.agents = new Map();
         this.auctionEnabled = true;
         this.auctionQueue = [];
@@ -490,14 +490,14 @@ export class Simulation {
     }
 
     reset() {
+        if (this.bus && typeof this.bus.dispose === 'function') this.bus.dispose();
         this.warehouse = new Warehouse(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         this.selectedRobotId = null;
         this.selectedObstacleId = null;
         this.running = true;
         this.speed = 1;
         this.time = 0;
-        this.bus = new MessageBus();
-        this.bus.setClock(() => this.time);
+        this.bus = createTransport(() => this.time, this.transportOptions);
         this.agents = new Map();
         this.auctions = [];
         this.auctionEnabled = true;
@@ -512,6 +512,6 @@ export class Simulation {
     }
 }
 
-export function createSimulation(width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT) {
-    return new Simulation(width, height);
+export function createSimulation(width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT, transportOptions) {
+    return new Simulation(width, height, transportOptions);
 }
