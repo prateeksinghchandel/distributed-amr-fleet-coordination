@@ -88,6 +88,75 @@ sim.reset();
 if (sim.robots.length !== 3 || sim.tasks.length !== 0 || sim.obstacles.length !== 0) errors.push('reset failed');
 if (!sim.running || sim.speed !== 1 || sim.width !== 30 || sim.height !== 20) errors.push('reset defaults failed');
 
+// ---- Stage 2: P2P auction ----
+const sim2 = createSimulation(30, 20);
+if (sim2.agents.size !== 3) errors.push('agents not created for fleet');
+if (!sim2.auctionEnabled) errors.push('auction should be enabled by default');
+for (let i = 0; i < 20; i++) sim2.step(1 / 60);
+
+const at1 = sim2.createTask({ x: 5, y: 8 }, { x: 25, y: 15 }, true);
+if (!at1) errors.push('auction task create failed');
+if (sim2.auctionInFlightId !== at1.id) errors.push('auction not started for announced task');
+if (sim2.auctionQueue.length !== 0) errors.push('auction queue not drained');
+if (sim2.bus.pendingCount() === 0) errors.push('no messages in transit after announce');
+
+let auctioned = false;
+for (let i = 0; i < 40 * 60; i++) {
+    sim2.step(1 / 60);
+    if (at1.status !== TASK_STATUS.PENDING) { auctioned = true; break; }
+}
+for (let i = 0; i < 10; i++) sim2.step(1 / 60);
+if (!auctioned || !at1.assignedRobotId) errors.push(`auction never assigned task, status=${at1.status}`);
+if (at1.status !== TASK_STATUS.ASSIGNED) errors.push(`auction assignment status wrong: ${at1.status}`);
+const res1 = sim2.auctions.find((a) => a.taskId === at1.id);
+if (!res1) errors.push('auction result not recorded');
+if (res1.winner !== at1.assignedRobotId) errors.push('auction winner mismatch');
+const numericBids = res1.bids.filter((b) => typeof b.bid === 'number');
+if (numericBids.length === 0) errors.push('no numeric bids in result');
+const minBid = Math.min(...numericBids.map((b) => b.bid));
+const winnerBid = res1.bids.find((b) => b.robotId === res1.winner);
+if (!winnerBid || Math.abs(winnerBid.bid - minBid) > 1e-9) errors.push('winner bid not minimal');
+if (!sim2.events.some((e) => e.message.includes('[AUCTION]'))) errors.push('no [AUCTION] events logged');
+
+let at1done = false;
+for (let i = 0; i < 40 * 60; i++) {
+    sim2.step(1 / 60);
+    if (at1.status === TASK_STATUS.COMPLETED) { at1done = true; break; }
+}
+if (!at1done) errors.push('at1 never completed');
+
+sim2.robots.find((r) => r.id === 'AMR3').online = false;
+const at2 = sim2.createTask({ x: 8, y: 8 }, { x: 22, y: 16 }, true);
+let offlineAssigned = false;
+for (let i = 0; i < 40 * 60; i++) {
+    sim2.step(1 / 60);
+    if (at2.status !== TASK_STATUS.PENDING) { offlineAssigned = true; break; }
+}
+if (!offlineAssigned) errors.push('auction with offline robot never assigned (deadline)');
+if (at2.assignedRobotId === 'AMR3') errors.push('offline robot won auction');
+
+sim2.setAuctionEnabled(false);
+const at3 = sim2.createTask({ x: 6, y: 6 }, { x: 20, y: 12 }, true);
+for (let i = 0; i < 40 * 60; i++) sim2.step(1 / 60);
+if (at3.status !== TASK_STATUS.PENDING) errors.push('task assigned while auction disabled');
+if (sim2.auctionInFlightId !== null) errors.push('in-flight not null while auction disabled');
+
+sim2.setAuctionEnabled(true);
+let afterEnable = false;
+for (let i = 0; i < 40 * 60; i++) {
+    sim2.step(1 / 60);
+    if (at3.status !== TASK_STATUS.PENDING) { afterEnable = true; break; }
+}
+if (!afterEnable || !at3.assignedRobotId) errors.push('task not auctioned after re-enable');
+
+sim2.reset();
+if (sim2.agents.size !== 3) errors.push('reset did not recreate agents');
+if (sim2.auctions.length !== 0) errors.push('reset did not clear auction history');
+if (sim2.auctionQueue.length !== 0 || sim2.auctionInFlightId !== null) errors.push('reset did not clear auction state');
+if (sim2.waitingTasks.size !== 0) errors.push('reset did not clear waiting tasks');
+if (sim2.bus.pendingCount() !== 0) errors.push('reset did not clear message bus');
+if (!sim2.auctionEnabled) errors.push('reset should restore auction enabled');
+
 console.log('events:', sim.events.length);
 if (errors.length) {
     console.error('FAILURES:');

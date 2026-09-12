@@ -1,6 +1,7 @@
 import React from 'react';
 import WarehousePanel from './WarehousePanel.jsx';
 import TaskPanel from './TaskPanel.jsx';
+import AuctionPanel from './AuctionPanel.jsx';
 
 export default function Sidebar({ simulation, mode, setMode, onMutate }) {
     return (
@@ -22,6 +23,7 @@ export default function Sidebar({ simulation, mode, setMode, onMutate }) {
                 </div>
             </div>
             <WarehousePanel simulation={simulation} mode={mode} setMode={setMode} onMutate={onMutate} />
+            <AuctionPanel simulation={simulation} onMutate={onMutate} />
             <TaskPanel simulation={simulation} onMutate={onMutate} />
         </div>
     );

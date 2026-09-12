@@ -2,15 +2,20 @@ import { Warehouse, clampNum } from './Warehouse.js';
 import { Robot, ROBOT_STATUS } from './Robot.js';
 import { Task, TASK_STATUS } from './Task.js';
 import { validateTask, TASK_POINT_PADDING } from './TaskGenerator.js';
+import { MessageBus } from './messages/MessageBus.js';
+import { TOPICS } from './messages/topics.js';
+import { FleetAgent, AUCTION_CONSTANTS, telemetryOf } from './fleet/FleetAgent.js';
 
 export const DEFAULT_WIDTH = 30;
 export const DEFAULT_HEIGHT = 20;
 export const MIN_DIM = 4;
 export const MAX_DIM = 100;
 export const MAX_RANDOM_TASKS = 100;
+export const MAX_AUCTION_RETRIES = 3;
 
 const ROBOT_COLORS = ['#00c8ff', '#00d084', '#ffa94d', '#f06595', '#b197fc', '#ffd43b'];
 const MAX_EVENTS = 500;
+const MAX_AUCTION_HISTORY = 20;
 
 export class Simulation {
     constructor(width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT) {
@@ -22,7 +27,18 @@ export class Simulation {
         this.time = 0;
         this.events = [];
         this.onEvent = null;
+        this.bus = new MessageBus();
+        this.bus.setClock(() => this.time);
+        this.agents = new Map();
+        this.auctionEnabled = true;
+        this.auctionQueue = [];
+        this.auctionInFlightId = null;
+        this.auctionRetries = new Map();
+        this.waitingTasks = new Set();
+        this.resultSeen = new Set();
+        this.auctions = [];
         this.createDefaultFleet();
+        this.bindCommunication();
     }
 
     get width() {
@@ -62,10 +78,130 @@ export class Simulation {
 
     step(dt) {
         this.time += dt;
+        this.bus.deliverDue(this.time);
         for (const robot of this.robots) {
             robot.update(dt, this.obstacles, this.bounds, (msg) => this.emit(msg));
         }
+        for (const agent of this.agents.values()) {
+            agent.tick(dt, this.time);
+        }
         this.syncTasks();
+        this.reconsiderWaitingTasks();
+        this.advanceAuction();
+    }
+
+    bindCommunication() {
+        this.bus.subscribe(TOPICS.AUCTION_RESULT, ({ payload }) => this.handleAuctionResult(payload));
+    }
+
+    spawnAgent(robot) {
+        if (this.agents.has(robot.id)) this.agents.get(robot.id).destroy();
+        const agent = new FleetAgent(robot, this.bus, {
+            onEvent: (msg) => this.emit(msg),
+            onAssign: (taskId) => this.assignTask(taskId, robot.id, { source: 'auction' }),
+            getFleetSnapshot: () => this.robots.map((r) => telemetryOf(r)),
+            getObstacles: () => this.obstacles,
+        });
+        this.agents.set(robot.id, agent);
+        return agent;
+    }
+
+    announceTask(task) {
+        this.bus.publish(TOPICS.TASK_NEW, {
+            taskId: task.id,
+            pickup: { x: task.pickup.x, y: task.pickup.y },
+            dropoff: { x: task.dropoff.x, y: task.dropoff.y },
+            priority: task.priority,
+        }, { sender: 'server', delay: AUCTION_CONSTANTS.ANNOUNCE_DELAY });
+    }
+
+    advanceAuction() {
+        if (this.auctionInFlightId) return;
+        if (!this.auctionEnabled) return;
+        while (this.auctionQueue.length > 0) {
+            const taskId = this.auctionQueue.shift();
+            const task = this.tasks.find((t) => t.id === taskId);
+            if (!task || task.status !== TASK_STATUS.PENDING) continue;
+            if (!this.anyEligibleRobot()) {
+                this.waitingTasks.add(taskId);
+                this.emit(`[AUCTION] Task ${taskId} deferred (no eligible robot)`);
+                continue;
+            }
+            this.auctionInFlightId = taskId;
+            this.emit(`[AUCTION] Task ${taskId} announced to ${this.agents.size} robot(s)`);
+            this.announceTask(task);
+            return;
+        }
+    }
+
+    reconsiderWaitingTasks() {
+        if (this.waitingTasks.size === 0 || !this.anyEligibleRobot()) return;
+        for (const taskId of [...this.waitingTasks]) {
+            const task = this.tasks.find((t) => t.id === taskId);
+            if (task && task.status === TASK_STATUS.PENDING) this.auctionQueue.push(taskId);
+        }
+        this.waitingTasks.clear();
+    }
+
+    anyEligibleRobot() {
+        return this.robots.some(
+            (r) => r.online && (r.currentTaskId === null || r.status === ROBOT_STATUS.COMPLETED)
+        );
+    }
+
+    handleAuctionResult({ taskId, winner, bids }) {
+        const task = this.tasks.find((t) => t.id === taskId);
+        if (!task || task.status === TASK_STATUS.CANCELLED) return;
+        if (this.resultSeen.has(taskId)) return;
+        this.resultSeen.add(taskId);
+        if (this.auctionInFlightId === taskId) this.auctionInFlightId = null;
+        const committed = Boolean(task.status !== TASK_STATUS.PENDING);
+        this.recordAuction({ taskId, winner, bids, committed });
+        if (!committed && task && task.status !== TASK_STATUS.CANCELLED) {
+            if (winner === null) {
+                this.waitingTasks.add(taskId);
+                this.emit(`[AUCTION] Task ${taskId} deferred (no eligible robot)`);
+            } else {
+                const retries = (this.auctionRetries.get(taskId) || 0) + 1;
+                if (retries <= MAX_AUCTION_RETRIES) {
+                    this.auctionRetries.set(taskId, retries);
+                    this.auctionQueue.unshift(taskId);
+                    this.emit(`[AUCTION] Task ${taskId} re-queued for auction (attempt ${retries})`);
+                } else {
+                    this.auctionRetries.delete(taskId);
+                    this.waitingTasks.add(taskId);
+                    this.emit(`[AUCTION] Task ${taskId} deferred (commit failed ${retries}×)`);
+                }
+            }
+        }
+        this.advanceAuction();
+    }
+
+    recordAuction({ taskId, winner, bids, committed }) {
+        this.auctions.push({
+            taskId,
+            winner,
+            bids: (bids || []).map((b) => ({
+                robotId: b.robotId,
+                bid: b.bid,
+                costs: b.costs,
+                reason: b.reason || null,
+            })),
+            reason: winner ? (committed ? null : 'commit failed') : 'no eligible robot',
+            time: new Date().toLocaleTimeString(),
+        });
+        if (this.auctions.length > MAX_AUCTION_HISTORY) this.auctions.shift();
+    }
+
+    setAuctionEnabled(enabled) {
+        this.auctionEnabled = Boolean(enabled);
+        if (!this.auctionEnabled) {
+            this.auctionInFlightId = null;
+            this.auctionQueue = [];
+            this.auctionRetries.clear();
+            this.waitingTasks.clear();
+        }
+        this.emit(`[AUCTION] auto-assign via auction ${this.auctionEnabled ? 'enabled' : 'disabled'}`);
     }
 
     createDefaultFleet() {
@@ -94,6 +230,7 @@ export class Simulation {
         robot.y = robot.clampToBounds(robot.y, robot.radius, this.height);
         robot.color = ROBOT_COLORS[this.robots.length % ROBOT_COLORS.length];
         this.robots.push(robot);
+        this.spawnAgent(robot);
         if (!this.selectedRobotId) this.selectedRobotId = robot.id;
         this.emit(`Robot ${robot.id} added at (${robot.x.toFixed(1)}, ${robot.y.toFixed(1)})`);
         return robot;
@@ -138,8 +275,19 @@ export class Simulation {
                 continue;
             }
             task.status = TASK_STATUS.CANCELLED;
+            this.waitingTasks.delete(task.id);
+            this.bus.publish(TOPICS.TASK_CANCELLED, { taskId: task.id }, { sender: 'server' });
             this.emit(`Task ${task.id} cancelled (outside updated warehouse)`);
         }
+        this.auctionQueue = this.auctionQueue.filter((id) => {
+            const t = this.tasks.find((tt) => tt.id === id);
+            return t && t.status === TASK_STATUS.PENDING;
+        });
+        if (this.auctionInFlightId) {
+            const t = this.tasks.find((tt) => tt.id === this.auctionInFlightId);
+            if (!t || t.status !== TASK_STATUS.PENDING) this.auctionInFlightId = null;
+        }
+        this.advanceAuction();
         this.emit(`Warehouse resized to ${w}×${h}`);
     }
 
@@ -159,7 +307,7 @@ export class Simulation {
         this.warehouse.moveObstacle(id, x, y);
     }
 
-    createTask(pickup, dropoff) {
+    createTask(pickup, dropoff, announce = false) {
         const error = validateTask(this.warehouse, pickup, dropoff);
         if (error) {
             this.emit(error);
@@ -168,6 +316,10 @@ export class Simulation {
         const task = new Task(pickup, dropoff);
         this.tasks.push(task);
         this.emit(`Task ${task.id} created (${pickup.x.toFixed(1)}, ${pickup.y.toFixed(1)}) → (${dropoff.x.toFixed(1)}, ${dropoff.y.toFixed(1)})`);
+        if (announce) {
+            this.auctionQueue.push(task.id);
+            this.advanceAuction();
+        }
         return task;
     }
 
@@ -178,7 +330,7 @@ export class Simulation {
         }
         let created = 0;
         for (const p of pickupPoints) {
-            if (this.createTask(p, dropoff)) created += 1;
+            if (this.createTask(p, dropoff, true)) created += 1;
         }
         this.emit(`Same-dropoff generation: ${created} task(s) created`);
         return created;
@@ -196,6 +348,8 @@ export class Simulation {
                 const task = new Task(pickup, dropoff);
                 this.tasks.push(task);
                 this.emit(`Task ${task.id} created (${pickup.x.toFixed(1)}, ${pickup.y.toFixed(1)}) → (${dropoff.x.toFixed(1)}, ${dropoff.y.toFixed(1)})`);
+                this.auctionQueue.push(task.id);
+                this.advanceAuction();
                 created += 1;
             }
         }
@@ -203,7 +357,7 @@ export class Simulation {
         return created;
     }
 
-    assignTask(taskId, robotId) {
+    assignTask(taskId, robotId, options = {}) {
         const task = this.tasks.find((t) => t.id === taskId);
         const robot = this.robots.find((r) => r.id === robotId);
         if (!task) {
@@ -226,10 +380,27 @@ export class Simulation {
             this.emit(`Cannot assign ${task.id}: task is ${task.status}`);
             return false;
         }
+        if (options.source === 'auction' && !this.auctionEnabled) {
+            this.emit(`Cannot assign ${task.id}: auction disabled`);
+            return false;
+        }
         task.assignedRobotId = robot.id;
         task.status = TASK_STATUS.ASSIGNED;
         robot.startTask(task);
-        this.emit(`${robot.id} started task ${task.id}`);
+        this.auctionQueue = this.auctionQueue.filter((id) => id !== task.id);
+        this.auctionRetries.delete(task.id);
+        this.waitingTasks.delete(task.id);
+        if (this.auctionInFlightId === task.id) {
+            this.auctionInFlightId = null;
+            this.advanceAuction();
+        }
+        this.bus.publish(TOPICS.TASK_ASSIGNED, {
+            taskId: task.id,
+            robotId: robot.id,
+            source: options.source || 'manual',
+        }, { sender: options.source === 'auction' ? robot.id : 'dashboard' });
+        const via = options.source === 'auction' ? ' (via auction)' : '';
+        this.emit(`${robot.id} started task ${task.id}${via}`);
         return true;
     }
 
@@ -244,6 +415,14 @@ export class Simulation {
             task.assignedRobotId = null;
         }
         task.status = TASK_STATUS.CANCELLED;
+        this.auctionQueue = this.auctionQueue.filter((id) => id !== task.id);
+        this.auctionRetries.delete(task.id);
+        this.waitingTasks.delete(task.id);
+        if (this.auctionInFlightId === task.id) {
+            this.auctionInFlightId = null;
+            this.advanceAuction();
+        }
+        this.bus.publish(TOPICS.TASK_CANCELLED, { taskId: task.id }, { sender: 'dashboard' });
         this.emit(`Task ${task.id} cancelled`);
     }
 
@@ -317,7 +496,18 @@ export class Simulation {
         this.running = true;
         this.speed = 1;
         this.time = 0;
+        this.bus = new MessageBus();
+        this.bus.setClock(() => this.time);
+        this.agents = new Map();
+        this.auctions = [];
+        this.auctionEnabled = true;
+        this.auctionQueue = [];
+        this.auctionInFlightId = null;
+        this.auctionRetries.clear();
+        this.waitingTasks.clear();
+        this.resultSeen.clear();
         this.createDefaultFleet();
+        this.bindCommunication();
         this.emit('Simulation reset');
     }
 }
