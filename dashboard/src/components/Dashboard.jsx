@@ -1,90 +1,93 @@
-import React, { useState, useCallback, useRef } from 'react';
-import WarehouseCanvas from './WarehouseCanvas.jsx';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import Header from './Header.jsx';
 import Sidebar from './Sidebar.jsx';
-import { createWorld } from '../simulation/World.js';
+import WarehouseCanvas from './WarehouseCanvas.jsx';
+import FleetPanel from './FleetPanel.jsx';
+import BottomPanel from './BottomPanel.jsx';
+import { createSimulation } from '../simulation/Simulation.js';
 
-const worldInstance = createWorld();
+const simulation = createSimulation();
 
 export default function Dashboard() {
     const [, setTick] = useState(0);
     const lastWorldSyncRef = useRef(0);
+    const simEventsSeenRef = useRef(simulation.events.length);
+    const [logs, setLogs] = useState(() =>
+        simulation.events.map((e) => `[${e.time}] ${e.message}`)
+    );
     const [mode, setMode] = useState('default');
-    const [logs, setLogs] = useState([]);
-    const [debugInfo, setDebugInfo] = useState({});
+    const [debug, setDebug] = useState({});
     const [cameraResetToken, setCameraResetToken] = useState(0);
+    const [resetVersion, setResetVersion] = useState(0);
 
-    const world = worldInstance;
-
-    const addLog = useCallback((msg) => {
-        setLogs(prev => [...prev.slice(-99), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    useEffect(() => {
+        simulation.onEvent = (entry) => {
+            setLogs((prev) => [...prev.slice(-399), `[${entry.time}] ${entry.message}`]);
+        };
+        const pending = simulation.events.slice(simEventsSeenRef.current);
+        simEventsSeenRef.current = simulation.events.length;
+        if (pending.length > 0) {
+            setLogs((prev) => [...prev, ...pending.map((e) => `[${e.time}] ${e.message}`)]);
+        }
+        return () => {
+            simulation.onEvent = null;
+        };
     }, []);
 
-    const handleWorldUpdate = useCallback((_w) => {
+    const handleWorldUpdate = useCallback((_sim) => {
         const now = performance.now();
         if (now - lastWorldSyncRef.current > 100) {
             lastWorldSyncRef.current = now;
-            setTick(t => t + 1);
+            setTick((t) => t + 1);
         }
     }, []);
 
-    const handleCameraChange = useCallback((info) => {
-        setDebugInfo(info);
+    const handleMutate = useCallback(() => {
+        setTick((t) => t + 1);
+    }, []);
+
+    const handleReset = useCallback(() => {
+        simulation.reset();
+        setResetVersion((v) => v + 1);
+        setTick((t) => t + 1);
     }, []);
 
     const handleResetCamera = useCallback(() => {
-        setCameraResetToken(t => t + 1);
-        addLog('Camera reset');
-    }, [addLog]);
-
-    const handleAddRobot = useCallback(() => {
-        const id = `R${world.robots.length + 1}`;
-        const x = 5 + Math.random() * 40;
-        const y = 3 + Math.random() * 24;
-        world.addRobot(id, x, y);
-        setTick(t => t + 1);
-        addLog(`Robot ${id} added at (${x.toFixed(2)}, ${y.toFixed(2)})`);
-    }, [addLog, world]);
-
-    const handleLog = useCallback((msg) => {
-        addLog(msg);
-    }, [addLog]);
-
-    const handleMutate = useCallback(() => {
-        setTick(t => t + 1);
+        setCameraResetToken((t) => t + 1);
     }, []);
 
     return (
-        <div style={{ display: 'flex', width: '100vw', height: '100vh', background: '#0a0a1a', color: '#e0e0e0', fontFamily: 'monospace' }}>
-            <Sidebar
-                world={world}
-                mode={mode}
-                setMode={setMode}
-                onResetCamera={handleResetCamera}
-                onAddRobot={handleAddRobot}
-                onLog={handleLog}
-                debug={debugInfo}
-                onMutate={handleMutate}
-            />
-            <div style={{ flex: 1, position: 'relative' }}>
-                <WarehouseCanvas
-                    world={world}
+        <div style={{
+            height: '100vh',
+            width: '100vw',
+            display: 'flex',
+            flexDirection: 'column',
+            background: '#0a0a1a',
+            color: '#e0e0e0',
+            fontFamily: 'monospace'
+        }}>
+            <Header simulation={simulation} onMutate={handleMutate} onReset={handleReset} onResetCamera={handleResetCamera} />
+            <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+                <Sidebar
+                    key={resetVersion}
+                    simulation={simulation}
                     mode={mode}
-                    cameraResetToken={cameraResetToken}
-                    onWorldUpdate={handleWorldUpdate}
-                    onLog={handleLog}
-                    onCameraChange={handleCameraChange}
+                    setMode={setMode}
                     onMutate={handleMutate}
                 />
+                <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+                    <WarehouseCanvas
+                        simulation={simulation}
+                        mode={mode}
+                        cameraResetToken={cameraResetToken}
+                        onWorldUpdate={handleWorldUpdate}
+                        onCameraChange={setDebug}
+                        onMutate={handleMutate}
+                    />
+                </div>
+                <FleetPanel simulation={simulation} onMutate={handleMutate} />
             </div>
-            <div style={{
-                width: 280, minWidth: 280, background: '#16213e', borderLeft: '2px solid #0f3460',
-                padding: 12, overflowY: 'auto', fontSize: 11
-            }}>
-                <div style={{ color: '#e94560', fontWeight: 'bold', marginBottom: 8 }}>EVENT LOG</div>
-                {logs.slice(-99).reverse().map((log, i) => (
-                    <div key={i} style={{ padding: '2px 0', color: '#aaa', borderBottom: '1px solid #222', wordBreak: 'break-all' }}>{log}</div>
-                ))}
-            </div>
+            <BottomPanel logs={logs} debug={debug} simulation={simulation} />
         </div>
     );
 }

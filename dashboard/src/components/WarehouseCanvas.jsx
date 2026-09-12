@@ -1,10 +1,10 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { Renderer } from '../rendering/renderer.js';
 
-export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorldUpdate, onLog, onCameraChange, onMutate }) {
+export default function WarehouseCanvas({ simulation, mode, cameraResetToken, onWorldUpdate, onCameraChange, onMutate }) {
     const canvasRef = useRef(null);
     const rendererRef = useRef(null);
-    const worldRef = useRef(world);
+    const simRef = useRef(simulation);
     const animFrameRef = useRef(null);
     const lastTimeRef = useRef(0);
     const mouseWorldRef = useRef({ x: null, y: null });
@@ -18,14 +18,15 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
     const obstacleMoveRef = useRef(null);
     const onWorldUpdateRef = useRef(onWorldUpdate);
     const onCameraChangeRef = useRef(onCameraChange);
+    const onMutateRef = useRef(onMutate);
 
     useEffect(() => {
         modeRef.current = mode;
     }, [mode]);
 
     useEffect(() => {
-        worldRef.current = world;
-    }, [world]);
+        simRef.current = simulation;
+    }, [simulation]);
 
     useEffect(() => {
         onWorldUpdateRef.current = onWorldUpdate;
@@ -34,6 +35,10 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
     useEffect(() => {
         onCameraChangeRef.current = onCameraChange;
     }, [onCameraChange]);
+
+    useEffect(() => {
+        onMutateRef.current = onMutate;
+    }, [onMutate]);
 
     useEffect(() => {
         const canvas = canvasRef.current;
@@ -47,10 +52,13 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
             const dt = Math.min((timestamp - lastTimeRef.current) / 1000, 0.05);
             lastTimeRef.current = timestamp;
 
-            worldRef.current.update(dt);
-            onWorldUpdateRef.current(worldRef.current);
+            const sim = simRef.current;
+            if (sim.running) {
+                sim.step(dt * sim.speed);
+            }
 
-            renderer.render(worldRef.current, mouseWorldRef.current.x, mouseWorldRef.current.y, obstacleDragRef.current);
+            renderer.render(sim, mouseWorldRef.current.x, mouseWorldRef.current.y, obstacleDragRef.current);
+            onWorldUpdateRef.current(sim);
 
             cameraStateRef.current = { ...renderer.camera };
 
@@ -61,7 +69,7 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
                     ...cameraStateRef.current,
                     fps: fpsCounterRef.current.count,
                     canvasSize: `${canvas.width}×${canvas.height}`,
-                    worldSize: `${worldRef.current.width}×${worldRef.current.height}`,
+                    worldSize: `${sim.width}×${sim.height}`,
                     gridSpacing: renderer.camera.getGridSpacing(),
                     mouseWorld: mouseWorldRef.current
                 });
@@ -105,25 +113,13 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
         if (e.button !== 0) return;
         const { x, y } = getCanvasCoords(e);
         const worldPos = screenToWorldLocal(x, y);
-
-        if (modeRef.current === 'add-task') {
-            const existing = worldRef.current.tasks.find(t =>
-                Math.abs(t.x - worldPos.x) < 0.3 && Math.abs(t.y - worldPos.y) < 0.3
-            );
-            if (!existing) {
-                worldRef.current.addTask(worldPos.x, worldPos.y);
-                onWorldUpdate(worldRef.current);
-                const task = worldRef.current.tasks[worldRef.current.tasks.length - 1];
-                onLog(`Task ${task.id} added at (${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)})`);
-            }
-            return;
-        }
+        const sim = simRef.current;
 
         if (modeRef.current === 'move-robot') {
-            const robot = worldRef.current.getSelectedRobot();
+            const robot = sim.getSelectedRobot();
             if (robot) {
-                robot.setTarget(worldPos.x, worldPos.y);
-                onLog(`${robot.id} target set to (${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)})`);
+                sim.moveRobotTo(robot.id, worldPos.x, worldPos.y);
+                onMutateRef.current();
             }
             return;
         }
@@ -134,33 +130,33 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
         }
 
         if (modeRef.current === 'move-obstacle') {
-            const obstacle = worldRef.current.getObstacleAt(worldPos.x, worldPos.y);
+            const obstacle = sim.getObstacleAt(worldPos.x, worldPos.y);
             if (obstacle) {
                 obstacleMoveRef.current = { id: obstacle.id, offsetX: worldPos.x - obstacle.x, offsetY: worldPos.y - obstacle.y };
-                worldRef.current.selectedObstacleId = obstacle.id;
-                onMutate();
+                sim.selectedObstacleId = obstacle.id;
+                onMutateRef.current();
                 return;
             }
         }
 
-        const obstacle = worldRef.current.getObstacleAt(worldPos.x, worldPos.y);
+        const obstacle = sim.getObstacleAt(worldPos.x, worldPos.y);
         if (obstacle) {
-            worldRef.current.selectedObstacleId = obstacle.id;
-            onLog(`Selected obstacle ${obstacle.id}`);
+            sim.selectedObstacleId = obstacle.id;
+            onMutateRef.current();
             return;
         }
 
-        const robot = worldRef.current.getRobotAt(worldPos.x, worldPos.y);
+        const robot = sim.getRobotAt(worldPos.x, worldPos.y);
         if (robot) {
-            worldRef.current.selectedRobotId = robot.id;
-            onLog(`Selected robot ${robot.id}`);
+            sim.setSelectedRobot(robot.id);
+            onMutateRef.current();
             return;
         }
 
         isDraggingRef.current = true;
         dragStartRef.current = { x: e.clientX, y: e.clientY };
         camStartRef.current = { x: rendererRef.current.camera.x, y: rendererRef.current.camera.y };
-    }, [getCanvasCoords, screenToWorldLocal, onWorldUpdate, onLog, onMutate]);
+    }, [getCanvasCoords, screenToWorldLocal]);
 
     const handleMouseMove = useCallback((e) => {
         const { x, y } = getCanvasCoords(e);
@@ -174,10 +170,10 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
         }
 
         if (obstacleMoveRef.current && rendererRef.current) {
-            const obs = worldRef.current.getObstacle(obstacleMoveRef.current.id);
+            const sim = simRef.current;
+            const obs = sim.getObstacle(obstacleMoveRef.current.id);
             if (obs) {
-                obs.x = worldPos.x - obstacleMoveRef.current.offsetX;
-                obs.y = worldPos.y - obstacleMoveRef.current.offsetY;
+                sim.moveObstacle(obs.id, worldPos.x - obstacleMoveRef.current.offsetX, worldPos.y - obstacleMoveRef.current.offsetY);
             }
             return;
         }
@@ -198,9 +194,8 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
             const w = Math.abs(endX - startX);
             const h = Math.abs(endY - startY);
             if (w > 0.2 && h > 0.2) {
-                const obs = worldRef.current.addObstacle(x, y, w, h);
-                onWorldUpdate(worldRef.current);
-                onLog(`Obstacle ${obs.id} added at (${x.toFixed(2)}, ${y.toFixed(2)}) ${w.toFixed(1)}×${h.toFixed(1)}m`);
+                simRef.current.addObstacle(x, y, w, h);
+                onMutateRef.current();
             }
             obstacleDragRef.current = null;
         }
@@ -208,7 +203,7 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
             obstacleMoveRef.current = null;
         }
         isDraggingRef.current = false;
-    }, [onWorldUpdate, onLog]);
+    }, []);
 
     const handleWheel = useCallback((e) => {
         e.preventDefault();
@@ -247,7 +242,7 @@ export default function WarehouseCanvas({ world, mode, cameraResetToken, onWorld
         return () => resizeObserver.disconnect();
     }, []);
 
-    const cursor = mode === 'add-task' || mode === 'move-robot' || mode === 'add-obstacle' ? 'crosshair' : mode === 'move-obstacle' ? 'grab' : 'default';
+    const cursor = mode === 'move-robot' || mode === 'add-obstacle' ? 'crosshair' : mode === 'move-obstacle' ? 'grab' : 'default';
 
     return (
         <div style={{ width: '100%', height: '100%', position: 'relative' }}>

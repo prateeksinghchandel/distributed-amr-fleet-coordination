@@ -13,6 +13,11 @@ export class Obstacle {
         return px >= this.x && px <= this.x + this.width &&
                py >= this.y && py <= this.y + this.height;
     }
+
+    inflatedContains(px, py, padding) {
+        return px >= this.x - padding && px <= this.x + this.width + padding &&
+               py >= this.y - padding && py <= this.y + this.height + padding;
+    }
 }
 
 export function createObstacle(x, y, width, height) {

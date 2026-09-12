@@ -4,9 +4,7 @@ import { formatWorldCoord, formatHeading } from '../rendering/coordinates.js';
 export default function RobotPanel({ robot }) {
     if (!robot) {
         return (
-            <div style={{ padding: 12, borderBottom: '1px solid #0f3460' }}>
-                <div style={{ fontSize: 13, color: '#888' }}>No robot selected</div>
-            </div>
+            <div style={{ color: '#888' }}>No robot selected</div>
         );
     }
 
@@ -14,36 +12,31 @@ export default function RobotPanel({ robot }) {
     const targetY = robot.targetY !== null ? formatWorldCoord(robot.targetY) : '—';
 
     return (
-        <div style={{ padding: 12, borderBottom: '1px solid #0f3460' }}>
-            <div style={{ fontSize: 14, fontWeight: 'bold', color: '#00c8ff', marginBottom: 8 }}>
+        <div style={{ borderTop: '1px solid #0f3460', paddingTop: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 'bold', color: robot.color, marginBottom: 4 }}>
                 Robot {robot.id}
             </div>
-            <div style={{ fontSize: 12 }}>
-                <div style={{ marginBottom: 4 }}>
-                    <span style={{ color: '#888' }}>Position</span>
-                </div>
-                <div>X: {formatWorldCoord(robot.x)} m</div>
-                <div>Y: {formatWorldCoord(robot.y)} m</div>
-                <div style={{ marginTop: 4 }}>
-                    <span style={{ color: '#888' }}>Heading</span>
-                </div>
-                <div>{formatHeading(robot.heading)}</div>
-                <div style={{ marginTop: 4 }}>
-                    <span style={{ color: '#888' }}>Speed</span>
-                </div>
-                <div>{robot.speed.toFixed(2)} m/s</div>
-                <div style={{ marginTop: 4 }}>
-                    <span style={{ color: '#888' }}>Status</span>
-                </div>
-                <div style={{ color: robot.status === 'MOVING' ? '#00ff88' : robot.status === 'IDLE' ? '#aaaaaa' : '#e94560' }}>
-                    {robot.status}{robot.blocked ? ' (BLOCKED)' : ''}
-                </div>
-                <div style={{ marginTop: 4 }}>
-                    <span style={{ color: '#888' }}>Target</span>
-                </div>
-                <div>X: {targetX} m</div>
-                <div>Y: {targetY} m</div>
+            <div style={{ fontSize: 11, color: '#aaa' }}>
+                <div>Position: ({formatWorldCoord(robot.x)}, {formatWorldCoord(robot.y)})</div>
+                <div>Velocity: ({robot.velocity.x.toFixed(2)}, {robot.velocity.y.toFixed(2)}) m/s</div>
+                <div>Heading: {formatHeading(robot.heading)}</div>
+                <div>Speed: {robot.speed.toFixed(2)} m/s</div>
+                <div>Status: <span style={{ color: statusColor(robot) }}>{robot.status}{robot.blocked ? ' (BLOCKED)' : ''}</span></div>
+                <div>Battery: {Math.round(robot.battery)}%</div>
+                <div>Connection: {robot.online ? 'ONLINE' : 'OFFLINE'}</div>
+                <div>Task: {robot.currentTaskId || '—'}</div>
+                <div>Target: ({targetX}, {targetY})</div>
             </div>
         </div>
     );
+}
+
+function statusColor(robot) {
+    if (!robot.online) return '#e94560';
+    if (robot.status === 'COMPLETED') return '#2ecc71';
+    if (robot.status === 'MOVING' ||
+        robot.status === 'MOVING_TO_PICKUP' ||
+        robot.status === 'MOVING_TO_DROPOFF') return '#00c8ff';
+    if (robot.status === 'PICKING' || robot.status === 'DROPPING') return '#ffd43b';
+    return '#aaa';
 }
