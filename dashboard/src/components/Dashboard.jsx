@@ -4,65 +4,40 @@ import Sidebar from './Sidebar.jsx';
 import WarehouseCanvas from './WarehouseCanvas.jsx';
 import FleetPanel from './FleetPanel.jsx';
 import BottomPanel from './BottomPanel.jsx';
-import WarehouseBuilderModal from './WarehouseBuilderModal.jsx';
-import { createSimulation } from '../simulation/Simulation.js';
+import { createDistributedFleetState } from '../distributed/DistributedFleetState.js';
 
-const simulation = createSimulation(30, 20, { layout: 'logistics' });
+const fleet = createDistributedFleetState();
 
 export default function Dashboard() {
     const [, setTick] = useState(0);
-    const lastWorldSyncRef = useRef(0);
-    const simEventsSeenRef = useRef(simulation.events.length);
-    const [logs, setLogs] = useState(() =>
-        simulation.events.map((e) => `[${e.time}] ${e.message}`)
-    );
-    const [mode, setMode] = useState('default');
+    const [logs, setLogs] = useState(() => fleet.logs.map((e) => `[${e.time}] ${e.message}`));
+    const logsSeenRef = useRef(fleet.logs.length);
     const [debug, setDebug] = useState({});
     const [cameraResetToken, setCameraResetToken] = useState(0);
-    const [resetVersion, setResetVersion] = useState(0);
-    const [isBuilderOpen, setIsBuilderOpen] = useState(false);
+    const lastWorldSyncRef = useRef(0);
 
     useEffect(() => {
-        simulation.onEvent = (entry) => {
-            setLogs((prev) => [...prev.slice(-399), `[${entry.time}] ${entry.message}`]);
-        };
-        const pending = simulation.events.slice(simEventsSeenRef.current);
-        simEventsSeenRef.current = simulation.events.length;
-        if (pending.length > 0) {
-            setLogs((prev) => [...prev, ...pending.map((e) => `[${e.time}] ${e.message}`)]);
-        }
-        return () => {
-            simulation.onEvent = null;
-        };
-    }, []);
+        const unsubscribe = fleet.subscribe(() => {
+            const now = performance.now();
+            if (now - lastWorldSyncRef.current > 100) {
+                lastWorldSyncRef.current = now;
+                setTick((t) => t + 1);
+            }
+            const newCount = fleet.logs.length;
+            if (newCount !== logsSeenRef.current) {
+                const extra = fleet.logs.slice(logsSeenRef.current);
+                logsSeenRef.current = newCount;
+                if (extra.length > 0) {
+                    setLogs((prev) => [...prev.slice(-399), ...extra.map((e) => `[${e.time}] ${e.message}`)]);
+                }
+            }
+        });
 
-    const handleWorldUpdate = useCallback((_sim) => {
-        const now = performance.now();
-        if (now - lastWorldSyncRef.current > 100) {
-            lastWorldSyncRef.current = now;
-            setTick((t) => t + 1);
-        }
-    }, []);
-
-    const handleMutate = useCallback(() => {
-        setTick((t) => t + 1);
-    }, []);
-
-    const handleReset = useCallback(() => {
-        simulation.reset();
-        setResetVersion((v) => v + 1);
-        setTick((t) => t + 1);
+        return () => unsubscribe();
     }, []);
 
     const handleResetCamera = useCallback(() => {
         setCameraResetToken((t) => t + 1);
-    }, []);
-
-    const handleBuildWarehouse = useCallback((config) => {
-        simulation.applyLogisticsLayout(config);
-        setResetVersion((v) => v + 1);
-        setCameraResetToken((t) => t + 1);
-        setTick((t) => t + 1);
     }, []);
 
     return (
@@ -75,40 +50,19 @@ export default function Dashboard() {
             color: '#e0e0e0',
             fontFamily: 'monospace'
         }}>
-            <Header
-                simulation={simulation}
-                onMutate={handleMutate}
-                onReset={handleReset}
-                onResetCamera={handleResetCamera}
-                onOpenBuilder={() => setIsBuilderOpen(true)}
-            />
+            <Header fleet={fleet} onResetCamera={handleResetCamera} />
             <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-                <Sidebar
-                    key={resetVersion}
-                    simulation={simulation}
-                    mode={mode}
-                    setMode={setMode}
-                    onMutate={handleMutate}
-                    onOpenBuilder={() => setIsBuilderOpen(true)}
-                />
+                <Sidebar fleet={fleet} />
                 <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
                     <WarehouseCanvas
-                        simulation={simulation}
-                        mode={mode}
+                        fleet={fleet}
                         cameraResetToken={cameraResetToken}
-                        onWorldUpdate={handleWorldUpdate}
                         onCameraChange={setDebug}
-                        onMutate={handleMutate}
                     />
                 </div>
-                <FleetPanel simulation={simulation} onMutate={handleMutate} />
+                <FleetPanel fleet={fleet} />
             </div>
-            <BottomPanel logs={logs} debug={debug} simulation={simulation} />
-            <WarehouseBuilderModal
-                isOpen={isBuilderOpen}
-                onClose={() => setIsBuilderOpen(false)}
-                onBuild={handleBuildWarehouse}
-            />
+            <BottomPanel logs={logs} debug={debug} fleet={fleet} />
         </div>
     );
 }

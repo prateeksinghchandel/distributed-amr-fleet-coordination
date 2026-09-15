@@ -28,3 +28,12 @@ WORLD_STATE = "world/state"
 
 # robots/intent — PLANNED for Phase 4 (intention broadcasting between peers).
 ROBOT_INTENT = "robots/intent"
+
+CONTROL_TASK_CREATE = "control/tasks/create"
+"""Dashboard → Coordinator: create a task (pickup/dropoff or randomCount) for auction."""
+
+CONTROL_TASK_ASSIGN = "control/tasks/assign"
+"""Dashboard → Coordinator: manually assign a pending task to a robot."""
+
+CONTROL_TASK_CANCEL = "control/tasks/cancel"
+"""Dashboard → Coordinator: cancel a task."""

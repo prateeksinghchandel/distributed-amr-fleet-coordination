@@ -12,6 +12,8 @@
     "test:builder": "node test/warehouse-builder.test.mjs",
     "test:transport": "node transport.test.mjs",
     "test:distributed": "node test/distributed-fleet.test.mjs",
+    "test:distributed-state": "node test/distributed-state.test.mjs",
+    "test:phase5": "node test/phase5-python-fleet.test.mjs",
     "fleet": "bash scripts/start-fleet.sh",
     "fleet:stop": "bash scripts/start-fleet.sh --stop",
     "zenohd": "bash scripts/zenohd.sh"

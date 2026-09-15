@@ -2,27 +2,33 @@ import React from 'react';
 
 const sectionHeader = { fontSize: 11, color: '#888', marginBottom: 6, letterSpacing: 1 };
 
-export default function AuctionPanel({ simulation, onMutate }) {
-    const recent = simulation.auctions.slice(-6).reverse();
-
-    const toggle = (e) => {
-        simulation.setAuctionEnabled(e.target.checked);
-        onMutate();
-    };
+export default function AuctionPanel({ fleet }) {
+    const recent = fleet.auctions.slice(0, 6);
+    const liveBids = [...fleet.liveBids.entries()];
 
     return (
         <div style={{ padding: 12, borderBottom: '1px solid #0f3460' }}>
             <div style={sectionHeader}>P2P AUCTION</div>
-            <label style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, cursor: 'pointer' }}>
-                <input type="checkbox" checked={simulation.auctionEnabled} onChange={toggle} />
-                Auto-assign via auction
-            </label>
-            <div style={{ fontSize: 10, color: '#aaa', marginBottom: 8 }}>
-                Queue: {simulation.auctionQueue.length} · Waiting: {simulation.waitingTasks.size} · In flight: {simulation.auctionInFlightId || '—'} · Bus: {simulation.bus.pendingCount()}
-            </div>
             <div style={{ fontSize: 10, color: '#666', marginBottom: 8 }}>
-                Generator tasks are auctioned fleet-wide (lowest bid wins); manual tasks wait for the Assign button.
+                Auctions are run by the coordinator — this panel only mirrors the live bid traffic
+                and completed results from Zenoh.
             </div>
+
+            {liveBids.length > 0 && (
+                <div style={{ fontSize: 10, color: '#ffd43b', marginBottom: 8 }}>
+                    <div>Live bids:</div>
+                    {liveBids.map(([taskId, bids]) => (
+                        <div key={taskId} style={{ color: '#aaa' }}>
+                            {taskId}: {[...bids.values()].map((b) => (
+                                <span key={b.robotId}>
+                                    {b.robotId}{b.bid === null ? `:${b.reason || 'n/a'}` : `:${b.bid.toFixed(2)}`}{' '}
+                                </span>
+                            ))}
+                        </div>
+                    ))}
+                </div>
+            )}
+
             {recent.length === 0 && (
                 <div style={{ fontSize: 11, color: '#666' }}>No completed auctions yet</div>
             )}

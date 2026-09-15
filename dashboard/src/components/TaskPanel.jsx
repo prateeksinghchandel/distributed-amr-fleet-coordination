@@ -1,9 +1,8 @@
 import React, { useState } from 'react';
-import { parsePointList } from '../simulation/TaskGenerator.js';
 
 const sectionHeader = { fontSize: 11, color: '#888', marginBottom: 6, letterSpacing: 1 };
 
-export default function TaskPanel({ simulation, onMutate }) {
+export default function TaskPanel({ fleet }) {
     const [genMode, setGenMode] = useState('manual');
     const [pX, setPX] = useState('5');
     const [pY, setPY] = useState('8');
@@ -14,33 +13,33 @@ export default function TaskPanel({ simulation, onMutate }) {
     const [pickupList, setPickupList] = useState('4, 4\n14, 6\n24, 9');
     const [count, setCount] = useState('5');
     const [assignSel, setAssignSel] = useState({});
+    const connected = fleet.isConnected;
 
     const createManual = () => {
-        simulation.createTask(
+        fleet.createTask(
             { x: Number.parseFloat(pX), y: Number.parseFloat(pY) },
             { x: Number.parseFloat(dX), y: Number.parseFloat(dY) }
         );
-        onMutate();
     };
 
     const createSameDropoff = () => {
-        const { points, invalid } = parsePointList(pickupList);
-        for (const msg of invalid) simulation.emit(msg);
-        simulation.generateSameDropoff(
-            { x: Number.parseFloat(sDX), y: Number.parseFloat(sDY) },
-            points
-        );
-        onMutate();
+        const { points } = parsePointList(pickupList);
+        const dropoff = { x: Number.parseFloat(sDX), y: Number.parseFloat(sDY) };
+        for (const p of points) {
+            fleet.createTask(p, dropoff);
+        }
     };
 
     const createRandom = () => {
-        simulation.generateRandomTasks(Number.parseFloat(count) || 0);
-        onMutate();
+        fleet.generateRandomTasks(Number.parseInt(count, 10) || 0);
     };
 
     return (
         <div style={{ padding: 12, borderBottom: '1px solid #0f3460' }}>
             <div style={sectionHeader}>TASK GENERATOR</div>
+            <div style={{ fontSize: 10, color: '#666', marginBottom: 6 }}>
+                Commands are sent to the Python coordinator ({fleet.conn.url}) — tasks appear once auctioned.
+            </div>
             <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
                 {[['manual', 'Manual'], ['same', 'Same Dropoff'], ['random', 'Random']].map(([key, label]) => (
                     <button
@@ -59,7 +58,7 @@ export default function TaskPanel({ simulation, onMutate }) {
                     <PointRow x={pX} y={pY} onX={setPX} onY={setPY} />
                     <div style={labelStyle}>Dropoff</div>
                     <PointRow x={dX} y={dY} onX={setDX} onY={setDY} />
-                    <button style={actionButtonStyle} onClick={createManual}>Create Task</button>
+                    <button style={actionButtonStyle(connected)} disabled={!connected} onClick={createManual}>Create Task</button>
                 </div>
             )}
 
@@ -74,7 +73,7 @@ export default function TaskPanel({ simulation, onMutate }) {
                         value={pickupList}
                         onChange={(e) => setPickupList(e.target.value)}
                     />
-                    <button style={actionButtonStyle} onClick={createSameDropoff}>Generate</button>
+                    <button style={actionButtonStyle(connected)} disabled={!connected} onClick={createSameDropoff}>Generate</button>
                 </div>
             )}
 
@@ -88,39 +87,38 @@ export default function TaskPanel({ simulation, onMutate }) {
                         min="1"
                         onChange={(e) => setCount(e.target.value)}
                     />
-                    <button style={actionButtonStyle} onClick={createRandom}>Generate</button>
+                    <button style={actionButtonStyle(connected)} disabled={!connected} onClick={createRandom}>Generate</button>
                 </div>
             )}
 
-            <div style={{ ...sectionHeader, marginTop: 14 }}>TASKS ({simulation.tasks.length})</div>
-            {simulation.tasks.length === 0 && (
+            <div style={{ ...sectionHeader, marginTop: 14 }}>TASKS ({fleet.tasksList.length})</div>
+            {fleet.tasksList.length === 0 && (
                 <div style={{ fontSize: 11, color: '#666' }}>No tasks yet</div>
             )}
-            {simulation.tasks.slice().reverse().map((task) => (
+            {fleet.tasksList.slice().reverse().map((task) => (
                 <TaskRow
                     key={task.id}
                     task={task}
-                    simulation={simulation}
+                    fleet={fleet}
+                    connected={connected}
                     assignSel={assignSel[task.id] || ''}
                     onAssignSel={(v) => setAssignSel((prev) => ({ ...prev, [task.id]: v }))}
-                    onMutate={onMutate}
                 />
             ))}
         </div>
     );
 }
 
-function TaskRow({ task, simulation, assignSel, onAssignSel, onMutate }) {
+function TaskRow({ task, fleet, connected, assignSel, onAssignSel }) {
     const pending = task.status === 'PENDING';
     const active = task.status === 'ASSIGNED' || task.status === 'PICKING_UP' || task.status === 'DELIVERING';
-    const available = simulation.robots.filter(
+    const available = fleet.robotsList.filter(
         (r) => r.online && (r.currentTaskId === null || r.status === 'COMPLETED')
     );
 
     const assign = () => {
         if (!assignSel) return;
-        simulation.assignTask(task.id, assignSel);
-        onMutate();
+        fleet.assignTask(task.id, assignSel);
     };
 
     return (
@@ -149,6 +147,7 @@ function TaskRow({ task, simulation, assignSel, onAssignSel, onMutate }) {
                     <select
                         style={selectStyle}
                         value={assignSel}
+                        disabled={!connected || available.length === 0}
                         onChange={(e) => onAssignSel(e.target.value)}
                     >
                         <option value="">Robot…</option>
@@ -156,19 +155,37 @@ function TaskRow({ task, simulation, assignSel, onAssignSel, onMutate }) {
                             <option key={r.id} value={r.id}>{r.id}</option>
                         ))}
                     </select>
-                    <button style={actionButtonStyle} onClick={assign}>Assign</button>
+                    <button style={actionButtonStyle(connected)} disabled={!connected || !assignSel} onClick={assign}>Assign</button>
                 </div>
             )}
             {active && (
                 <button
-                    style={{ ...actionButtonStyle, marginTop: 4, background: '#3a1a1a', borderColor: '#e94560' }}
-                    onClick={() => { simulation.cancelTask(task.id); onMutate(); }}
+                    style={{ ...actionButtonStyle(connected), marginTop: 4, background: '#3a1a1a', borderColor: '#e94560' }}
+                    disabled={!connected}
+                    onClick={() => fleet.cancelTask(task.id)}
                 >
                     Cancel task
                 </button>
             )}
         </div>
     );
+}
+
+function parsePointList(text) {
+    const points = [];
+    const invalid = [];
+    const lines = String(text).split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const parts = line.split(',').map((s) => Number.parseFloat(s.trim()));
+        if (parts.length === 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])) {
+            points.push({ x: parts[0], y: parts[1] });
+        } else {
+            invalid.push(`Invalid point on line ${i + 1}: "${lines[i]}"`);
+        }
+    }
+    return { points, invalid };
 }
 
 function taskStatusColor(status) {
@@ -211,11 +228,15 @@ const selectStyle = {
     border: '1px solid #0f3460', borderRadius: 3, fontSize: 11, fontFamily: 'inherit'
 };
 
-const actionButtonStyle = {
-    padding: '4px 10px', background: '#0f3460', color: '#e0e0e0',
-    border: '1px solid #00c8ff', borderRadius: 4, cursor: 'pointer',
-    fontSize: 11, fontFamily: 'inherit'
-};
+function actionButtonStyle(connected) {
+    const base = {
+        padding: '4px 10px', background: '#0f3460', color: '#e0e0e0',
+        border: '1px solid #00c8ff', borderRadius: 4, cursor: 'pointer',
+        fontSize: 11, fontFamily: 'inherit'
+    };
+    if (!connected) return { ...base, opacity: 0.45, cursor: 'not-allowed' };
+    return base;
+}
 
 function tabStyle(active) {
     return {

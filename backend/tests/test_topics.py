@@ -37,11 +37,22 @@ class TestTopicStrings:
         """robots/intent is planned but must be present as a constant."""
         assert topics.ROBOT_INTENT == "robots/intent"
 
+    def test_control_task_create(self):
+        assert topics.CONTROL_TASK_CREATE == "control/tasks/create"
+
+    def test_control_task_assign(self):
+        assert topics.CONTROL_TASK_ASSIGN == "control/tasks/assign"
+
+    def test_control_task_cancel(self):
+        assert topics.CONTROL_TASK_CANCEL == "control/tasks/cancel"
+
     def test_all_topics_are_strings(self):
         all_topics = [
             topics.TASK_NEW, topics.TASK_ASSIGNED, topics.TASK_CANCELLED,
             topics.BID_PLACED, topics.AUCTION_RESULT,
             topics.ROBOT_TELEMETRY, topics.WORLD_STATE, topics.ROBOT_INTENT,
+            topics.CONTROL_TASK_CREATE, topics.CONTROL_TASK_ASSIGN,
+            topics.CONTROL_TASK_CANCEL,
         ]
         for t in all_topics:
             assert isinstance(t, str), f"Topic {t!r} is not a str"
@@ -53,6 +64,8 @@ class TestTopicStrings:
             topics.TASK_NEW, topics.TASK_ASSIGNED, topics.TASK_CANCELLED,
             topics.BID_PLACED, topics.AUCTION_RESULT,
             topics.ROBOT_TELEMETRY, topics.WORLD_STATE,
+            topics.CONTROL_TASK_CREATE, topics.CONTROL_TASK_ASSIGN,
+            topics.CONTROL_TASK_CANCEL,
         ]
         assert len(all_topics) == len(set(all_topics)), "Duplicate topic strings detected"
 
@@ -62,6 +75,8 @@ class TestTopicStrings:
             topics.TASK_NEW, topics.TASK_ASSIGNED, topics.TASK_CANCELLED,
             topics.BID_PLACED, topics.AUCTION_RESULT,
             topics.ROBOT_TELEMETRY, topics.WORLD_STATE,
+            topics.CONTROL_TASK_CREATE, topics.CONTROL_TASK_ASSIGN,
+            topics.CONTROL_TASK_CANCEL,
         ]
         for t in all_topics:
             assert "." not in t, f"Topic {t!r} must not contain '.'"

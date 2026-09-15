@@ -6,4 +6,7 @@ export const TOPICS = {
     AUCTION_RESULT: 'auction/results',
     ROBOT_TELEMETRY: 'robots/telemetry',
     WORLD_STATE: 'world/state',
+    CONTROL_TASK_CREATE: 'control/tasks/create',
+    CONTROL_TASK_ASSIGN: 'control/tasks/assign',
+    CONTROL_TASK_CANCEL: 'control/tasks/cancel',
 };
