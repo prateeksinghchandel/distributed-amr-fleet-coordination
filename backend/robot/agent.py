@@ -14,6 +14,7 @@ import time
 from typing import Optional, Callable
 
 from common import topics
+from robot.planning.astar import AStarPlanner, PathNotFoundError, path_distance
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,7 @@ class FleetAgent:
         log: Callable[[str], None],
         get_obstacles: Callable[[], list] = lambda: [],
         get_fleet_snapshot: Callable[[], list] = lambda: [],
+        get_world_bounds: Callable[[], tuple[float, float] | None] = lambda: None,
         disable_finalize: bool = True,
         coordinator_commit: Optional[Callable[[str, str, list[dict]], bool]] = None,
     ):
@@ -94,6 +96,7 @@ class FleetAgent:
         self._log = log
         self._get_obstacles = get_obstacles
         self._get_fleet_snapshot = get_fleet_snapshot
+        self._get_world_bounds = get_world_bounds
         self.disable_finalize = disable_finalize
         self._coordinator_commit = coordinator_commit
 
@@ -190,11 +193,26 @@ class FleetAgent:
         px, py = pickup.get("x", 0.0), pickup.get("y", 0.0)
         dx, dy = dropoff.get("x", 0.0), dropoff.get("y", 0.0)
 
-        # Travel cost
-        travel = _dist(rx, ry, px, py)
-        if self._straight_blocked(rx, ry, px, py):
-            travel *= BLOCKED_PENALTY
-        travel += _dist(px, py, dx, dy)
+        # Travel cost: use the same global A* planner as the motion controller
+        # whenever world bounds are available. This keeps auction costs aligned
+        # with the path the AMR will actually drive.
+        bounds = self._get_world_bounds()
+        if bounds:
+            try:
+                planner = AStarPlanner(
+                    bounds[0], bounds[1], robot_radius=float(robot.get("radius", 0.4)),
+                    safety_margin=0.1, resolution=0.25,
+                )
+                pickup_path = planner.plan((rx, ry), (px, py), self._get_obstacles())
+                delivery_path = planner.plan((px, py), (dx, dy), self._get_obstacles())
+                travel = path_distance(pickup_path) + path_distance(delivery_path)
+            except PathNotFoundError:
+                return {"eligible": False, "reason": "no_path", "bid": None, "costs": None}
+        else:
+            travel = _dist(rx, ry, px, py)
+            if self._straight_blocked(rx, ry, px, py):
+                travel *= BLOCKED_PENALTY
+            travel += _dist(px, py, dx, dy)
         travel = round(travel * 100) / 100
 
         # Congestion cost

@@ -1,3 +1,5 @@
+import { AStarPlanner, PathNotFoundError } from './planning/AStarPlanner.js';
+
 export const ROBOT_STATUS = {
     IDLE: 'IDLE',
     MOVING: 'MOVING',
@@ -52,7 +54,7 @@ export class Robot {
         this.blocked = false;
     }
 
-    startTask(task) {
+    startTask(task, obstacles = [], bounds = null) {
         this.currentTaskId = task.id;
         this.taskPickup = { x: task.pickup.x, y: task.pickup.y };
         this.taskDropoff = { x: task.dropoff.x, y: task.dropoff.y };
@@ -62,6 +64,26 @@ export class Robot {
         this.targetY = this.taskPickup.y;
         this.status = ROBOT_STATUS.MOVING_TO_PICKUP;
         this.blocked = false;
+        this.currentPath = [];
+        this.currentWaypointIndex = 0;
+        this.pickupWaypointIndex = 0;
+        if (bounds) this.planTaskPath(obstacles, bounds);
+    }
+
+    planTaskPath(obstacles, bounds) {
+        try {
+            const planner = new AStarPlanner(bounds.width, bounds.height, { robotRadius: this.radius, safetyMargin: 0.1 });
+            const first = planner.plan({ x: this.x, y: this.y }, this.taskPickup, obstacles);
+            const second = planner.plan(this.taskPickup, this.taskDropoff, obstacles);
+            this.currentPath = first.concat(second.slice(1));
+            this.pickupWaypointIndex = Math.max(1, first.length - 1);
+            this.currentWaypointIndex = this.currentPath.length > 1 ? 1 : this.currentPath.length;
+        } catch (error) {
+            if (!(error instanceof PathNotFoundError)) throw error;
+            this.currentPath = [];
+            this.currentWaypointIndex = 0;
+            this.blocked = true;
+        }
     }
 
     cancelTask() {
@@ -77,6 +99,9 @@ export class Robot {
         this.targetY = null;
         this.status = ROBOT_STATUS.IDLE;
         this.blocked = false;
+        this.currentPath = [];
+        this.currentWaypointIndex = -1;
+        this.pickupWaypointIndex = 0;
     }
 
     update(dt, obstacles, bounds, emit) {
@@ -111,7 +136,9 @@ export class Robot {
             return;
         }
 
-        const arrived = this.moveToward(dt, obstacles, bounds);
+        const arrived = this.currentPath.length > 1
+            ? this.followPath(dt, obstacles, bounds)
+            : this.moveToward(dt, obstacles, bounds);
         if (arrived) {
             if (this.taskStage === 'toPickup') {
                 this.beginPicking(emit);
@@ -123,6 +150,29 @@ export class Robot {
                 this.status = ROBOT_STATUS.IDLE;
             }
         }
+    }
+
+    followPath(dt, obstacles, bounds) {
+        const targetLimit = this.taskStage === 'toPickup' ? this.pickupWaypointIndex : this.currentPath.length - 1;
+        if (this.currentWaypointIndex > targetLimit) return true;
+        const target = this.currentPath[this.currentWaypointIndex];
+        const dx = target.x - this.x, dy = target.y - this.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist <= 0.15) {
+            this.x = target.x; this.y = target.y; this.currentWaypointIndex += 1;
+            this.speed = 0; this.velocity = {x:0,y:0}; this.blocked = false;
+            return this.currentWaypointIndex > targetLimit;
+        }
+        const step = Math.min(this.maxSpeed * dt, dist);
+        const nx = this.x + dx / dist * step, ny = this.y + dy / dist * step;
+        if (this.checkCollision(nx, ny, obstacles) || !this.isWithinBounds(nx, ny, bounds)) {
+            this.blocked = true; this.speed = 0; this.velocity = {x:0,y:0};
+            return false;
+        }
+        this.x = nx; this.y = ny; this.speed = step / Math.max(dt, 1e-9);
+        this.velocity = { x: dx / dist * this.speed, y: dy / dist * this.speed };
+        this.heading = Math.atan2(dy, dx); this.blocked = false;
+        return false;
     }
 
     moveToward(dt, obstacles, bounds) {

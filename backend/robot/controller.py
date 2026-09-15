@@ -1,16 +1,22 @@
 """
-controller.py — Motion controller and robot state machine for a Python AMR.
+controller.py — Motion controller and robot state machine for a Python AMR with A* navigation.
 
-Mirrors Robot.js update() / state machine logic:
+State Machine:
   IDLE → MOVING_TO_PICKUP → PICKING → MOVING_TO_DROPOFF → DROPPING → COMPLETED
 
-Battery drains during movement and charges at rest.
+Navigation:
+  - Uses AStarPlanner to find global collision-free paths around shelf racks and obstacles.
+  - Uses WaypointFollower for smooth waypoint tracking.
+  - Battery drains during movement and charges at rest.
 """
 
 from __future__ import annotations
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
+
+from robot.planning.astar import AStarPlanner, PathNotFoundError
+from robot.planning.waypoint_follower import WaypointFollower
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +71,8 @@ class RobotState:
     current_task_id: Optional[str] = None
     pickup: Optional[dict] = None   # {x, y}
     dropoff: Optional[dict] = None  # {x, y}
+    current_path: list[tuple[float, float]] = field(default_factory=list)
+    path_index: int = 0
     _action_timer: float = field(default=0.0, repr=False)
 
     def to_dict(self) -> dict:
@@ -82,7 +90,7 @@ class RobotState:
 
 
 # ---------------------------------------------------------------------------
-# MotionController
+# MotionController with A* Navigation
 # ---------------------------------------------------------------------------
 
 ARRIVE_THRESHOLD = 0.15   # m — considered "arrived"
@@ -94,63 +102,92 @@ BATTERY_CHARGE = 0.5      # % per second while IDLE/COMPLETED
 
 class MotionController:
     """
-    Updates a RobotState each simulation tick.
-
-    Accepts a list of ObstacleRect objects for basic collision avoidance
-    (steering around obstacles is Phase 3 — A*; here we do straight-line).
+    Updates a RobotState each simulation tick using A* path planning and waypoint following.
     """
 
-    def __init__(self, state: RobotState, log):
+    def __init__(self, state: RobotState, log, resolution: float = 0.25, safety_margin: float = 0.1):
         self.state = state
         self._log = log
+        self.resolution = resolution
+        self.safety_margin = safety_margin
+        self.follower = WaypointFollower(lookahead=0.6, arrival_threshold=ARRIVE_THRESHOLD)
 
-    def assign_task(self, task_id: str, pickup: dict, dropoff: dict) -> None:
+    def plan_route(self, goal_x: float, goal_y: float, obstacles: Sequence[object] = (),
+                   bounds: Optional[dict] = None) -> list[tuple[float, float]]:
+        w = bounds.get("width", 30.0) if bounds else 30.0
+        h = bounds.get("height", 20.0) if bounds else 20.0
+        planner = AStarPlanner(
+            width=w, height=h,
+            resolution=self.resolution,
+            robot_radius=self.state.radius,
+            safety_margin=self.safety_margin
+        )
+        try:
+            return planner.plan((self.state.x, self.state.y), (goal_x, goal_y), obstacles)
+        except PathNotFoundError:
+            self._log(f"Warning: A* path not found to ({goal_x:.2f}, {goal_y:.2f}), using direct waypoint")
+            return [(self.state.x, self.state.y), (goal_x, goal_y)]
+
+    def assign_task(self, task_id: str, pickup: dict, dropoff: dict,
+                    obstacles: Sequence[object] = (), bounds: Optional[dict] = None) -> None:
         s = self.state
         s.current_task_id = task_id
         s.pickup = pickup
         s.dropoff = dropoff
         s.status = Status.MOVING_TO_PICKUP
         s.blocked = False
-        self._log(f"{s.id} assigned task {task_id} — moving to pickup")
+        s.current_path = self.plan_route(pickup["x"], pickup["y"], obstacles, bounds)
+        s.path_index = 0
+        self._log(f"{s.id} assigned task {task_id} — planned {len(s.current_path)} waypoints to pickup")
 
     def cancel_task(self) -> None:
         s = self.state
         s.current_task_id = None
         s.pickup = None
         s.dropoff = None
+        s.current_path = []
+        s.path_index = 0
         s.status = Status.IDLE
+        s.speed = 0.0
         self._log(f"{s.id} task cancelled")
 
-    def update(self, dt: float, obstacles: list[ObstacleRect]) -> None:
+    def update(self, dt: float, obstacles: list[ObstacleRect], bounds: Optional[dict] = None) -> None:
         s = self.state
         if not s.online:
             return
 
         if s.status == Status.IDLE or s.status == Status.COMPLETED:
-            # Charge battery when idle
             s.battery = min(100.0, s.battery + BATTERY_CHARGE * dt)
             s.speed = 0.0
             return
 
-        if s.status == Status.MOVING_TO_PICKUP and s.pickup:
-            arrived = self._move_towards(s.pickup["x"], s.pickup["y"], dt, obstacles)
+        if s.status == Status.MOVING_TO_PICKUP:
+            arrived = self._follow_path(dt)
             if arrived:
                 s.status = Status.PICKING
                 s._action_timer = PICK_DURATION
+                s.speed = 0.0
+                s.current_path = []
+                s.path_index = 0
                 self._log(f"{s.id} arrived at pickup — picking")
 
         elif s.status == Status.PICKING:
             s._action_timer -= dt
             s.speed = 0.0
-            if s._action_timer <= 0:
+            if s._action_timer <= 0 and s.dropoff:
                 s.status = Status.MOVING_TO_DROPOFF
-                self._log(f"{s.id} picked up — moving to dropoff")
+                s.current_path = self.plan_route(s.dropoff["x"], s.dropoff["y"], obstacles, bounds)
+                s.path_index = 0
+                self._log(f"{s.id} picked up — planned {len(s.current_path)} waypoints to dropoff")
 
-        elif s.status == Status.MOVING_TO_DROPOFF and s.dropoff:
-            arrived = self._move_towards(s.dropoff["x"], s.dropoff["y"], dt, obstacles)
+        elif s.status == Status.MOVING_TO_DROPOFF:
+            arrived = self._follow_path(dt)
             if arrived:
                 s.status = Status.DROPPING
                 s._action_timer = DROP_DURATION
+                s.speed = 0.0
+                s.current_path = []
+                s.path_index = 0
                 self._log(f"{s.id} arrived at dropoff — dropping")
 
         elif s.status == Status.DROPPING:
@@ -160,35 +197,18 @@ class MotionController:
                 s.status = Status.COMPLETED
                 self._log(f"{s.id} task {s.current_task_id} COMPLETED")
 
-    def _move_towards(self, tx: float, ty: float, dt: float,
-                       obstacles: list[ObstacleRect]) -> bool:
+    def _follow_path(self, dt: float) -> bool:
         s = self.state
-        dx, dy = tx - s.x, ty - s.y
-        dist = math.hypot(dx, dy)
-        if dist <= ARRIVE_THRESHOLD:
-            s.x, s.y = tx, ty
-            s.speed = 0.0
-            s.blocked = False
+        if not s.current_path:
             return True
 
-        # Heading
-        s.heading = math.atan2(dy, dx)
-
-        # Check if next step is blocked
-        step = min(s.max_speed * dt, dist)
-        nx = s.x + (dx / dist) * step
-        ny = s.y + (dy / dist) * step
-
-        blocked = any(obs.inflated_contains(nx, ny, s.radius) for obs in obstacles)
-        s.blocked = blocked
-
-        if not blocked:
-            metres = step
-            s.x, s.y = nx, ny
-            s.speed = step / dt if dt > 0 else 0.0
-            s.battery = max(0.0, s.battery - BATTERY_DRAIN * metres)
-        else:
-            s.speed = 0.0
-            # Phase 3 will replace this with A* path; for now just stay put
-
-        return False
+        nx, ny, heading, new_idx, arrived, travelled = self.follower.step(
+            (s.x, s.y), s.current_path, s.path_index, s.max_speed, dt
+        )
+        s.x = nx
+        s.y = ny
+        s.heading = heading
+        s.path_index = new_idx
+        s.speed = travelled / dt if dt > 0 else 0.0
+        s.battery = max(0.0, s.battery - BATTERY_DRAIN * travelled)
+        return arrived

@@ -113,8 +113,13 @@ bus.subscribe(TOPICS.TASK_ASSIGNED, ({ payload }) => {
         logError(`assigned task ${payload.taskId} but no announcement remembered`);
         return;
     }
-    robot.startTask(task);
-    log(`${id} started task ${task.id} (via auction)`);
+    if (!world) logError(`assigned task ${payload.taskId} before world state — moving without a planned path`);
+    robot.startTask(
+        task,
+        world ? world.obstacles : [],
+        world ? { width: world.width, height: world.height } : null,
+    );
+    log(`${id} started task ${task.id} (via auction) — planned ${robot.currentPath.length} waypoints`);
 });
 
 bus.subscribe(TOPICS.TASK_CANCELLED, ({ payload }) => {

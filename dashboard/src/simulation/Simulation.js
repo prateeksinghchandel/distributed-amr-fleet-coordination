@@ -436,7 +436,7 @@ export class Simulation {
         }
         task.assignedRobotId = robot.id;
         task.status = TASK_STATUS.ASSIGNED;
-        robot.startTask(task);
+        robot.startTask(task, this.obstacles, this.bounds);
         this.auctionQueue = this.auctionQueue.filter((id) => id !== task.id);
         this.auctionRetries.delete(task.id);
         this.waitingTasks.delete(task.id);

@@ -74,6 +74,7 @@ class RobotNode:
             log=log.info,
             get_obstacles=lambda: self.obstacles,
             get_fleet_snapshot=lambda: list(self.agent.fleet.values()) if hasattr(self, "agent") else [],
+            get_world_bounds=lambda: (self.world["width"], self.world["height"]) if self.world else None,
             disable_finalize=True,   # coordinator commits
         )
 
@@ -143,6 +144,8 @@ class RobotNode:
             task_id,
             pickup=task["pickup"],
             dropoff=task["dropoff"],
+            obstacles=self.obstacles,
+            bounds={"width": self.world.get("width", 30), "height": self.world.get("height", 20)},
         )
         self.log.info(f"{self.robot_id} started task {task_id} (via auction)")
 
@@ -179,7 +182,7 @@ class RobotNode:
             dt = min(max(now - self._last_tick, 0.01), 0.2)
         self._last_tick = now
 
-        self.controller.update(dt, self.obstacles)
+        self.controller.update(dt, self.obstacles, bounds={"width": self.world.get("width", 30), "height": self.world.get("height", 20)})
         self.agent.tick(dt, now)
 
         # If task just completed, reset current_task_id so agent can accept new tasks
