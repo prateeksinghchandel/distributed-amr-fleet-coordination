@@ -184,6 +184,8 @@ class FleetAgent:
         # Eligibility check
         if not robot.get("online", True):
             return {"eligible": False, "reason": "offline", "bid": None, "costs": None}
+        if robot.get("battery", 100.0) <= 10.0:
+            return {"eligible": False, "reason": "low_battery", "bid": None, "costs": None}
         current_task = robot.get("currentTaskId")
         status = robot.get("status", "IDLE")
         if current_task and status != "COMPLETED":

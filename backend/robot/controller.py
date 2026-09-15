@@ -73,6 +73,7 @@ class RobotState:
     dropoff: Optional[dict] = None  # {x, y}
     current_path: list[tuple[float, float]] = field(default_factory=list)
     path_index: int = 0
+    home_charge_bay: Optional[tuple[float, float]] = None
     _action_timer: float = field(default=0.0, repr=False)
 
     def to_dict(self) -> dict:
@@ -156,8 +157,28 @@ class MotionController:
         if not s.online:
             return
 
+        # Autonomous Return-to-Charge Lifecycle:
+        # If robot is low battery (<25%) and not busy delivering, or IDLE with charge < 100% and a charge pad is known:
+        if (s.status == Status.IDLE or s.status == Status.COMPLETED or (s.battery < 25.0 and s.status != Status.CHARGING and not s.current_task_id)):
+            if s.home_charge_bay and math.dist((s.x, s.y), s.home_charge_bay) > 0.3:
+                s.status = Status.CHARGING
+                s.current_path = self.plan_route(s.home_charge_bay[0], s.home_charge_bay[1], obstacles, bounds)
+                s.path_index = 0
+                self._log(f"{s.id} returning to charging bay ({s.home_charge_bay[0]:.1f}, {s.home_charge_bay[1]:.1f})")
+
+        if s.status == Status.CHARGING:
+            arrived = self._follow_path(dt)
+            if arrived or (s.home_charge_bay and math.dist((s.x, s.y), s.home_charge_bay) <= 0.3):
+                s.speed = 0.0
+                s.battery = min(100.0, s.battery + 8.0 * dt)
+                if s.battery >= 100.0:
+                    s.status = Status.IDLE
+                    self._log(f"{s.id} fully charged (100%)")
+            return
+
         if s.status == Status.IDLE or s.status == Status.COMPLETED:
-            s.battery = min(100.0, s.battery + BATTERY_CHARGE * dt)
+            # Idle standby drain
+            s.battery = max(0.0, s.battery - 0.02 * dt)
             s.speed = 0.0
             return
 

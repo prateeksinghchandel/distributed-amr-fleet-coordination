@@ -107,10 +107,11 @@ class RobotNode:
             if me:
                 self.state.x = me["x"]
                 self.state.y = me["y"]
+                self.state.home_charge_bay = (me["x"], me["y"])
                 self.spawned = True
                 self.log.info(
                     f"Spawned at ({self.state.x:.1f}, {self.state.y:.1f}) "
-                    f"— world {payload['width']}×{payload['height']}"
+                    f"— home charging bay set, world {payload['width']}×{payload['height']}"
                 )
         else:
             self.log.debug(
