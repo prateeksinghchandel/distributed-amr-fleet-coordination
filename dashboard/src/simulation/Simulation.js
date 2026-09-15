@@ -5,6 +5,7 @@ import { validateTask, TASK_POINT_PADDING } from './TaskGenerator.js';
 import { createTransport } from './messages/transport.js';
 import { TOPICS } from './messages/topics.js';
 import { FleetAgent, AUCTION_CONSTANTS, telemetryOf } from './fleet/FleetAgent.js';
+import { buildWarehouseConfig } from './WarehouseBuilder.js';
 
 export const DEFAULT_WIDTH = 30;
 export const DEFAULT_HEIGHT = 20;
@@ -37,7 +38,12 @@ export class Simulation {
         this.waitingTasks = new Set();
         this.resultSeen = new Set();
         this.auctions = [];
-        this.createDefaultFleet();
+        this.layoutConfig = this.transportOptions.layoutConfig || null;
+        if (this.transportOptions.layout === 'logistics' || this.layoutConfig) {
+            this.applyLogisticsLayout(this.layoutConfig || buildWarehouseConfig({ width, height }));
+        } else {
+            this.createDefaultFleet();
+        }
         this.bindCommunication();
     }
 
@@ -204,6 +210,48 @@ export class Simulation {
         this.emit(`[AUCTION] auto-assign via auction ${this.auctionEnabled ? 'enabled' : 'disabled'}`);
     }
 
+    applyLogisticsLayout(config) {
+        if (!config) return;
+        this.layoutConfig = config;
+        this.warehouse.setLogisticsLayout(config);
+
+        // Clear existing agents
+        for (const agent of this.agents.values()) {
+            agent.destroy();
+        }
+        this.agents.clear();
+        this.warehouse.robots = [];
+
+        // Clear tasks & auctions
+        this.warehouse.tasks = [];
+        this.auctionQueue = [];
+        this.auctionInFlightId = null;
+        this.auctionRetries.clear();
+        this.waitingTasks.clear();
+        this.resultSeen.clear();
+        this.auctions = [];
+
+        // Spawn robots from config
+        if (config.robots && config.robots.length > 0) {
+            for (let i = 0; i < config.robots.length; i++) {
+                const rSpec = config.robots[i];
+                const robot = new Robot(rSpec.id, rSpec.x, rSpec.y, 0, rSpec.radius || 0.4);
+                robot.maxSpeed = rSpec.maxSpeed || 2.0;
+                robot.color = ROBOT_COLORS[i % ROBOT_COLORS.length];
+                this.robots.push(robot);
+                this.spawnAgent(robot);
+            }
+            this.selectedRobotId = this.robots[0].id;
+        } else {
+            this.createDefaultFleet();
+        }
+
+        const shelfCount = config.shelves ? config.shelves.length : 0;
+        const dockCount = config.deliveryZone ? config.deliveryZone.stations.length : 0;
+        const padCount = config.chargingZone ? config.chargingZone.pads.length : 0;
+        this.emit(`[WAREHOUSE] Logistics layout applied: ${config.width}×${config.height}m (${shelfCount} shelves, ${dockCount} delivery docks, ${padCount} charging pads, ${this.robots.length} AMRs)`);
+    }
+
     createDefaultFleet() {
         this.addRobot('AMR1', 5, 5);
         this.addRobot('AMR2', 14, 7);
@@ -338,12 +386,14 @@ export class Simulation {
 
     generateRandomTasks(count) {
         const target = Math.max(0, Math.min(count, MAX_RANDOM_TASKS));
+        const isLogistics = this.warehouse.shelves && this.warehouse.shelves.length > 0 &&
+                            this.warehouse.getDeliveryStations && this.warehouse.getDeliveryStations().length > 0;
         let created = 0;
         let attempts = 0;
         while (created < target && attempts < 2000) {
             attempts += 1;
-            const pickup = this.warehouse.randomFreePoint();
-            const dropoff = this.warehouse.randomFreePoint();
+            const pickup = isLogistics ? this.warehouse.getRandomPickPoint() : this.warehouse.randomFreePoint();
+            const dropoff = isLogistics ? this.warehouse.getRandomDeliveryPoint() : this.warehouse.randomFreePoint();
             if (pickup && dropoff && !validateTask(this.warehouse, pickup, dropoff)) {
                 const task = new Task(pickup, dropoff);
                 this.tasks.push(task);
@@ -506,7 +556,11 @@ export class Simulation {
         this.auctionRetries.clear();
         this.waitingTasks.clear();
         this.resultSeen.clear();
-        this.createDefaultFleet();
+        if (this.layoutConfig) {
+            this.applyLogisticsLayout(this.layoutConfig);
+        } else {
+            this.createDefaultFleet();
+        }
         this.bindCommunication();
         this.emit('Simulation reset');
     }

@@ -3,7 +3,7 @@ import WarehousePanel from './WarehousePanel.jsx';
 import TaskPanel from './TaskPanel.jsx';
 import AuctionPanel from './AuctionPanel.jsx';
 
-export default function Sidebar({ simulation, mode, setMode, onMutate }) {
+export default function Sidebar({ simulation, mode, setMode, onMutate, onOpenBuilder }) {
     return (
         <div style={{
             width: 260,
@@ -22,7 +22,7 @@ export default function Sidebar({ simulation, mode, setMode, onMutate }) {
                     {simulation.width} × {simulation.height} m · {simulation.robots.length} robots · {simulation.tasks.length} tasks
                 </div>
             </div>
-            <WarehousePanel simulation={simulation} mode={mode} setMode={setMode} onMutate={onMutate} />
+            <WarehousePanel simulation={simulation} mode={mode} setMode={setMode} onMutate={onMutate} onOpenBuilder={onOpenBuilder} />
             <AuctionPanel simulation={simulation} onMutate={onMutate} />
             <TaskPanel simulation={simulation} onMutate={onMutate} />
         </div>

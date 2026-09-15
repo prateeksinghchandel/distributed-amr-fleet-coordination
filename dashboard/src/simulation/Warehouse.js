@@ -11,6 +11,9 @@ export class Warehouse {
         this.dropoffLocations = [];
         this.robots = [];
         this.tasks = [];
+        this.deliveryZone = null;
+        this.chargingZone = null;
+        this.shelves = [];
     }
 
     get bounds() {
@@ -67,6 +70,57 @@ export class Warehouse {
             obs.x = clampNum(obs.x, 0, this.width - obs.width);
             obs.y = clampNum(obs.y, 0, this.height - obs.height);
         }
+    }
+
+    setLogisticsLayout(layout) {
+        if (!layout) return;
+        this.width = layout.width || this.width;
+        this.height = layout.height || this.height;
+        this.deliveryZone = layout.deliveryZone || null;
+        this.chargingZone = layout.chargingZone || null;
+        this.shelves = layout.shelves || [];
+        this.obstacles = [];
+        if (layout.obstacles) {
+            for (const o of layout.obstacles) {
+                const obs = new Obstacle(o.x, o.y, o.width, o.height);
+                obs.type = o.type || 'obstacle';
+                this.obstacles.push(obs);
+            }
+        }
+    }
+
+    getDeliveryStations() {
+        return this.deliveryZone ? this.deliveryZone.stations : [];
+    }
+
+    getChargingPads() {
+        return this.chargingZone ? this.chargingZone.pads : [];
+    }
+
+    getRandomPickPoint() {
+        if (this.shelves.length > 0) {
+            const shelf = this.shelves[Math.floor(Math.random() * this.shelves.length)];
+            if (shelf.pickPoints && shelf.pickPoints.length > 0) {
+                const pt = shelf.pickPoints[Math.floor(Math.random() * shelf.pickPoints.length)];
+                if (this.isValidPoint(pt.x, pt.y, 0.2)) return { x: pt.x, y: pt.y };
+            }
+        }
+        return this.randomFreePoint();
+    }
+
+    getRandomDeliveryPoint() {
+        const stations = this.getDeliveryStations();
+        if (stations.length > 0) {
+            const st = stations[Math.floor(Math.random() * stations.length)];
+            return { x: st.dropoffPoint.x, y: st.dropoffPoint.y };
+        }
+        if (this.deliveryZone) {
+            return {
+                x: this.deliveryZone.x + Math.random() * this.deliveryZone.width,
+                y: 1 + Math.random() * (this.height - 2),
+            };
+        }
+        return this.randomFreePoint();
     }
 
     randomFreePoint(padding = DEFAULT_POINT_PADDING) {
