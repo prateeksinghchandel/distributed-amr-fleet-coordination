@@ -9,6 +9,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "test:sim": "node sim-smoke.test.mjs",
+    "test:builder": "node test/warehouse-builder.test.mjs",
     "test:transport": "node transport.test.mjs",
     "test:distributed": "node test/distributed-fleet.test.mjs",
     "fleet": "bash scripts/start-fleet.sh",

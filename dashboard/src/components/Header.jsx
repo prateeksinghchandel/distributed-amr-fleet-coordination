@@ -2,7 +2,7 @@ import React from 'react';
 
 const SPEEDS = [0.5, 1, 2, 5];
 
-export default function Header({ simulation, onMutate, onReset, onResetCamera }) {
+export default function Header({ simulation, onMutate, onReset, onResetCamera, onOpenBuilder }) {
     const buttonStyle = {
         padding: '4px 10px',
         background: '#16213e',
@@ -32,6 +32,12 @@ export default function Header({ simulation, onMutate, onReset, onResetCamera })
                 SIMULATION: {simulation.stateLabel}
             </div>
             <div style={{ flex: 1 }} />
+            <button
+                style={{ ...buttonStyle, borderColor: '#00c8ff', color: '#00c8ff', fontWeight: 'bold' }}
+                onClick={onOpenBuilder}
+            >
+                ⚙ Build Warehouse
+            </button>
             <button
                 style={buttonStyle}
                 onClick={() => { simulation.togglePaused(); onMutate(); }}

@@ -4,9 +4,10 @@ import Sidebar from './Sidebar.jsx';
 import WarehouseCanvas from './WarehouseCanvas.jsx';
 import FleetPanel from './FleetPanel.jsx';
 import BottomPanel from './BottomPanel.jsx';
+import WarehouseBuilderModal from './WarehouseBuilderModal.jsx';
 import { createSimulation } from '../simulation/Simulation.js';
 
-const simulation = createSimulation();
+const simulation = createSimulation(30, 20, { layout: 'logistics' });
 
 export default function Dashboard() {
     const [, setTick] = useState(0);
@@ -19,6 +20,7 @@ export default function Dashboard() {
     const [debug, setDebug] = useState({});
     const [cameraResetToken, setCameraResetToken] = useState(0);
     const [resetVersion, setResetVersion] = useState(0);
+    const [isBuilderOpen, setIsBuilderOpen] = useState(false);
 
     useEffect(() => {
         simulation.onEvent = (entry) => {
@@ -56,6 +58,13 @@ export default function Dashboard() {
         setCameraResetToken((t) => t + 1);
     }, []);
 
+    const handleBuildWarehouse = useCallback((config) => {
+        simulation.applyLogisticsLayout(config);
+        setResetVersion((v) => v + 1);
+        setCameraResetToken((t) => t + 1);
+        setTick((t) => t + 1);
+    }, []);
+
     return (
         <div style={{
             height: '100vh',
@@ -66,7 +75,13 @@ export default function Dashboard() {
             color: '#e0e0e0',
             fontFamily: 'monospace'
         }}>
-            <Header simulation={simulation} onMutate={handleMutate} onReset={handleReset} onResetCamera={handleResetCamera} />
+            <Header
+                simulation={simulation}
+                onMutate={handleMutate}
+                onReset={handleReset}
+                onResetCamera={handleResetCamera}
+                onOpenBuilder={() => setIsBuilderOpen(true)}
+            />
             <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
                 <Sidebar
                     key={resetVersion}
@@ -74,6 +89,7 @@ export default function Dashboard() {
                     mode={mode}
                     setMode={setMode}
                     onMutate={handleMutate}
+                    onOpenBuilder={() => setIsBuilderOpen(true)}
                 />
                 <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
                     <WarehouseCanvas
@@ -88,6 +104,11 @@ export default function Dashboard() {
                 <FleetPanel simulation={simulation} onMutate={handleMutate} />
             </div>
             <BottomPanel logs={logs} debug={debug} simulation={simulation} />
+            <WarehouseBuilderModal
+                isOpen={isBuilderOpen}
+                onClose={() => setIsBuilderOpen(false)}
+                onBuild={handleBuildWarehouse}
+            />
         </div>
     );
 }

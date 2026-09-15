@@ -3,7 +3,7 @@ import { MIN_DIM, MAX_DIM } from '../simulation/Simulation.js';
 
 const sectionHeader = { fontSize: 11, color: '#888', marginBottom: 6, letterSpacing: 1 };
 
-export default function WarehousePanel({ simulation, mode, setMode, onMutate }) {
+export default function WarehousePanel({ simulation, mode, setMode, onMutate, onOpenBuilder }) {
     const [draftW, setDraftW] = useState(String(simulation.width));
     const [draftH, setDraftH] = useState(String(simulation.height));
     const [dimError, setDimError] = useState(null);
@@ -24,9 +24,31 @@ export default function WarehousePanel({ simulation, mode, setMode, onMutate }) 
         onMutate();
     };
 
+    const deliveryDocks = simulation.warehouse.getDeliveryStations ? simulation.warehouse.getDeliveryStations().length : 0;
+    const chargingPads = simulation.warehouse.getChargingPads ? simulation.warehouse.getChargingPads().length : 0;
+    const shelvesCount = simulation.warehouse.shelves ? simulation.warehouse.shelves.length : 0;
+
     return (
         <div style={{ padding: 12, borderBottom: '1px solid #0f3460' }}>
-            <div style={sectionHeader}>WAREHOUSE</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                <div style={sectionHeader}>WAREHOUSE</div>
+                <button
+                    style={{
+                        padding: '3px 8px', background: '#0f3460', color: '#00c8ff',
+                        border: '1px solid #00c8ff', borderRadius: 3, cursor: 'pointer', fontSize: 10, fontFamily: 'inherit'
+                    }}
+                    onClick={onOpenBuilder}
+                >
+                    ⚙ Build
+                </button>
+            </div>
+            {(deliveryDocks > 0 || chargingPads > 0 || shelvesCount > 0) && (
+                <div style={{ fontSize: 10, color: '#00c8ff', background: 'rgba(0,200,255,0.06)', padding: 6, borderRadius: 3, marginBottom: 8 }}>
+                    <div>📍 Left: {deliveryDocks} Delivery Dock(s)</div>
+                    <div>⚡ Right: {chargingPads} Charging Bay(s)</div>
+                    <div>📦 Center: {shelvesCount} Storage Rack(s)</div>
+                </div>
+            )}
             <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
                 <label style={{ fontSize: 12 }}>W
                     <input

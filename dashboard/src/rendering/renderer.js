@@ -25,7 +25,8 @@ export class Renderer {
         this.drawBackground(w, h);
         this.drawGrid(w, h);
         this.drawBoundary(warehouse);
-        this.drawObstacles(sim.obstacles);
+        this.drawLogisticsZones(warehouse);
+        this.drawObstacles(sim.obstacles, warehouse.shelves);
         this.drawTasks(sim.tasks);
         this.drawRobotPaths(sim.robots);
         this.drawRobots(sim.robots, sim.selectedRobotId);
@@ -108,25 +109,190 @@ export class Renderer {
         ctx.fillText(`(${formatWorldCoord(warehouse.width)}, ${formatWorldCoord(warehouse.height)})`, tr.x - 4, tr.y + 12);
     }
 
-    drawObstacles(obstacles) {
+    drawLogisticsZones(warehouse) {
+        if (!warehouse) return;
         const { ctx, camera, canvas } = this;
+
+        // 1. Delivery Zone on Left
+        if (warehouse.deliveryZone) {
+            const dz = warehouse.deliveryZone;
+            const bl = camera.worldToScreen(dz.x, dz.y, canvas.width, canvas.height);
+            const tr = camera.worldToScreen(dz.x + dz.width, dz.y + dz.height, canvas.width, canvas.height);
+            const zw = tr.x - bl.x;
+            const zh = tr.y - bl.y;
+
+            // Subtle zone background
+            ctx.fillStyle = 'rgba(0, 180, 255, 0.06)';
+            ctx.fillRect(bl.x, bl.y, zw, zh);
+            ctx.strokeStyle = 'rgba(0, 200, 255, 0.35)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 4]);
+            ctx.strokeRect(bl.x, bl.y, zw, zh);
+            ctx.setLineDash([]);
+
+            // Zone title
+            ctx.fillStyle = '#00c8ff';
+            ctx.font = 'bold 11px monospace';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillText('DELIVERY ZONE (DROPOFF)', bl.x + 8, bl.y + 6);
+
+            // Individual delivery docks
+            for (const st of dz.stations || []) {
+                const sbl = camera.worldToScreen(st.x, st.y, canvas.width, canvas.height);
+                const str = camera.worldToScreen(st.x + st.width, st.y + st.height, canvas.width, canvas.height);
+                const dw = str.x - sbl.x;
+                const dh = str.y - sbl.y;
+
+                ctx.fillStyle = 'rgba(0, 80, 140, 0.6)';
+                ctx.fillRect(sbl.x, sbl.y, dw, dh);
+                ctx.strokeStyle = '#00c8ff';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(sbl.x, sbl.y, dw, dh);
+
+                // Conveyor dock lines
+                ctx.strokeStyle = 'rgba(0, 200, 255, 0.25)';
+                ctx.lineWidth = 1;
+                const step = Math.max(6, 8 * camera.zoom);
+                for (let lx = sbl.x + step; lx < sbl.x + dw; lx += step) {
+                    ctx.beginPath();
+                    ctx.moveTo(lx, sbl.y);
+                    ctx.lineTo(lx, sbl.y + dh);
+                    ctx.stroke();
+                }
+
+                // Dock Label
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 10px monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(st.id, sbl.x + dw / 2, sbl.y + dh / 2);
+            }
+        }
+
+        // 2. AMR Charging Area on Right
+        if (warehouse.chargingZone) {
+            const cz = warehouse.chargingZone;
+            const bl = camera.worldToScreen(cz.x, cz.y, canvas.width, canvas.height);
+            const tr = camera.worldToScreen(cz.x + cz.width, cz.y + cz.height, canvas.width, canvas.height);
+            const zw = tr.x - bl.x;
+            const zh = tr.y - bl.y;
+
+            // Subtle zone background
+            ctx.fillStyle = 'rgba(0, 255, 136, 0.05)';
+            ctx.fillRect(bl.x, bl.y, zw, zh);
+            ctx.strokeStyle = 'rgba(0, 255, 136, 0.35)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 4]);
+            ctx.strokeRect(bl.x, bl.y, zw, zh);
+            ctx.setLineDash([]);
+
+            // Zone title
+            ctx.fillStyle = '#00ff88';
+            ctx.font = 'bold 11px monospace';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'top';
+            ctx.fillText('AMR CHARGING HUB', tr.x - 8, bl.y + 6);
+
+            // Individual charging pads
+            for (const pad of cz.pads || []) {
+                const pbl = camera.worldToScreen(pad.x, pad.y, canvas.width, canvas.height);
+                const ptr = camera.worldToScreen(pad.x + pad.width, pad.y + pad.height, canvas.width, canvas.height);
+                const pw = ptr.x - pbl.x;
+                const ph = ptr.y - pbl.y;
+
+                ctx.fillStyle = 'rgba(0, 90, 50, 0.55)';
+                ctx.fillRect(pbl.x, pbl.y, pw, ph);
+                ctx.strokeStyle = '#00ff88';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(pbl.x, pbl.y, pw, ph);
+
+                // Corner brackets on charging pad
+                const cl = Math.min(6, pw * 0.25);
+                ctx.strokeStyle = '#ffd43b';
+                ctx.lineWidth = 1.5;
+                // Top-left
+                ctx.beginPath();
+                ctx.moveTo(pbl.x + cl, pbl.y); ctx.lineTo(pbl.x, pbl.y); ctx.lineTo(pbl.x, pbl.y + cl);
+                // Bottom-right
+                ctx.moveTo(ptr.x - cl, ptr.y); ctx.lineTo(ptr.x, ptr.y); ctx.lineTo(ptr.x, ptr.y - cl);
+                ctx.stroke();
+
+                // Lightning symbol & label
+                ctx.fillStyle = '#ffd43b';
+                ctx.font = 'bold 11px monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(`⚡ ${pad.id}`, pbl.x + pw / 2, pbl.y + ph / 2);
+            }
+        }
+    }
+
+    drawObstacles(obstacles, shelves = []) {
+        const { ctx, camera, canvas } = this;
+        const shelfIds = new Set((shelves || []).map((s) => s.id));
+
         for (const obs of obstacles) {
             const bl = camera.worldToScreen(obs.x, obs.y, canvas.width, canvas.height);
             const tr = camera.worldToScreen(obs.x + obs.width, obs.y + obs.height, canvas.width, canvas.height);
             const w = tr.x - bl.x;
             const h = tr.y - bl.y;
 
-            ctx.fillStyle = '#555577';
-            ctx.fillRect(bl.x, bl.y, w, h);
-            ctx.strokeStyle = '#e94560';
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(bl.x, bl.y, w, h);
+            const isShelf = obs.type === 'shelf' || shelfIds.has(obs.id);
 
-            ctx.fillStyle = '#aaaacc';
-            ctx.font = '10px monospace';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(obs.id, bl.x + w / 2, bl.y + h / 2);
+            if (isShelf) {
+                // Warehouse rack styling
+                ctx.fillStyle = '#2c251f';
+                ctx.fillRect(bl.x, bl.y, w, h);
+                ctx.strokeStyle = '#ffa94d';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(bl.x, bl.y, w, h);
+
+                // Shelf internal compartment lines
+                const slots = 3;
+                ctx.strokeStyle = 'rgba(255, 169, 77, 0.35)';
+                ctx.lineWidth = 1;
+                for (let s = 1; s < slots; s++) {
+                    const cx = bl.x + (w / slots) * s;
+                    ctx.beginPath();
+                    ctx.moveTo(cx, bl.y);
+                    ctx.lineTo(cx, bl.y + h);
+                    ctx.stroke();
+                }
+
+                ctx.fillStyle = '#ffd43b';
+                ctx.font = 'bold 10px monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(obs.id, bl.x + w / 2, bl.y + h / 2);
+            } else {
+                // Standard obstacle styling
+                ctx.fillStyle = '#555577';
+                ctx.fillRect(bl.x, bl.y, w, h);
+                ctx.strokeStyle = '#e94560';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(bl.x, bl.y, w, h);
+
+                ctx.fillStyle = '#aaaacc';
+                ctx.font = '10px monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(obs.id, bl.x + w / 2, bl.y + h / 2);
+            }
+        }
+
+        // Draw pick-face indicators along shelf aisles
+        if (shelves && shelves.length > 0) {
+            for (const shelf of shelves) {
+                if (!shelf.pickPoints) continue;
+                for (const pt of shelf.pickPoints) {
+                    const spt = camera.worldToScreen(pt.x, pt.y, canvas.width, canvas.height);
+                    ctx.beginPath();
+                    ctx.arc(spt.x, spt.y, 2, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgba(255, 212, 59, 0.45)';
+                    ctx.fill();
+                }
+            }
         }
     }
 
