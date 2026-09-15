@@ -88,6 +88,9 @@ export class FleetCoordinator {
         this.unsubs = [
             this.bus.subscribe(TOPICS.AUCTION_RESULT, ({ payload }) => this.handleAuctionResult(payload)),
             this.bus.subscribe(TOPICS.ROBOT_TELEMETRY, ({ payload }) => this.onRobotTelemetry(payload)),
+            this.bus.subscribe(TOPICS.CONTROL_TASK_CREATE, ({ payload }) => this.onControlCreate(payload)),
+            this.bus.subscribe(TOPICS.CONTROL_TASK_ASSIGN, ({ payload }) => this.onControlAssign(payload)),
+            this.bus.subscribe(TOPICS.CONTROL_TASK_CANCEL, ({ payload }) => this.onControlCancel(payload)),
         ];
         this.publishWorld();
     }
@@ -113,6 +116,44 @@ export class FleetCoordinator {
 
     onRobotTelemetry(payload) {
         this.fleet.set(payload.robotId, payload);
+    }
+
+    onControlCreate(payload) {
+        if (typeof payload.randomCount === 'number' && Number.isFinite(payload.randomCount)) {
+            const n = Math.max(0, Math.min(Math.trunc(payload.randomCount), MAX_RANDOM_TASKS));
+            this.log(`[CTRL] generate ${n} random task(s)`);
+            this.generateRandomTasks(n);
+            return;
+        }
+        const pickup = payload.pickup;
+        const dropoff = payload.dropoff;
+        if (!pickup || !dropoff) {
+            this.log('[CTRL] create needs pickup and dropoff (or randomCount)');
+            return;
+        }
+        const task = this.createTask(
+            { x: pickup.x, y: pickup.y },
+            { x: dropoff.x, y: dropoff.y },
+            true
+        );
+        this.log(task ? `[CTRL] create task ${task.id} → queued for auction` : '[CTRL] create task rejected');
+    }
+
+    onControlAssign(payload) {
+        const { taskId, robotId } = payload;
+        if (!taskId || !robotId) {
+            this.log('[CTRL] assign needs taskId and robotId');
+            return;
+        }
+        const ok = this.assignTask(taskId, robotId, { source: 'manual' });
+        this.log(`[CTRL] assign ${taskId} → ${robotId}: ${ok ? 'ok' : 'rejected'}`);
+    }
+
+    onControlCancel(payload) {
+        const { taskId } = payload;
+        if (!taskId) return;
+        this.cancelTask(taskId);
+        this.log(`[CTRL] cancel task ${taskId}`);
     }
 
     anyEligibleRobot() {

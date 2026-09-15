@@ -14,11 +14,11 @@ export class Renderer {
         this.canvas.height = container.clientHeight;
     }
 
-    render(sim, mouseWorldX, mouseWorldY, obstacleDrag) {
+    render(scene, mouseWorldX, mouseWorldY, obstacleDrag) {
         const { ctx, canvas } = this;
         const w = canvas.width;
         const h = canvas.height;
-        const warehouse = sim.warehouse;
+        const warehouse = scene.warehouse;
 
         ctx.clearRect(0, 0, w, h);
 
@@ -26,11 +26,11 @@ export class Renderer {
         this.drawGrid(w, h);
         this.drawBoundary(warehouse);
         this.drawLogisticsZones(warehouse);
-        this.drawObstacles(sim.obstacles, warehouse.shelves);
-        this.drawTasks(sim.tasks);
-        this.drawRobotPaths(sim.robots);
-        this.drawRobots(sim.robots, sim.selectedRobotId);
-        this.drawTargetIndicator(sim);
+        this.drawObstacles(scene.obstacles, warehouse.shelves);
+        this.drawTasks(scene.tasks);
+        this.drawRobotPaths(scene.robots);
+        this.drawRobots(scene.robots, scene.selectedRobotId);
+        this.drawTargetIndicator(scene);
         if (obstacleDrag) this.drawObstaclePreview(obstacleDrag);
         this.drawMouseCoords(mouseWorldX, mouseWorldY);
     }
@@ -348,7 +348,7 @@ export class Renderer {
     drawRobotPaths(robots) {
         const { ctx, camera, canvas } = this;
         for (const robot of robots) {
-            if (robot.targetX === null || robot.targetY === null) continue;
+            if (robot.targetX == null || robot.targetY == null) continue;
             const start = camera.worldToScreen(robot.x, robot.y, canvas.width, canvas.height);
             const end = camera.worldToScreen(robot.targetX, robot.targetY, canvas.width, canvas.height);
 
@@ -410,10 +410,10 @@ export class Renderer {
         }
     }
 
-    drawTargetIndicator(sim) {
+    drawTargetIndicator(scene) {
         const { ctx, camera, canvas } = this;
-        const robot = sim.getSelectedRobot();
-        if (!robot || robot.targetX === null || robot.targetY === null) return;
+        const robot = scene.selectedRobot;
+        if (!robot || robot.targetX == null || robot.targetY == null) return;
 
         const screen = camera.worldToScreen(robot.targetX, robot.targetY, canvas.width, canvas.height);
 

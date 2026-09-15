@@ -25,7 +25,7 @@ from robot.agent import FleetAgent
 from robot.communication import ZenohBus, open_session
 from common import topics
 from common.logger import get_logger
-from server.warehouse import build_from_preset, build_warehouse, WAREHOUSE_PRESETS, WarehouseLayout
+from server.warehouse import build_from_preset, build_warehouse, WAREHOUSE_PRESETS, WarehouseLayout, Point2D
 from server.task_manager import TaskManager
 from server.telemetry_manager import TelemetryManager
 
@@ -105,6 +105,9 @@ class ServerNode:
         bus.subscribe(topics.TASK_NEW, self._on_task_new)
         bus.subscribe(topics.BID_PLACED, self._on_bid_placed)
         bus.subscribe(topics.AUCTION_RESULT, self._on_auction_result)
+        bus.subscribe(topics.CONTROL_TASK_CREATE, self._on_control_create)
+        bus.subscribe(topics.CONTROL_TASK_ASSIGN, self._on_control_assign)
+        bus.subscribe(topics.CONTROL_TASK_CANCEL, self._on_control_cancel)
 
         # Publish initial world state
         self._publish_world()
@@ -140,6 +143,50 @@ class ServerNode:
             f"[BID] {payload.get('robotId')} bid {payload.get('bid')} "
             f"for task {payload.get('taskId')}"
         )
+
+    # ------------------------------------------------------------------
+    # Dashboard command handlers (control/* topics)
+    # ------------------------------------------------------------------
+
+    def _on_control_create(self, _topic: str, payload: dict) -> None:
+        """Dashboard → coordinator: create a task (and auction it)."""
+        try:
+            random_count = payload.get("randomCount")
+            if random_count is not None:
+                n = max(0, min(int(random_count), 100))
+                self.tasks.generate_random_tasks(n)
+                self.log.info(f"[CTRL] generate {n} random task(s)")
+                return
+            pickup = payload.get("pickup", {})
+            dropoff = payload.get("dropoff", {})
+            pt = Point2D(float(pickup.get("x", 0.0)), float(pickup.get("y", 0.0)))
+            dp = Point2D(float(dropoff.get("x", 0.0)), float(dropoff.get("y", 0.0)))
+            priority = int(payload.get("priority", 1))
+            task = self.tasks.create_task(pt, dp, priority=priority, announce=True)
+            if task is None:
+                self.log.warning("[CTRL] create task rejected")
+            else:
+                self.log.info(f"[CTRL] create task {task.id} → queued for auction")
+        except Exception as exc:
+            self.log.warning(f"[CTRL] malformed create payload: {exc}")
+
+    def _on_control_assign(self, _topic: str, payload: dict) -> None:
+        """Dashboard → coordinator: manually assign a pending task to a robot."""
+        task_id = payload.get("taskId")
+        robot_id = payload.get("robotId")
+        if not task_id or not robot_id:
+            self.log.warning("[CTRL] assign needs taskId and robotId")
+            return
+        ok = self.tasks.assign_task(task_id, robot_id, source="manual")
+        self.log.info(f"[CTRL] assign {task_id} → {robot_id}: {'ok' if ok else 'rejected'}")
+
+    def _on_control_cancel(self, _topic: str, payload: dict) -> None:
+        """Dashboard → coordinator: cancel a task."""
+        task_id = payload.get("taskId")
+        if not task_id:
+            return
+        self.tasks.cancel_task(task_id)
+        self.log.info(f"[CTRL] cancel task {task_id}")
 
     # ------------------------------------------------------------------
     # Main step loop

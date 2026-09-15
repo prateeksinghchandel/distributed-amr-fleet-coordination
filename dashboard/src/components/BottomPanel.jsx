@@ -1,7 +1,7 @@
 import React from 'react';
 import DebugPanel from './DebugPanel.jsx';
 
-export default function BottomPanel({ logs, debug, simulation }) {
+export default function BottomPanel({ logs, debug, fleet }) {
     return (
         <div style={{
             height: 180,
@@ -29,7 +29,7 @@ export default function BottomPanel({ logs, debug, simulation }) {
                 padding: 10,
                 overflowY: 'auto'
             }}>
-                <DebugPanel debug={debug} simulation={simulation} />
+                <DebugPanel debug={debug} fleet={fleet} />
             </div>
         </div>
     );

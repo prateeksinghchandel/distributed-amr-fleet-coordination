@@ -1,6 +1,6 @@
 import React from 'react';
 
-export default function FleetPanel({ simulation, onMutate }) {
+export default function FleetPanel({ fleet }) {
     return (
         <div style={{
             width: 230,
@@ -16,19 +16,26 @@ export default function FleetPanel({ simulation, onMutate }) {
                 <button
                     style={{
                         padding: '2px 8px', background: '#0f3460', color: '#e0e0e0',
-                        border: '1px solid #00c8ff', borderRadius: 3, cursor: 'pointer', fontSize: 11, fontFamily: 'inherit'
+                        border: '1px solid #555577', borderRadius: 3, cursor: 'not-allowed',
+                        fontSize: 11, fontFamily: 'inherit', opacity: 0.45
                     }}
-                    onClick={() => { simulation.addRobot(); onMutate(); }}
+                    disabled
+                    title="Robots are spawned by the backend — read-only"
                 >
                     + Add Robot
                 </button>
             </div>
-            {simulation.robots.map((r) => {
-                const selected = simulation.selectedRobotId === r.id;
+            {fleet.robotsList.length === 0 && (
+                <div style={{ fontSize: 11, color: '#666' }}>
+                    Waiting for robots/telemetry…
+                </div>
+            )}
+            {fleet.robotsList.map((r) => {
+                const selected = fleet.selectedRobotId === r.id;
                 return (
                     <div
                         key={r.id}
-                        onClick={() => { simulation.setSelectedRobot(r.id); onMutate(); }}
+                        onClick={() => fleet.setSelectedRobot(r.id)}
                         style={{
                             padding: 8,
                             marginBottom: 6,
