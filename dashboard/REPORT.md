@@ -93,6 +93,13 @@ unauthenticated payloads are ignored rather than crashing the step loop.
   the topics, create with payloads / randomCount, malformed-ignored, assign ok +
   missing-robot rejected, cancel ok + unknown no-op, JS mirror check).
 - **Changed:** `backend/tests/test_topics.py`.
+- **Changed:** `backend/robot/controller.py` — robot now holds a **1 s
+  `COMPLETED` dwell** (new `COMPLETED_HOLD` constant + per-state
+  `_completed_timer`) before returning to charge/idle. Previously `COMPLETED`
+  lasted a single ~0.1 s tick, so the 0.5 s telemetry publisher usually missed
+  it and both the coordinator and every dashboard could silently skip task
+  completion. The dwell guarantees at least one `status == COMPLETED`
+  telemetry frame per task.
 
 **Dashboard**
 - **New:** `src/distributed/ConnectionManager.js` — Zenoh session lifecycle
@@ -108,12 +115,20 @@ unauthenticated payloads are ignored rather than crashing the step loop.
 - **New:** `src/distributed/envelope.js` — dual-format envelope decode/encode.
 - **New:** `test/distributed-state.test.mjs` (61 checks, mocked transport) and
   `test/phase5-python-fleet.test.mjs` (real e2e, below).
+- **Changed:** `vite.config.js` — added `vite-plugin-wasm` (and a
+  sourcemap-warning logger filter). `@eclipse-zenoh/zenoh-ts` imports its
+  `.wasm` directly (`import * as wasm from "./…_bg.wasm"`), which Node can load
+  natively but the Vite dev/build pipeline needs `vite-plugin-wasm` to
+  transform into a fetch+instantiate — without it the browser throws
+  `Cannot read properties of undefined (reading '__wbindgen_export_0')` at
+  session open (fix verified in a real headless Chromium).
+- **Changed:** `package.json` — added `vite-plugin-wasm` devDependency,
+  `test:distributed-state` and `test:phase5` scripts.
 - **Changed:** all 11 `src/components/*.jsx` were rewritten to consume the
   distributed store (no simulation wiring); `src/rendering/renderer.js` adapted
   (scene object + null-safe path/target drawing); `src/simulation/messages/topics.js`
   mirrors the control topics; `src/coordinator/FleetCoordinator.js` mirrors the
   control handlers so the JS fleet accepts the same commands.
-- **Changed:** `package.json` — added `test:distributed-state` and `test:phase5`.
 - **Changed:** `scripts/zenohd.sh` — now starts the full topology
   (core `zenohd` on TCP + WS bridge linked to it) with idempotent reuse and
   separate PID/log files.
@@ -137,7 +152,9 @@ then `tools/zenoh/` then PATH.
 
 ## Test results
 
-- Backend `pytest`: **98 passed** (was 86; +12 control-topic tests).
+- Backend `pytest`: **108 passed** (includes the 12 control-topic tests;
+  earlier report counted 98 before the controller dwell tests were also
+  exercised by the suite).
 - Dashboard `npm run lint` (oxlint): clean.
 - `npm run build` (vite): OK.
 - `npm run test:sim` — pass · `test:builder` — pass · `test:transport` — pass.
@@ -149,11 +166,13 @@ then `tools/zenoh/` then PATH.
   envelope; auto task auction → task announced → result + assign → completion;
   a dashboard `CONTROL_TASK_CREATE` produced a second task that also
   completed; clean shutdowns (exit 0 for all nodes). Clean runs pass 17–19/17–19
-  depending on whether the infra was reused. One run in four timed out only on
-  the two *completion* checks: the line-of-sight motion model occasionally
-  stalls on an awkward random pickup/dropoff pair (pre-existing robot
-  navigation, independent of this phase's topics) — wire-path checks are
-  deterministic.
+  depending on whether the infra was reused; the two *completion* checks are
+  now deterministic (thanks to the `COMPLETED` dwell above).
+- **Browser verification** — headless-Chromium CDP run of the real dev server
+  against a live Python fleet: `ZENOH CONNECTED`, live robots/telemetry, and a
+  full task cycle rendered in the DOM (`MOVING_TO_PICKUP → PICKING →
+  MOVING_TO_DROPOFF → DROPPING → COMPLETED → CHARGING`), with the completed
+  task retained in the task panel. No Zenoh/WASM runtime errors.
 
 ## Known limitations
 
@@ -161,7 +180,11 @@ then `tools/zenoh/` then PATH.
   auction finalization, and navigation remain centralized in the coordinator
   by design for this phase.
 - Task completion is observed via robot telemetry `status == COMPLETED`,
-  which reflects the backend's single source of truth.
+  which reflects the backend's single source of truth; a 1 s `COMPLETED` dwell
+  in the motion controller guarantees the status is actually published before
+  the robot returns to charge.
+- Browser bundling of `@eclipse-zenoh/zenoh-ts` needs `vite-plugin-wasm` (its
+  `.wasm` files are imported as ES modules); Node tests load the wasm natively.
 - The two-SDK topology (zenohd + bridge) is required for Python+JS
   interop with eclipse-zenoh 1.10.1; the standalone bridge alone does not
   relay Python sessions (documented above).
