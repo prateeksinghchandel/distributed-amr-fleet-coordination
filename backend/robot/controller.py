@@ -75,6 +75,7 @@ class RobotState:
     path_index: int = 0
     home_charge_bay: Optional[tuple[float, float]] = None
     _action_timer: float = field(default=0.0, repr=False)
+    _completed_timer: float = field(default=0.0, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -97,6 +98,7 @@ class RobotState:
 ARRIVE_THRESHOLD = 0.15   # m — considered "arrived"
 PICK_DURATION = 1.0       # s
 DROP_DURATION = 0.8       # s
+COMPLETED_HOLD = 1.0      # s — keep COMPLETED observable (telemetry publishes every 0.5s)
 BATTERY_DRAIN = 0.02      # % per metre travelled
 BATTERY_CHARGE = 0.5      # % per second while IDLE/COMPLETED
 
@@ -137,6 +139,7 @@ class MotionController:
         s.dropoff = dropoff
         s.status = Status.MOVING_TO_PICKUP
         s.blocked = False
+        s._completed_timer = 0.0
         s.current_path = self.plan_route(pickup["x"], pickup["y"], obstacles, bounds)
         s.path_index = 0
         self._log(f"{s.id} assigned task {task_id} — planned {len(s.current_path)} waypoints to pickup")
@@ -146,6 +149,7 @@ class MotionController:
         s.current_task_id = None
         s.pickup = None
         s.dropoff = None
+        s._completed_timer = 0.0
         s.current_path = []
         s.path_index = 0
         s.status = Status.IDLE
@@ -155,6 +159,15 @@ class MotionController:
     def update(self, dt: float, obstacles: list[ObstacleRect], bounds: Optional[dict] = None) -> None:
         s = self.state
         if not s.online:
+            return
+
+        # Completed dwell: hold COMPLETED for one telemetry window so the
+        # coordinator and dashboards can observe the completion before the
+        # robot returns to charge / idle.
+        if s.status == Status.COMPLETED and s._completed_timer > 0:
+            s._completed_timer -= dt
+            s.speed = 0.0
+            s.battery = max(0.0, s.battery - 0.02 * dt)
             return
 
         # Autonomous Return-to-Charge Lifecycle:
@@ -216,6 +229,7 @@ class MotionController:
             s.speed = 0.0
             if s._action_timer <= 0:
                 s.status = Status.COMPLETED
+                s._completed_timer = COMPLETED_HOLD
                 self._log(f"{s.id} task {s.current_task_id} COMPLETED")
 
     def _follow_path(self, dt: float) -> bool:
