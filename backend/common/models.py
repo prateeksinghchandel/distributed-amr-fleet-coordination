@@ -144,15 +144,3 @@ class ZenohEnvelope(BaseModel):
     origin: str        # sender id, e.g. "server" or "AMR1"
     type: str          # topic string, e.g. "tasks/new"
     payload: dict      # raw payload dict — callers parse into specific model
-
-
-class Task(BaseModel):
-    """Internal task record (not transmitted as-is on the wire)."""
-    id: str
-    pickup: Point
-    dropoff: Point
-    priority: int = 1
-    status: TaskStatus = TaskStatus.PENDING
-    assigned_robot_id: Optional[str] = None
-    created_at: float = 0.0
-    completed_at: Optional[float] = None

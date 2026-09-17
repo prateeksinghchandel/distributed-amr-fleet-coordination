@@ -14,6 +14,7 @@ import time
 from typing import Optional, Callable
 
 from common import topics
+from robot.battery import BATTERY_CRITICAL_THRESHOLD
 from robot.planning.astar import AStarPlanner, PathNotFoundError, path_distance
 
 
@@ -30,6 +31,9 @@ BLOCKED_PENALTY = 2.5
 CONGESTION_RADIUS = 4.0
 CONGESTION_COST = 3.0
 BATTERY_WEIGHT = 0.05
+# Bid-penalty threshold (< BATTERY_WARN ⇒ +BATTERY_LOW_PENALTY). This is
+# deliberately distinct from the physical return-to-charge threshold
+# (robot/battery.py BATTERY_WARN_THRESHOLD) and must mirror FleetAgent.js.
 BATTERY_WARN = 20.0
 BATTERY_LOW_PENALTY = 30.0
 
@@ -184,7 +188,7 @@ class FleetAgent:
         # Eligibility check
         if not robot.get("online", True):
             return {"eligible": False, "reason": "offline", "bid": None, "costs": None}
-        if robot.get("battery", 100.0) <= 10.0:
+        if robot.get("battery", 100.0) <= BATTERY_CRITICAL_THRESHOLD:
             return {"eligible": False, "reason": "low_battery", "bid": None, "costs": None}
         current_task = robot.get("currentTaskId")
         status = robot.get("status", "IDLE")

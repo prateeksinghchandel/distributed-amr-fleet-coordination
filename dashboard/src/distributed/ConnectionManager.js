@@ -14,6 +14,7 @@
  */
 
 import { encodeEnvelope, decodeEnvelope } from './envelope.js';
+import { DEFAULT_ZENOH_URL, zenohUrlOf } from '../simulation/messages/transport.js';
 
 export const CONNECTION_STATUS = {
     DISCONNECTED: 'DISCONNECTED',
@@ -22,14 +23,10 @@ export const CONNECTION_STATUS = {
     ERROR: 'ERROR',
 };
 
-export const DEFAULT_DASHBOARD_URL = 'ws/127.0.0.1:10000';
+export const DEFAULT_DASHBOARD_URL = DEFAULT_ZENOH_URL;
 
 export function resolveDashboardUrl() {
-    return (
-        (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_ZENOH_URL) ||
-        (typeof process !== 'undefined' && process.env && process.env.AMR_ZENOH_URL) ||
-        DEFAULT_DASHBOARD_URL
-    );
+    return zenohUrlOf();
 }
 
 export class ConnectionManager {

@@ -11,37 +11,12 @@ import random
 from dataclasses import dataclass, field
 from typing import Optional
 
+from common.geometry import Rect  # noqa: F401  (re-exported for existing imports)
+
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Point helper
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Rect:
-    """Axis-aligned rectangle."""
-    x: float
-    y: float
-    width: float
-    height: float
-
-    @property
-    def x2(self) -> float:
-        return self.x + self.width
-
-    @property
-    def y2(self) -> float:
-        return self.y + self.height
-
-    def contains(self, px: float, py: float) -> bool:
-        return self.x <= px <= self.x2 and self.y <= py <= self.y2
-
-    def inflated_contains(self, px: float, py: float, margin: float = 0.35) -> bool:
-        return (self.x - margin <= px <= self.x2 + margin and
-                self.y - margin <= py <= self.y2 + margin)
-
-    def to_dict(self) -> dict:
-        return {"x": self.x, "y": self.y, "width": self.width, "height": self.height}
-
 
 @dataclass
 class Point2D:

@@ -1,5 +1,5 @@
 import { Camera } from './camera.js';
-import { formatWorldCoord } from './coordinates.js';
+import { formatWorldCoord, getGridSpacing } from './coordinates.js';
 
 export class Renderer {
     constructor(canvas) {
@@ -43,7 +43,7 @@ export class Renderer {
 
     drawGrid(w, h) {
         const { ctx, camera } = this;
-        const spacing = camera.getGridSpacing();
+        const spacing = getGridSpacing(camera.zoom);
         const halfW = w / 2 / camera.zoom;
         const halfH = h / 2 / camera.zoom;
 

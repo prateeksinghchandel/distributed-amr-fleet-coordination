@@ -1,13 +1,15 @@
 import math
 import pytest
 
-from robot.controller import ObstacleRect, RobotState, MotionController, Status
+from common.geometry import Rect
+from common.models import RobotStatus
+from robot.controller import RobotState, MotionController
 from robot.planning.astar import AStarPlanner, PathNotFoundError, path_distance
 
 
 def test_astar_finds_route_around_wall():
     planner = AStarPlanner(10, 10, resolution=0.25, robot_radius=0.2, safety_margin=0.05)
-    wall = ObstacleRect("wall", 4, 2, 2, 6)
+    wall = Rect(4, 2, 2, 6)
     path = planner.plan((1, 5), (9, 5), [wall])
     assert path[0] == (1, 5)
     assert path[-1] == (9, 5)
@@ -44,7 +46,7 @@ def test_controller_follows_astar_path_without_entering_shelf():
     state = RobotState(id="AMR1", x=1, y=5, max_speed=2.0, radius=0.4)
     logs = []
     controller = MotionController(state, logs.append, resolution=0.25, safety_margin=0.1)
-    obstacle = ObstacleRect("shelf", 4, 2, 2, 6)
+    obstacle = Rect(4, 2, 2, 6)
     controller.assign_task(
         "T1", {"x": 9, "y": 5}, {"x": 9, "y": 8},
         obstacles=[obstacle], bounds={"width": 10, "height": 10},
@@ -53,9 +55,9 @@ def test_controller_follows_astar_path_without_entering_shelf():
     for _ in range(500):
         controller.update(0.05, [obstacle], bounds={"width": 10, "height": 10})
         assert not obstacle.inflated_contains(state.x, state.y, state.radius + 0.1)
-        if state.status == Status.PICKING:
+        if state.status == RobotStatus.PICKING:
             break
-    assert state.status == Status.PICKING
+    assert state.status == RobotStatus.PICKING
     assert math.dist((state.x, state.y), (9, 5)) < 0.2
 
 
@@ -67,7 +69,7 @@ def test_fleet_agent_uses_astar_distance_when_world_is_available():
         "status": "IDLE", "battery": 100.0, "currentTaskId": None,
         "blocked": False, "online": True, "radius": 0.4,
     }
-    wall = ObstacleRect("wall", 4, 2, 2, 6)
+    wall = Rect(4, 2, 2, 6)
     agent = FleetAgent(
         "AMR1", lambda: robot, lambda *_: None, lambda _: None,
         get_obstacles=lambda: [wall],

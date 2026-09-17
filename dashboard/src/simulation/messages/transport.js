@@ -29,7 +29,7 @@ export function resolveTransportMode(explicit, urlProvided) {
 }
 
 export function zenohUrlOf(options = {}) {
-    return options.url || readEnv('AMR_ZENOH_URL') || DEFAULT_ZENOH_URL;
+    return options.url || readEnv('VITE_ZENOH_URL') || readEnv('AMR_ZENOH_URL') || DEFAULT_ZENOH_URL;
 }
 
 export function createTransport(clock, options = {}) {

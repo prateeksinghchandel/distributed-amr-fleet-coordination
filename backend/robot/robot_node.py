@@ -13,17 +13,17 @@ Options:
 
 from __future__ import annotations
 import argparse
-import json
 import sys
 import time
 import threading
 
-from robot.communication import ZenohBus, open_session
-
 from common import topics
+from common.geometry import Rect
 from common.logger import get_logger
+from common.models import RobotStatus
 from robot.agent import FleetAgent
-from robot.controller import MotionController, ObstacleRect, RobotState, Status
+from robot.communication import ZenohBus, open_session
+from robot.controller import MotionController, RobotState
 
 STEP_S = 0.05   # 50 ms
 
@@ -60,7 +60,7 @@ class RobotNode:
 
         # World data received from coordinator
         self.world: dict = {}
-        self.obstacles: list[ObstacleRect] = []
+        self.obstacles: list[Rect] = []
         self.spawned = False
 
         # Pending tasks (keyed by taskId)
@@ -96,8 +96,7 @@ class RobotNode:
     def _on_world_state(self, _topic: str, payload: dict) -> None:
         self.world = payload
         self.obstacles = [
-            ObstacleRect(id=o.get("id", "?"), x=o["x"], y=o["y"],
-                         width=o["width"], height=o["height"])
+            Rect(x=o["x"], y=o["y"], width=o["width"], height=o["height"])
             for o in payload.get("obstacles", [])
         ]
         # Spawn at roster position on first world state
@@ -187,7 +186,7 @@ class RobotNode:
         self.agent.tick(dt, now)
 
         # If task just completed, reset current_task_id so agent can accept new tasks
-        if self.state.status == Status.COMPLETED:
+        if self.state.status == RobotStatus.COMPLETED:
             self.state.current_task_id = None
 
     def shutdown(self) -> None:

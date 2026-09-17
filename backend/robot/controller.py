@@ -15,40 +15,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
+from common.geometry import Rect
+from common.models import RobotStatus
+from robot.battery import (
+    BATTERY_FULL, BATTERY_WARN_THRESHOLD,
+    CHARGE_RATE_PER_SEC, IDLE_DRAIN_PER_SEC, TRAVEL_DRAIN_PER_METER,
+)
 from robot.planning.astar import AStarPlanner, PathNotFoundError
 from robot.planning.waypoint_follower import WaypointFollower
-
-
-# ---------------------------------------------------------------------------
-# State constants (mirror ROBOT_STATUS in Robot.js)
-# ---------------------------------------------------------------------------
-
-class Status:
-    IDLE = "IDLE"
-    MOVING_TO_PICKUP = "MOVING_TO_PICKUP"
-    PICKING = "PICKING"
-    MOVING_TO_DROPOFF = "MOVING_TO_DROPOFF"
-    DROPPING = "DROPPING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    CHARGING = "CHARGING"
-
-
-# ---------------------------------------------------------------------------
-# Obstacle AABB (thin wrapper around obstacle dicts from world/state)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ObstacleRect:
-    id: str
-    x: float
-    y: float
-    width: float
-    height: float
-
-    def inflated_contains(self, px: float, py: float, margin: float = 0.35) -> bool:
-        return (self.x - margin <= px <= self.x + self.width + margin and
-                self.y - margin <= py <= self.y + self.height + margin)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +39,7 @@ class RobotState:
     max_speed: float = 2.0          # m/s
     radius: float = 0.4             # m
     battery: float = 100.0          # %
-    status: str = Status.IDLE
+    status: RobotStatus = RobotStatus.IDLE
     online: bool = True
     blocked: bool = False
     current_task_id: Optional[str] = None
@@ -99,8 +73,6 @@ ARRIVE_THRESHOLD = 0.15   # m — considered "arrived"
 PICK_DURATION = 1.0       # s
 DROP_DURATION = 0.8       # s
 COMPLETED_HOLD = 1.0      # s — keep COMPLETED observable (telemetry publishes every 0.5s)
-BATTERY_DRAIN = 0.02      # % per metre travelled
-BATTERY_CHARGE = 0.5      # % per second while IDLE/COMPLETED
 
 
 class MotionController:
@@ -137,7 +109,7 @@ class MotionController:
         s.current_task_id = task_id
         s.pickup = pickup
         s.dropoff = dropoff
-        s.status = Status.MOVING_TO_PICKUP
+        s.status = RobotStatus.MOVING_TO_PICKUP
         s.blocked = False
         s._completed_timer = 0.0
         s.current_path = self.plan_route(pickup["x"], pickup["y"], obstacles, bounds)
@@ -152,11 +124,11 @@ class MotionController:
         s._completed_timer = 0.0
         s.current_path = []
         s.path_index = 0
-        s.status = Status.IDLE
+        s.status = RobotStatus.IDLE
         s.speed = 0.0
         self._log(f"{s.id} task cancelled")
 
-    def update(self, dt: float, obstacles: list[ObstacleRect], bounds: Optional[dict] = None) -> None:
+    def update(self, dt: float, obstacles: list[Rect], bounds: Optional[dict] = None) -> None:
         s = self.state
         if not s.online:
             return
@@ -164,71 +136,73 @@ class MotionController:
         # Completed dwell: hold COMPLETED for one telemetry window so the
         # coordinator and dashboards can observe the completion before the
         # robot returns to charge / idle.
-        if s.status == Status.COMPLETED and s._completed_timer > 0:
+        if s.status == RobotStatus.COMPLETED and s._completed_timer > 0:
             s._completed_timer -= dt
             s.speed = 0.0
-            s.battery = max(0.0, s.battery - 0.02 * dt)
+            s.battery = max(0.0, s.battery - IDLE_DRAIN_PER_SEC * dt)
             return
 
         # Autonomous Return-to-Charge Lifecycle:
-        # If robot is low battery (<25%) and not busy delivering, or IDLE with charge < 100% and a charge pad is known:
-        if (s.status == Status.IDLE or s.status == Status.COMPLETED or (s.battery < 25.0 and s.status != Status.CHARGING and not s.current_task_id)):
+        # If robot is low battery (< WARN) and not busy delivering, or IDLE with
+        # charge < 100% and a charge pad is known:
+        if (s.status == RobotStatus.IDLE or s.status == RobotStatus.COMPLETED or
+                (s.battery < BATTERY_WARN_THRESHOLD and s.status != RobotStatus.CHARGING and not s.current_task_id)):
             if s.home_charge_bay and math.dist((s.x, s.y), s.home_charge_bay) > 0.3:
-                s.status = Status.CHARGING
+                s.status = RobotStatus.CHARGING
                 s.current_path = self.plan_route(s.home_charge_bay[0], s.home_charge_bay[1], obstacles, bounds)
                 s.path_index = 0
                 self._log(f"{s.id} returning to charging bay ({s.home_charge_bay[0]:.1f}, {s.home_charge_bay[1]:.1f})")
 
-        if s.status == Status.CHARGING:
+        if s.status == RobotStatus.CHARGING:
             arrived = self._follow_path(dt)
             if arrived or (s.home_charge_bay and math.dist((s.x, s.y), s.home_charge_bay) <= 0.3):
                 s.speed = 0.0
-                s.battery = min(100.0, s.battery + 8.0 * dt)
-                if s.battery >= 100.0:
-                    s.status = Status.IDLE
+                s.battery = min(BATTERY_FULL, s.battery + CHARGE_RATE_PER_SEC * dt)
+                if s.battery >= BATTERY_FULL:
+                    s.status = RobotStatus.IDLE
                     self._log(f"{s.id} fully charged (100%)")
             return
 
-        if s.status == Status.IDLE or s.status == Status.COMPLETED:
+        if s.status == RobotStatus.IDLE or s.status == RobotStatus.COMPLETED:
             # Idle standby drain
-            s.battery = max(0.0, s.battery - 0.02 * dt)
+            s.battery = max(0.0, s.battery - IDLE_DRAIN_PER_SEC * dt)
             s.speed = 0.0
             return
 
-        if s.status == Status.MOVING_TO_PICKUP:
+        if s.status == RobotStatus.MOVING_TO_PICKUP:
             arrived = self._follow_path(dt)
             if arrived:
-                s.status = Status.PICKING
+                s.status = RobotStatus.PICKING
                 s._action_timer = PICK_DURATION
                 s.speed = 0.0
                 s.current_path = []
                 s.path_index = 0
                 self._log(f"{s.id} arrived at pickup — picking")
 
-        elif s.status == Status.PICKING:
+        elif s.status == RobotStatus.PICKING:
             s._action_timer -= dt
             s.speed = 0.0
             if s._action_timer <= 0 and s.dropoff:
-                s.status = Status.MOVING_TO_DROPOFF
+                s.status = RobotStatus.MOVING_TO_DROPOFF
                 s.current_path = self.plan_route(s.dropoff["x"], s.dropoff["y"], obstacles, bounds)
                 s.path_index = 0
                 self._log(f"{s.id} picked up — planned {len(s.current_path)} waypoints to dropoff")
 
-        elif s.status == Status.MOVING_TO_DROPOFF:
+        elif s.status == RobotStatus.MOVING_TO_DROPOFF:
             arrived = self._follow_path(dt)
             if arrived:
-                s.status = Status.DROPPING
+                s.status = RobotStatus.DROPPING
                 s._action_timer = DROP_DURATION
                 s.speed = 0.0
                 s.current_path = []
                 s.path_index = 0
                 self._log(f"{s.id} arrived at dropoff — dropping")
 
-        elif s.status == Status.DROPPING:
+        elif s.status == RobotStatus.DROPPING:
             s._action_timer -= dt
             s.speed = 0.0
             if s._action_timer <= 0:
-                s.status = Status.COMPLETED
+                s.status = RobotStatus.COMPLETED
                 s._completed_timer = COMPLETED_HOLD
                 self._log(f"{s.id} task {s.current_task_id} COMPLETED")
 
@@ -245,5 +219,5 @@ class MotionController:
         s.heading = heading
         s.path_index = new_idx
         s.speed = travelled / dt if dt > 0 else 0.0
-        s.battery = max(0.0, s.battery - BATTERY_DRAIN * travelled)
+        s.battery = max(0.0, s.battery - TRAVEL_DRAIN_PER_METER * travelled)
         return arrived

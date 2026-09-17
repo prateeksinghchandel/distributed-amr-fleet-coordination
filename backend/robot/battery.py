@@ -14,11 +14,14 @@ from typing import Optional
 
 
 BATTERY_FULL = 100.0
-BATTERY_WARN_THRESHOLD = 25.0
+BATTERY_WARN_THRESHOLD = 25.0    # physical return-to-charge threshold (controller.py)
 BATTERY_CRITICAL_THRESHOLD = 10.0
-CHARGE_RATE_PER_SEC = 8.0     # +8.0% per sec while charging on pad
-TRAVEL_DRAIN_PER_METER = 0.05  # % consumed per meter moved
-IDLE_DRAIN_PER_SEC = 0.02      # % consumed per sec while standby
+CHARGE_RATE_PER_SEC = 8.0        # +8.0% per sec while charging on pad
+# NOTE: TRAVEL_DRAIN_PER_METER and IDLE_DRAIN_PER_SEC are the runtime values the
+# MotionController applies. The auction bid threshold in agent.py/FleetAgent.js
+# (BATTERY_WARN = 20.0) is a separate cost-penalty threshold, not a charge state.
+TRAVEL_DRAIN_PER_METER = 0.02    # % consumed per meter moved
+IDLE_DRAIN_PER_SEC = 0.02        # % consumed per sec while standby
 
 
 @dataclass

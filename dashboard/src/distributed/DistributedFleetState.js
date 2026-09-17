@@ -12,6 +12,7 @@
 
 import { ConnectionManager, CONNECTION_STATUS, resolveDashboardUrl } from './ConnectionManager.js';
 import { TOPICS } from '../simulation/messages/topics.js';
+import { ROBOT_COLORS } from '../simulation/robotColors.js';
 
 export const TASK_STATUS = {
     PENDING: 'PENDING',
@@ -23,7 +24,6 @@ export const TASK_STATUS = {
     FAILED: 'FAILED',
 };
 
-const ROBOT_COLORS = ['#00c8ff', '#00d084', '#ffa94d', '#f06595', '#b197fc', '#ffd43b'];
 const STALE_TELEMETRY_S = 5.0;
 const MAX_EVENTS = 400;
 const MAX_AUCTION_HISTORY = 20;

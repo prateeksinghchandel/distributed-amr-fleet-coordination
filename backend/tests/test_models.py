@@ -8,7 +8,7 @@ from common.models import (
     Point, TaskNewPayload, TaskAssignedPayload, TaskCancelledPayload,
     BidPlacedPayload, BidCosts, AuctionResultPayload,
     TelemetryPayload, WorldStatePayload, ObstacleSchema, RosterEntry,
-    RobotStatus, TaskStatus, Task, ZenohEnvelope,
+    RobotStatus, TaskStatus, ZenohEnvelope,
 )
 
 
@@ -142,15 +142,3 @@ class TestZenohEnvelope:
         assert env.origin == "server"
         assert env.type == "tasks/new"
         assert env.payload["taskId"] == "T-001"
-
-
-class TestTask:
-    def test_defaults(self):
-        t = Task(
-            id="T-ABC",
-            pickup=Point(x=5.0, y=3.0),
-            dropoff=Point(x=2.0, y=10.0),
-        )
-        assert t.status == TaskStatus.PENDING
-        assert t.priority == 1
-        assert t.assigned_robot_id is None

@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { Renderer } from '../rendering/renderer.js';
+import { getGridSpacing } from '../rendering/coordinates.js';
 
 export default function WarehouseCanvas({ fleet, cameraResetToken, onCameraChange }) {
     const canvasRef = useRef(null);
@@ -42,7 +43,7 @@ export default function WarehouseCanvas({ fleet, cameraResetToken, onCameraChang
                     ...cameraStateRef.current,
                     fps: fpsCounterRef.current.count,
                     canvasSize: `${canvas.width}×${canvas.height}`,
-                    gridSpacing: renderer.camera.getGridSpacing(),
+                    gridSpacing: getGridSpacing(renderer.camera.zoom),
                     mouseWorld: mouseWorldRef.current,
                     fleetStats: {
                         robots: fleetRefCurrent.robotsList.length,

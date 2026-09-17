@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional, Callable
-from common.models import TaskStatus, Point
+from common.models import RobotStatus, TaskStatus, Point
 from server.warehouse import WarehouseLayout, Point2D
 
 
@@ -133,7 +133,7 @@ class TaskManager:
         for r in self.fleet.values():
             if r.get("online", True) and not r.get("currentTaskId"):
                 return True
-            if r.get("online", True) and r.get("status") == "COMPLETED":
+            if r.get("online", True) and r.get("status") == RobotStatus.COMPLETED:
                 return True
         return False
 
@@ -189,7 +189,7 @@ class TaskManager:
         if not robot.get("online", True):
             self._log(f"Cannot assign {task_id}: {robot_id} is offline")
             return False
-        if robot.get("currentTaskId") and robot.get("status") != "COMPLETED":
+        if robot.get("currentTaskId") and robot.get("status") != RobotStatus.COMPLETED:
             self._log(f"Cannot assign {task_id}: {robot_id} is busy")
             return False
 
@@ -289,18 +289,18 @@ class TaskManager:
             if not robot or robot.get("currentTaskId") != task.id:
                 continue
             status = robot.get("status", "IDLE")
-            if status == "COMPLETED":
+            if status == RobotStatus.COMPLETED:
                 if task.status != TaskStatus.COMPLETED:
                     task.status = TaskStatus.COMPLETED
                     task.completed_at = time.time()
                     self._log(f"Task {task.id} completed by {task.assigned_robot_id}")
-            elif status in ("FAILED",) or not robot.get("online", True):
+            elif status == RobotStatus.FAILED or not robot.get("online", True):
                 if task.status != TaskStatus.FAILED:
                     task.status = TaskStatus.FAILED
                     self._log(f"Task {task.id} failed ({task.assigned_robot_id})")
-            elif status == "PICKING":
+            elif status == RobotStatus.PICKING:
                 task.status = TaskStatus.PICKING_UP
-            elif status in ("MOVING_TO_DROPOFF", "DROPPING"):
+            elif status in (RobotStatus.MOVING_TO_DROPOFF, RobotStatus.DROPPING):
                 task.status = TaskStatus.DELIVERING
 
     # ------------------------------------------------------------------

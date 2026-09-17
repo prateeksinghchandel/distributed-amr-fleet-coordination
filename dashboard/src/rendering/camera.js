@@ -32,13 +32,4 @@ export class Camera {
         this.y = 0;
         this.zoom = 1;
     }
-
-    getGridSpacing() {
-        if (this.zoom < 0.3) return 20;
-        if (this.zoom < 0.6) return 10;
-        if (this.zoom < 1.5) return 5;
-        if (this.zoom < 4) return 2;
-        if (this.zoom < 8) return 1;
-        return 0.5;
-    }
 }

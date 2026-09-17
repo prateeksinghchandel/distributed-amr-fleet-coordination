@@ -6,6 +6,7 @@ import { createTransport } from './messages/transport.js';
 import { TOPICS } from './messages/topics.js';
 import { FleetAgent, AUCTION_CONSTANTS, telemetryOf } from './fleet/FleetAgent.js';
 import { buildWarehouseConfig } from './WarehouseBuilder.js';
+import { ROBOT_COLORS } from './robotColors.js';
 
 export const DEFAULT_WIDTH = 30;
 export const DEFAULT_HEIGHT = 20;
@@ -14,7 +15,6 @@ export const MAX_DIM = 100;
 export const MAX_RANDOM_TASKS = 100;
 export const MAX_AUCTION_RETRIES = 3;
 
-const ROBOT_COLORS = ['#00c8ff', '#00d084', '#ffa94d', '#f06595', '#b197fc', '#ffd43b'];
 const MAX_EVENTS = 500;
 const MAX_AUCTION_HISTORY = 20;
 

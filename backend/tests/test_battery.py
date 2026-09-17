@@ -6,10 +6,13 @@ import math
 import pytest
 from robot.battery import (
     BatteryState, BATTERY_FULL, BATTERY_WARN_THRESHOLD,
-    BATTERY_CRITICAL_THRESHOLD, CHARGE_RATE_PER_SEC
+    BATTERY_CRITICAL_THRESHOLD, CHARGE_RATE_PER_SEC,
+    TRAVEL_DRAIN_PER_METER, IDLE_DRAIN_PER_SEC,
 )
-from robot.controller import RobotState, MotionController, Status, ObstacleRect
+from robot.controller import RobotState, MotionController
 from robot.agent import FleetAgent
+from common.geometry import Rect
+from common.models import RobotStatus
 
 
 def test_battery_discharge_and_charge():
@@ -21,7 +24,7 @@ def test_battery_discharge_and_charge():
     # Move 100 meters, 10 seconds
     b.discharge(distance_traveled=100.0, dt=10.0)
     assert b.level < 80.0
-    assert b.level == pytest.approx(80.0 - (100 * 0.05 + 10 * 0.02))
+    assert b.level == pytest.approx(80.0 - (100 * TRAVEL_DRAIN_PER_METER + 10 * IDLE_DRAIN_PER_SEC))
 
     # Test charging
     b.is_charging = True
@@ -31,11 +34,11 @@ def test_battery_discharge_and_charge():
 
 
 def test_battery_threshold_flags():
-    b = BatteryState(level=24.0)
+    b = BatteryState(level=BATTERY_WARN_THRESHOLD - 1.0)
     assert b.is_low()
     assert not b.is_critical()
 
-    b.level = 9.0
+    b.level = BATTERY_CRITICAL_THRESHOLD - 1.0
     assert b.is_critical()
     assert b.is_low()
 
@@ -63,15 +66,22 @@ def test_controller_autonomous_returns_to_charge():
 
     # Calling update when idle + low battery triggers charging return
     controller.update(0.1, obstacles=[], bounds={"width": 10, "height": 10})
-    assert state.status == Status.CHARGING
+    assert state.status == RobotStatus.CHARGING
     assert len(state.current_path) >= 2
 
     # Simulate steps until it reaches the charging bay and charges to 100%
     for _ in range(300):
         controller.update(0.1, obstacles=[], bounds={"width": 10, "height": 10})
-        if state.status == Status.IDLE and state.battery >= 100.0:
+        if state.status == RobotStatus.IDLE and state.battery >= BATTERY_FULL:
             break
 
-    assert state.status == Status.IDLE
-    assert state.battery == pytest.approx(100.0)
+    assert state.status == RobotStatus.IDLE
+    assert state.battery == pytest.approx(BATTERY_FULL)
     assert math.dist((state.x, state.y), state.home_charge_bay) <= 0.35
+
+
+def test_obstacle_rect_is_shared_geometry():
+    """Controller obstacles use the shared Rect (no duplicate ObstacleRect)."""
+    r = Rect(4, 2, 2, 6)
+    assert r.inflated_contains(5.0, 5.0)
+    assert not r.inflated_contains(9.0, 5.0)
