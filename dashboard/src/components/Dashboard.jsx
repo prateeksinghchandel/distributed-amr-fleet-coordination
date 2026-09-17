@@ -52,7 +52,7 @@ export default function Dashboard() {
             fontFamily: 'monospace'
         }}>
             <Header fleet={fleet} onResetCamera={handleResetCamera} />
-            <FleetControl />
+            <FleetControl fleet={fleet} />
             <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
                 <Sidebar fleet={fleet} />
                 <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>

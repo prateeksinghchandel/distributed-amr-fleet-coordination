@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useFleetManager } from '../hooks/useFleetManager.js';
+import { CONNECTION_STATUS } from '../distributed/ConnectionManager.js';
 
 const C = {
     RUNNING: '#00ff88',
@@ -46,12 +47,12 @@ const dotStyle = (color) => ({
     flex: '0 0 auto',
 });
 
-function StatusDot({ state }) {
+function StatusDot({ state, label }) {
     const color = C[state] || C.STOPPED;
     return (
         <span style={{ display: 'inline-flex', alignItems: 'center', color, fontSize: 11, minWidth: 84 }}>
             <span style={dotStyle(color)} />
-            {STATE_LABEL[state] || (state || 'UNKNOWN').toUpperCase()}
+            {label || STATE_LABEL[state] || (state || 'UNKNOWN').toUpperCase()}
         </span>
     );
 }
@@ -96,28 +97,42 @@ function SectionTitle({ children }) {
 function ProcessRow({ title, proc, busy, onStart, onStop, onRestart }) {
     const running = proc && (proc.state === 'RUNNING' || proc.state === 'STARTING' || proc.state === 'STOPPING');
     return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3, minHeight: 26 }}>
-            <span style={{ width: 148, fontSize: 12, color: '#e0e0e0' }}>{title}</span>
-            {running ? (
-                <ActionButton label={'STOP'} onClick={onStop} disabled={busy} title="Gracefully stop" />
-            ) : (
-                <ActionButton label={'START'} onClick={onStart} disabled={busy} title="Start" />
+        <React.Fragment>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3, minHeight: 26 }}>
+                <span style={{ width: 148, fontSize: 12, color: '#e0e0e0' }}>{title}</span>
+                {running ? (
+                    <ActionButton label={'STOP'} onClick={onStop} disabled={busy} title="Gracefully stop" />
+                ) : (
+                    <ActionButton label={'START'} onClick={onStart} disabled={busy} title="Start" />
+                )}
+                <ActionButton
+                    label="RESTART"
+                    onClick={onRestart}
+                    disabled={busy || !proc}
+                    title={proc && !running ? 'Start' : 'Restart'}
+                />
+                <StatusDot state={proc ? proc.state : 'STOPPED'} />
+                <span style={{ fontSize: 10, color: '#666', marginLeft: 4 }}>
+                    {proc && proc.pid ? `pid ${proc.pid}` : ''}
+                </span>
+            </div>
+            {proc && proc.lastError && (
+                <div style={{ fontSize: 10, color: '#e94560', margin: '-2px 0 4px 148px', wordBreak: 'break-all' }}>
+                    ⚠ {proc.lastError}
+                </div>
             )}
-            <ActionButton
-                label="RESTART"
-                onClick={onRestart}
-                disabled={busy || !proc}
-                title={proc && !running ? 'Start' : 'Restart'}
-            />
-            <StatusDot state={proc ? proc.state : 'STOPPED'} />
-            <span style={{ fontSize: 10, color: '#666', marginLeft: 4 }}>
-                {proc && proc.pid ? `pid ${proc.pid}` : ''}
-            </span>
-        </div>
+        </React.Fragment>
     );
 }
 
-export default function FleetControl() {
+const logTabsFor = (amrs) => [
+    { key: 'zenohd', label: 'Zenoh' },
+    { key: 'bridge', label: 'Bridge' },
+    { key: 'coordinator', label: 'Coordinator' },
+    ...amrs.map((a) => ({ key: a.name || `amr:${a.id}`, label: a.id })),
+];
+
+export default function FleetControl({ fleet }) {
     const { status, error, managerAvailable, busy, lastCommandError, command, fetchLogs } = useFleetManager();
     const [open, setOpen] = useState(true);
     const [logSource, setLogSource] = useState(null);
@@ -127,11 +142,28 @@ export default function FleetControl() {
     const amrs = useMemo(() => (status ? status.amrs : []), [status]);
     const ready = status ? status.ready : false;
 
-    const logNames = useMemo(() => {
-        const names = ['zenoh', 'bridge', 'coordinator'];
-        for (const a of amrs) names.push(a.id);
-        return names;
-    }, [amrs]);
+    const bridgeState = status ? status.infrastructure.bridge.state : 'STOPPED';
+
+    useEffect(() => {
+        // As soon as the Fleet Manager reports the WS bridge RUNNING, snap the
+        // Zenoh connection to connected instead of waiting on the reconnect backoff.
+        if (bridgeState === 'RUNNING' && fleet && fleet.conn && fleet.conn.status !== CONNECTION_STATUS.CONNECTED) {
+            fleet.conn.retryConnection();
+        }
+    }, [bridgeState, fleet]);
+
+    const logTabs = useMemo(() => logTabsFor(amrs), [amrs]);
+
+    const processMeta = useMemo(() => {
+        if (!status) return {};
+        const map = {
+            zenohd: status.infrastructure.zenoh,
+            bridge: status.infrastructure.bridge,
+            coordinator: status.backend.coordinator,
+        };
+        for (const a of status.amrs) map[a.name || `amr:${a.id}`] = a;
+        return map;
+    }, [status]);
 
     const nextDefaultId = useMemo(() => {
         const used = new Set(amrs.map((a) => a.id));
@@ -191,7 +223,7 @@ export default function FleetControl() {
         if (!window.confirm(`Remove ${id}? The AMR will be deleted from the configured fleet.`)) return;
         try {
             await command(`/api/amrs/${encodeURIComponent(id)}`, { method: 'DELETE' });
-            if (logSource === id) setLogSource(null);
+            if (logSource === id || logSource === `amr:${id}`) setLogSource(null);
         } catch {
             /* error surfaced in the header strip */
         }
@@ -199,7 +231,7 @@ export default function FleetControl() {
 
     return (
         <div style={{ borderBottom: '2px solid #0f3460', background: '#16213e', color: '#e0e0e0', fontFamily: 'monospace' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', cursor: 'pointer' }} onClick={() => setOpen((o) => !o)}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', cursor: 'pointer' }} onClick={(e) => { if (e.target.closest('button')) return; setOpen((o) => !o); }}>
                 <span style={{ fontSize: 11, letterSpacing: 1, color: '#e94560', fontWeight: 'bold' }}>▸ FLEET CONTROL</span>
                 <span
                     style={{
@@ -233,7 +265,7 @@ export default function FleetControl() {
                         <ProcessRow
                             title="Zenoh Router"
                             proc={zenoh}
-                            busy={isBusy('/api/zenoh/restart')}
+                            busy={isBusy('/api/zenoh/start') || isBusy('/api/zenoh/stop') || isBusy('/api/zenoh/restart')}
                             onStart={() => command('/api/zenoh/start')}
                             onStop={() => command('/api/zenoh/stop')}
                             onRestart={() => command('/api/zenoh/restart')}
@@ -241,7 +273,7 @@ export default function FleetControl() {
                         <ProcessRow
                             title="WebSocket Bridge"
                             proc={bridge}
-                            busy={isBusy('/api/bridge/restart')}
+                            busy={isBusy('/api/bridge/start') || isBusy('/api/bridge/stop') || isBusy('/api/bridge/restart')}
                             onStart={() => command('/api/bridge/start')}
                             onStop={() => command('/api/bridge/stop')}
                             onRestart={() => command('/api/bridge/restart')}
@@ -253,7 +285,7 @@ export default function FleetControl() {
                         <ProcessRow
                             title="Coordinator"
                             proc={coord}
-                            busy={isBusy('/api/coordinator/restart')}
+                            busy={isBusy('/api/coordinator/start') || isBusy('/api/coordinator/stop') || isBusy('/api/coordinator/restart')}
                             onStart={() => command('/api/coordinator/start')}
                             onStop={() => command('/api/coordinator/stop')}
                             onRestart={() => command('/api/coordinator/restart')}
@@ -266,16 +298,30 @@ export default function FleetControl() {
                             <div style={{ fontSize: 11, color: '#8a8a9a', marginBottom: 6 }}>No AMRs configured.</div>
                         )}
                         {amrs.map((a) => (
-                            <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3, minHeight: 26 }}>
-                                <span style={{ width: 76, fontSize: 12, color: '#e0e0e0' }}>{a.id}</span>
-                                {(a.state === 'RUNNING' || a.state === 'STARTING' || a.state === 'STOPPING') ? (
-                                    <ActionButton label={'STOP'} onClick={() => command(`/api/amrs/${encodeURIComponent(a.id)}/stop`)} disabled={isBusy(`/api/amrs/${a.id}/start`)} />
-                                ) : (
-                                    <ActionButton label={'START'} onClick={() => command(`/api/amrs/${encodeURIComponent(a.id)}/start`)} disabled={isBusy(`/api/amrs/${a.id}/start`)} />
+                            <div key={a.id} style={{ display: 'flex', flexDirection: 'column' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3, minHeight: 26 }}>
+                                    <span style={{ width: 76, fontSize: 12, color: '#e0e0e0' }}>{a.id}</span>
+                                    {(() => {
+                                        const amrBusy = isBusy(`/api/amrs/${a.id}/start`) || isBusy(`/api/amrs/${a.id}/stop`) || isBusy(`/api/amrs/${a.id}/restart`);
+                                        return (
+                                            <React.Fragment>
+                                                {(a.state === 'RUNNING' || a.state === 'STARTING' || a.state === 'STOPPING') ? (
+                                                    <ActionButton label={'STOP'} onClick={() => command(`/api/amrs/${encodeURIComponent(a.id)}/stop`)} disabled={amrBusy} />
+                                                ) : (
+                                                    <ActionButton label={'START'} onClick={() => command(`/api/amrs/${encodeURIComponent(a.id)}/start`)} disabled={amrBusy} />
+                                                )}
+                                                <ActionButton label="RESTART" onClick={() => command(`/api/amrs/${encodeURIComponent(a.id)}/restart`)} disabled={amrBusy} />
+                                                <StatusDot state={a.state} label={a.state === 'RUNNING' ? 'ONLINE' : undefined} />
+                                                <ActionButton label="REMOVE" style="danger" onClick={() => handleRemove(a.id)} disabled={amrBusy} />
+                                            </React.Fragment>
+                                        );
+                                    })()}
+                                </div>
+                                {a.lastError && (
+                                    <div style={{ fontSize: 10, color: '#e94560', margin: '-2px 0 4px', wordBreak: 'break-all' }}>
+                                        ⚠ {a.lastError}
+                                    </div>
                                 )}
-                                <ActionButton label="RESTART" onClick={() => command(`/api/amrs/${encodeURIComponent(a.id)}/restart`)} disabled={isBusy(`/api/amrs/${a.id}/restart`)} />
-                                <StatusDot state={a.state} />
-                                <ActionButton label="REMOVE" style="danger" onClick={() => handleRemove(a.id)} disabled={isBusy(`/api/amrs/${a.id}/restart`)} />
                             </div>
                         ))}
                         <form onSubmit={handleCreate} style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
@@ -312,30 +358,55 @@ export default function FleetControl() {
                     <div style={{ minWidth: 420, flex: 1 }}>
                         <SectionTitle>LOGS</SectionTitle>
                         <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6 }}>
-                            {logNames.map((name) => (
+                            {logTabs.map((tab) => (
                                 <button
-                                    key={name}
+                                    key={tab.key}
                                     type="button"
                                     onClick={() => {
-                                        const next = logSource === name ? null : name;
+                                        const next = logSource === tab.key ? null : tab.key;
                                         setLogSource(next);
                                         if (!next) setLogData({ lines: [] });
                                     }}
                                     style={{
                                         ...baseButton,
-                                        borderColor: logSource === name ? '#00ffff' : '#555577',
-                                        color: logSource === name ? '#00ffff' : '#e0e0e0',
+                                        borderColor: logSource === tab.key ? '#00ffff' : '#555577',
+                                        color: logSource === tab.key ? '#00ffff' : '#e0e0e0',
                                     }}
                                 >
-                                    {name}
+                                    {tab.label}
                                 </button>
                             ))}
                         </div>
                         {logSource ? (
-                            <div style={{ background: '#0a0a1a', border: '1px solid #0f3460', borderRadius: 3, padding: 8, height: 140, overflowY: 'auto', fontSize: 10, color: '#c8d4e8', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                                {logData.error && <div style={{ color: '#e94560' }}>log error: {logData.error}</div>}
-                                {logData.lines.length === 0 && !logData.error && <span style={{ color: '#8a8a9a' }}>no log output yet</span>}
-                                {logData.lines.join('\n')}
+                            <div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, marginBottom: 4, minHeight: 16 }}>
+                                    {(() => {
+                                        const meta = processMeta[logSource];
+                                        if (!meta) return null;
+                                        return (
+                                            <React.Fragment>
+                                                <StatusDot state={meta.state} label={meta.state === 'RUNNING' && logSource.startsWith('amr:') ? 'ONLINE' : undefined} />
+                                                {meta.lastError && (
+                                                    <span style={{ color: '#e94560', wordBreak: 'break-all' }}>⚠ {meta.lastError}</span>
+                                                )}
+                                            </React.Fragment>
+                                        );
+                                    })()}
+                                </div>
+                                <div style={{ background: '#0a0a1a', border: '1px solid #0f3460', borderRadius: 3, padding: 8, height: 140, overflowY: 'auto', fontSize: 10, color: '#c8d4e8', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                                    {logData.error && <div style={{ color: '#e94560' }}>log error: {logData.error}</div>}
+                                    {logData.lines.length === 0 && !logData.error && (
+                                        <span style={{ color: '#8a8a9a' }}>
+                                            {(() => {
+                                                const state = processMeta[logSource] ? processMeta[logSource].state : null;
+                                                if (state === 'STOPPED') return 'process not started — capture begins when you press START' + (logSource === 'zenohd' ? ' (with START ALL the whole stack comes up)' : '');
+                                                if (state === 'CRASHED') return 'process crashed before producing output';
+                                                return 'no log output yet';
+                                            })()}
+                                        </span>
+                                    )}
+                                    {logData.lines.join('\n')}
+                                </div>
                             </div>
                         ) : (
                             <div style={{ fontSize: 11, color: '#8a8a9a' }}>Select a process above to view its captured stdout/stderr.</div>

@@ -55,7 +55,8 @@ export function useFleetManager(options = {}) {
         setBusy((b) => ({ ...b, [key]: true }));
         setLastCommandError(null);
         try {
-            const res = await fetch(`${API_BASE}${path}`, {
+            const url = path.startsWith('/api') ? path : `${API_BASE}${path}`;
+            const res = await fetch(url, {
                 method,
                 headers: body ? { 'Content-Type': 'application/json' } : undefined,
                 body: body ? JSON.stringify(body) : undefined,
