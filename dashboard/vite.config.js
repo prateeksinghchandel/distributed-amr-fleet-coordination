@@ -30,4 +30,10 @@ function silenceZenohSourcemapWarnings() {
 // https://vite.dev/config/
 export default defineConfig({
     plugins: [react(), wasm(), silenceZenohSourcemapWarnings()],
+    server: {
+        // Proxy Fleet Manager API (/api/* -> local Fleet Manager HTTP service)
+        proxy: {
+            '/api': 'http://127.0.0.1:8270',
+        },
+    },
 })

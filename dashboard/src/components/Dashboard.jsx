@@ -4,6 +4,7 @@ import Sidebar from './Sidebar.jsx';
 import WarehouseCanvas from './WarehouseCanvas.jsx';
 import FleetPanel from './FleetPanel.jsx';
 import BottomPanel from './BottomPanel.jsx';
+import FleetControl from './FleetControl.jsx';
 import { createDistributedFleetState } from '../distributed/DistributedFleetState.js';
 
 const fleet = createDistributedFleetState();
@@ -51,6 +52,7 @@ export default function Dashboard() {
             fontFamily: 'monospace'
         }}>
             <Header fleet={fleet} onResetCamera={handleResetCamera} />
+            <FleetControl fleet={fleet} />
             <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
                 <Sidebar fleet={fleet} />
                 <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
