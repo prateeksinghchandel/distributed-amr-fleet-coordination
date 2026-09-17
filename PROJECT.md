@@ -1,10 +1,28 @@
+# Distributed AI Fleet Coordination for Autonomous Mobile Robots
+
+## 1. Project Vision
+
+This project implements a **distributed multi-robot fleet coordination system for Autonomous Mobile Robots (AMRs) operating in a dynamic warehouse environment**.
+
+The system is built around three fundamental layers:
+
 1. **Central Server → knows the warehouse and announces tasks**
-2. **Fleet/P2P Layer → robots collectively decide who does each task**
+2. **Fleet/P2P Layer → robots collectively decide who performs each task**
 3. **Individual AMR → decides how to physically execute its task safely**
 
-The central server should **not** continuously control the robots. That is what makes the system genuinely distributed.
+The central server should **not continuously control the robots**. Robots communicate with one another and with the server through the distributed communication layer, allowing the fleet to coordinate tasks and movement without requiring every movement decision to pass through a central controller.
 
-# 1. Overall Architecture
+The final system supports **three interchangeable operating modes**:
+
+* **Algorithm-Only Mode** — conventional deterministic algorithms perform planning, coordination, and collision avoidance.
+* **Robot AI Mode** — each AMR uses its own neural-network policy for local decision-making, while deterministic safety and imminent-collision avoidance act as higher-priority guard rails.
+* **AI Global Planning Mode** — AI assists with global path planning, path correction, congestion-aware rerouting, and route optimization, while deterministic local collision avoidance and emergency safety remain authoritative.
+
+The communication, fleet-management, telemetry, dashboard, simulation, and safety infrastructure should remain common across all three modes.
+
+---
+
+# 2. Overall Architecture
 
 ```text
                          ┌─────────────────────────┐
@@ -15,11 +33,13 @@ The central server should **not** continuously control the robots. That is what 
                          │ • Task generation       │
                          │ • Fleet status          │
                          │ • Experiment controls   │
+                         │ • Operating mode        │
+                         │ • Telemetry             │
                          └────────────┬────────────┘
                                       │
                                       ▼
                          ┌─────────────────────────┐
-                         │      FLEET SERVER        │
+                         │      FLEET SERVER       │
                          │                         │
                          │ • Warehouse state       │
                          │ • Task manager          │
@@ -27,78 +47,160 @@ The central server should **not** continuously control the robots. That is what 
                          │ • Telemetry collector   │
                          │ • Robot health monitor  │
                          │ • Logging               │
+                         │ • Mode/configuration    │
                          └────────────┬────────────┘
                                       │
-                                ZENOH NETWORK
+                              ═══ ZENOH NETWORK ═══
                                       │
-             ┌────────────────────────┼────────────────────────┐
-             │                        │                        │
-             ▼                        ▼                        ▼
-      ┌──────────────┐        ┌──────────────┐        ┌──────────────┐
-      │     AMR 1    │◄──────►│     AMR 2    │◄──────►│     AMR 3    │
-      │              │        │              │        │              │
-      │ P2P Agent    │◄──────►│ P2P Agent    │◄──────►│ P2P Agent    │
-      │ Auction      │        │ Auction      │        │ Auction      │
-      │ Planner      │        │ Planner      │        │ Planner      │
-      │ Controller   │        │ Controller   │        │ Controller   │
-      │ Safety       │        │ Safety       │        │ Safety       │
-      └──────┬───────┘        └──────┬───────┘        └──────┬───────┘
-             │                       │                       │
-             ▼                       ▼                       ▼
-          Robot 1                 Robot 2                 Robot 3
+              ┌───────────────────────┼───────────────────────┐
+              │                       │                       │
+              ▼                       ▼                       ▼
+       ┌──────────────┐        ┌──────────────┐        ┌──────────────┐
+       │    AMR 1     │◄──────►│    AMR 2     │◄──────►│    AMR 3     │
+       │              │        │              │        │              │
+       │ P2P Agent    │        │ P2P Agent    │        │ P2P Agent    │
+       │ Task Manager │        │ Task Manager │        │ Task Manager │
+       │ Planner      │        │ Planner      │        │ Planner      │
+       │ AI Policy    │        │ AI Policy    │        │ AI Policy    │
+       │ Safety       │        │ Safety       │        │ Safety       │
+       │ Controller   │        │ Controller   │        │ Controller   │
+       └──────┬───────┘        └──────┬───────┘        └──────┬───────┘
+              │                       │                       │
+              ▼                       ▼                       ▼
+           Robot 1                 Robot 2                 Robot 3
 ```
 
-There are therefore **two different communication directions**:
+There are therefore two major communication directions.
 
 ### Server ↔ Robots
 
 Used mainly for:
 
-* task announcements
-* telemetry
-* warehouse/environment information
-* configuration
-* monitoring
+* Task announcements
+* Telemetry
+* Warehouse/environment information
+* Configuration
+* Robot monitoring
+* Fleet status
+* System mode
 
 ### Robot ↔ Robot
 
-Used for:
+Used mainly for:
 
-* auctions
-* task allocation
-* position/state sharing
-* trajectory/intent sharing
-* priority negotiation
-* collision coordination
-* failure information
+* Auctions
+* Task allocation
+* Position/state sharing
+* Trajectory/intent sharing
+* Priority negotiation
+* Collision coordination
+* Reservations
+* Failure information
 
-This second communication path is the important part of your **peer-to-peer fleet coordination**.
+The second communication path is fundamental to the **peer-to-peer fleet coordination architecture**.
 
 ---
 
-# 2. The Fleet Server
+# 3. System Principles
 
-The server is **not the fleet's decision-making brain**.
+The architecture follows four primary principles.
 
-Think of it as the **warehouse supervisor/observer**.
+### 3.1 Centralized organization, distributed decision-making
 
-Its responsibilities are:
+The server knows the warehouse and manages task availability, but does not continuously decide which robot should perform every movement.
 
 ```text
-                    SERVER
-                       │
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
-   Warehouse        Tasks          Telemetry
-    Manager         Manager         Manager
-        │              │              │
-        ▼              ▼              ▼
-   Environment      Task Queue     Robot States
+Server
+  │
+  └── "Task 42 exists."
+          │
+          ▼
+       Robots
+          │
+          ├── AMR1 calculates bid
+          ├── AMR2 calculates bid
+          └── AMR3 calculates bid
+                    │
+                    ▼
+             Fleet decision
 ```
 
-## 2.1 Warehouse Manager
+### 3.2 Robots are independent agents
 
-Maintains:
+Every AMR has its own:
+
+* State
+* Communication
+* Fleet agent
+* Task state
+* Planner
+* Decision system
+* Collision avoidance
+* Safety system
+* Controller
+
+A robot should be able to reason about its own execution using information received from other robots.
+
+### 3.3 Planning and collision avoidance are separate
+
+Global planning answers:
+
+> "How should I get from A to B?"
+
+Local collision avoidance answers:
+
+> "Given what is happening right now, can I safely continue along that plan?"
+
+The distinction remains valid in all three operating modes.
+
+### 3.4 AI does not replace deterministic safety
+
+AI can make decisions or propose routes, but it must operate within deterministic safety constraints.
+
+The final authority over an imminent physical collision belongs to the safety layer.
+
+---
+
+# 4. Fleet Server
+
+The fleet server is **not the fleet's decision-making brain**.
+
+It acts primarily as the warehouse supervisor, task organizer, telemetry collector, and system monitor.
+
+Its responsibilities include:
+
+```text
+                     SERVER
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+     Warehouse       Tasks       Telemetry
+      Manager        Manager       Manager
+          │            │            │
+          ▼            ▼            ▼
+     Environment    Task Queue   Robot States
+```
+
+The server is responsible for:
+
+* Warehouse state
+* Warehouse configuration
+* Task generation
+* Task announcements
+* Telemetry collection
+* Robot health monitoring
+* System configuration
+* Operating-mode configuration
+* Logging
+* Dashboard communication
+
+The server should not become a centralized low-level motion controller.
+
+---
+
+# 5. Warehouse Manager
+
+The warehouse manager maintains:
 
 ```text
 warehouse dimensions
@@ -113,232 +215,435 @@ For example:
 Warehouse = 30m × 20m
 
 Obstacles:
-    [5,5] → [8,10]
+
+    [5,5]  → [8,10]
     [15,3] → [18,12]
 ```
 
-The dashboard can modify these while the simulation is running.
+The dashboard should be able to modify the environment while the simulation is running.
+
+Changes must propagate to the robots so that their planning and decision systems can react to the new environment.
 
 ---
 
-# 3. Task Manager
+# 6. Task Manager
 
 The server creates and announces tasks.
 
-A task looks roughly like:
+A task contains information such as:
 
 ```text
 Task 42
 
 Pickup:  (4.5, 7.2)
 Dropoff: (24.2, 15.8)
-
 Priority: NORMAL
 Status: UNASSIGNED
 ```
 
-The server publishes:
+The server publishes a new task:
 
 ```text
 NEW_TASK
     │
     ▼
-Zenoh
+ Zenoh
     │
  ┌──┼──┐
  ▼  ▼  ▼
 R1 R2 R3
 ```
 
-**The server does not choose the robot.**
+The server **does not directly choose the robot**.
 
-This is where your distributed auction begins.
+The task enters the distributed fleet-allocation process.
 
 ---
 
-# 4. P2P Fleet Coordination
+# 7. Distributed P2P Fleet Coordination
 
-Every robot runs a **fleet agent**.
+Every AMR runs a fleet agent.
 
-Suppose Task 42 is announced.
-
-```text
-                 TASK 42
-                    │
-          ┌─────────┼─────────┐
-          ▼         ▼         ▼
-        AMR1      AMR2      AMR3
-          │         │         │
-        calculate own bid
-          │         │         │
-          ▼         ▼         ▼
-         32        18        25
-          │         │         │
-          └─────────┼─────────┘
-                    ▼
-                 AMR2 wins
-```
-
-The important thing is:
-
-**AMR2 calculates its own bid.**
-
-It might consider:
+Suppose Task 42 is announced:
 
 ```text
-distance to pickup
-distance to dropoff
-current workload
-battery
-estimated travel time
-current congestion
-task priority
+                    TASK 42
+                       │
+              ┌────────┼────────┐
+              ▼        ▼        ▼
+            AMR1     AMR2     AMR3
+              │        │        │
+              ▼        ▼        ▼
+            bid=32   bid=18   bid=25
+              │        │        │
+              └────────┼────────┘
+                       ▼
+                 AMR2 selected
 ```
+
+Each robot calculates its own bid.
+
+A bid may consider:
+
+* Distance to pickup
+* Distance to dropoff
+* Current workload
+* Battery
+* Estimated travel time
+* Current congestion
+* Task priority
 
 For example:
 
 ```text
 bid =
-    travel_cost
-  + congestion_cost
-  + battery_cost
-  + workload_cost
+      travel_cost
+    + congestion_cost
+    + battery_cost
+    + workload_cost
 ```
 
-The exact formula can evolve later.
+The exact bid function can evolve independently of the rest of the architecture.
+
+The important architectural property is:
+
+> **The robot determines its own cost and participates in the distributed allocation process.**
 
 ---
 
-# 5. Why This Is P2P
+# 8. Task Execution
 
-The server says:
-
-> "There is a new task."
-
-It does **not** say:
-
-> "AMR2, you do it."
-
-Instead:
-
-```text
-Server
-   │
-   │ NEW TASK
-   ▼
-All robots
-   │
-   ├── AMR1 calculates bid
-   ├── AMR2 calculates bid
-   └── AMR3 calculates bid
-            │
-            ▼
-       Robots communicate
-            │
-            ▼
-       Winner determined
-```
-
-The robots collectively make the assignment decision.
-
-That is one of the core contributions of your system.
-
----
-
-# 6. What Happens After Winning?
-
-Suppose AMR2 wins.
+After a robot wins a task:
 
 ```text
 Task
- ↓
-AMR2
- ↓
-Local planner
- ↓
+  ↓
+Winning AMR
+  ↓
+Decision / Planning Layer
+  ↓
 Path
- ↓
-Trajectory
- ↓
-Local controller
- ↓
+  ↓
+Local execution
+  ↓
+Safety validation
+  ↓
+Controller
+  ↓
 Robot
 ```
 
-AMR2 calculates its own route.
-
-For example:
-
-```text
-Start
-  │
-  ├──→→→
-  │     ↓
-  │     ↓
-  │     └────→→→
-  │             ↓
-  └──────────── Goal
-```
-
-Initially:
-
-**A*** should be your baseline path planner.
-
-Later you can compare it with other approaches.
+The planning/decision layer depends on the currently selected operating mode.
 
 ---
 
-# 7. Path Planning vs Collision Avoidance
+# 9. Operating Modes
 
-These should be treated as **different systems**.
+The fleet has three system-wide operating modes selectable from the dashboard.
 
-This distinction is extremely important.
+```text
+                    OPERATING MODE
+                          │
+             ┌────────────┼────────────┐
+             ▼            ▼            ▼
+       Algorithm Only   Robot AI   AI Global Planning
+```
 
-## Global path planning
+All three modes share:
+
+* Zenoh communication
+* Fleet/P2P coordination
+* Task management
+* Robot telemetry
+* Warehouse state
+* Collision safety
+* Emergency handling
+* Dashboard
+* Simulation/hardware interface
+
+Only the decision/planning strategy changes.
+
+---
+
+# 10. Mode 1 — Algorithm-Only
+
+Algorithm-Only Mode is the deterministic baseline.
+
+No neural network is required for robot navigation decisions.
+
+The system uses conventional algorithms for:
+
+* Task allocation
+* Global path planning
+* Local planning
+* Collision avoidance
+* Deadlock handling
+* Rerouting
+* Priority resolution
+* Motion control
+
+A baseline execution pipeline is:
+
+```text
+Task
+  ↓
+Distributed Auction
+  ↓
+Winning Robot
+  ↓
+A*
+  ↓
+Local Planner
+  ↓
+Collision Avoidance
+  ↓
+Controller
+  ↓
+Robot
+```
+
+This mode provides the baseline for evaluating the AI-based modes.
+
+---
+
+# 11. Mode 2 — Robot AI
+
+In Robot AI Mode, **each AMR contains its own neural-network policy**.
+
+The AI policy receives an observation representing the robot's current situation and proposes an action or local decision.
+
+Conceptually:
+
+```text
+                 Robot State
+                     +
+             Other Robot State
+                     +
+              Environment
+                     │
+                     ▼
+             ┌───────────────┐
+             │ Neural Network│
+             │ Robot Policy  │
+             └───────┬───────┘
+                     │
+              Proposed Action
+                     │
+                     ▼
+             ┌───────────────┐
+             │ Safety Guard  │
+             └───────┬───────┘
+                     │
+             Safe/Modified Action
+                     │
+                     ▼
+                Controller
+                     │
+                     ▼
+                   Robot
+```
+
+The neural network must not have unrestricted authority over physical movement.
+
+The AI produces a **proposed action**.
+
+The deterministic safety layer validates that action before it reaches the controller.
+
+---
+
+# 12. Robot AI Responsibilities
+
+The neural-network policy may eventually learn or provide:
+
+* Local navigation decisions
+* Adaptive movement
+* Speed selection
+* Local trajectory selection
+* Dynamic obstacle response
+* Robot interaction behavior
+* Congestion-aware movement
+* Learned local decision-making
+
+The exact neural-network architecture and training methodology are implementation/research components and should remain replaceable.
+
+AI inference should preferably occur locally on the robot's edge computer so that robot decision-making does not require continuous dependence on a central server.
+
+---
+
+# 13. Mode 3 — AI Global Planning
+
+The third mode uses AI primarily for **global planning and route correction**, while retaining deterministic local control and safety.
+
+The conceptual pipeline is:
+
+```text
+             Warehouse + Fleet State
+                       │
+                       ▼
+              AI Global Planner
+                       │
+                Proposed Route
+                       │
+                       ▼
+                Route Validation
+                       │
+              ┌────────┴────────┐
+              │                 │
+            Valid            Invalid
+              │                 │
+              ▼                 ▼
+         Local Planner       Rerouting
+              │                 │
+              └────────┬────────┘
+                       ▼
+              Local Collision Avoidance
+                       │
+                       ▼
+                  Safety Guard
+                       │
+                       ▼
+                   Controller
+                       │
+                       ▼
+                     Robot
+```
+
+The AI global planner may assist with:
+
+* Route selection
+* Global path correction
+* Rerouting
+* Congestion prediction
+* Congestion-aware route selection
+* Identifying inefficient paths
+* Adapting routes to changing warehouse conditions
+
+The global AI does not bypass local collision avoidance.
+
+---
+
+# 14. Common Safety Architecture
+
+Safety is common to all three modes.
+
+```text
+             Decision / Planning
+                      │
+                      ▼
+            ┌──────────────────┐
+            │ Deterministic    │
+            │ Safety Layer      │
+            │                  │
+            │ • Collision      │
+            │ • Constraints    │
+            │ • Safe distance  │
+            │ • Emergency stop │
+            │ • Override       │
+            └────────┬─────────┘
+                     │
+                     ▼
+                 Controller
+```
+
+The safety system must be capable of overriding:
+
+* Algorithmic planners
+* AI robot policies
+* AI global planners
+* Normal trajectory following
+
+Safety should be treated as a **higher-priority execution constraint**, not as another optional planning strategy.
+
+---
+
+# 15. Imminent Collision Avoidance
+
+The most immediate safety layer is responsible for reacting to imminent collisions.
+
+It must be able to:
+
+* Detect imminent collision
+* Predict near-future collision
+* Reduce speed
+* Stop the robot
+* Modify trajectory
+* Avoid another robot
+* Avoid dynamic obstacles
+* Enforce minimum separation
+* Override AI decisions
+
+Conceptually:
+
+```text
+AI / Planner
+     │
+     ▼
+Proposed action
+     │
+     ▼
+Collision prediction
+     │
+ ┌───┴───────────────┐
+ │                   │
+Safe              Imminent
+ │                   │
+ ▼                   ▼
+Execute          Override
+                     │
+             Stop / slow / avoid
+```
+
+The system must never assume that a globally valid path is locally safe at every instant.
+
+---
+
+# 16. Global Path Planning vs Local Collision Avoidance
+
+These remain separate subsystems.
+
+## Global Path Planning
 
 Answers:
 
 > "How should I get from A to B?"
 
-Example:
+It considers:
+
+* Warehouse layout
+* Static obstacles
+* Destination
+* Known route costs
+* Global fleet conditions
+
+A* provides the initial deterministic baseline:
 
 ```text
-A*:
-
 Start → → → ↓ ↓ → → → Goal
 ```
 
-It considers:
+AI Global Planning Mode may later replace or augment this process.
 
-* warehouse
-* static obstacles
-* destination
-
----
-
-## Local collision avoidance
+## Local Collision Avoidance
 
 Answers:
 
-> "Given what is happening RIGHT NOW, should I continue following that path?"
+> "Given what is happening right now, should I continue following this path?"
 
 For example:
 
 ```text
             AMR1
-             ↓
-             ↓
-             X
-             ↑
-             ↑
+              ↓
+              ↓
+              X
+              ↑
+              ↑
             AMR2
 ```
 
-Both have valid paths.
+Both robots can have valid global paths while their paths conflict locally.
 
-But those paths conflict.
-
-The local systems may decide:
+The local system may therefore decide:
 
 ```text
 AMR1 → slow down
@@ -355,57 +660,64 @@ AMR2 → wait
 or:
 
 ```text
-AMR1 → change trajectory
+AMR1 → modify trajectory
 ```
 
-This happens continuously while the robot is moving.
+This process occurs continuously during execution.
 
 ---
 
-# 8. Robot's Internal Architecture
+# 17. Robot Internal Architecture
 
-Each AMR should therefore contain several modules.
+Each AMR should contain:
 
 ```text
-                    AMR NODE
-                       │
-       ┌───────────────┼────────────────┐
-       │               │                │
-       ▼               ▼                ▼
- Communication     Fleet Agent      Telemetry
-       │               │
-       │               ├── Auction
-       │               ├── Task state
-       │               ├── Priority
-       │               └── P2P coordination
-       │
-       └─────────────────────┐
-                             ▼
-                       Task Executor
-                             │
-                             ▼
-                      Global Planner
-                             │
-                             ▼
-                     Local Planner
-                             │
-                             ▼
-                  Collision Avoidance
-                             │
-                             ▼
-                       Controller
-                             │
-                             ▼
-                          ROBOT
+                         AMR NODE
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+ Communication         Fleet Agent          Telemetry
+        │                   │
+        │                   ├── Auction
+        │                   ├── Task state
+        │                   ├── Priority
+        │                   └── P2P coordination
+        │
+        └────────────────────────┐
+                                 ▼
+                         Task Executor
+                                 │
+                                 ▼
+                    Decision / Planning Layer
+                                 │
+                    ┌────────────┼────────────┐
+                    │            │            │
+                    ▼            ▼            ▼
+                Algorithm      Robot AI    Global AI
+                  Mode           Mode       Planning
+                    │            │            │
+                    └────────────┼────────────┘
+                                 ▼
+                       Local Collision Avoidance
+                                 │
+                                 ▼
+                         Deterministic Safety
+                                 │
+                                 ▼
+                            Controller
+                                 │
+                                 ▼
+                               ROBOT
 ```
+
+The exact implementation may combine some of these modules, but the responsibilities should remain logically separated.
 
 ---
 
-# 9. Telemetry
+# 18. Robot State and Telemetry
 
-Every AMR continuously broadcasts information.
-
-Something like:
+Every AMR continuously publishes information such as:
 
 ```text
 AMR 2
@@ -422,39 +734,32 @@ Health:         OK
 Timestamp:      ...
 ```
 
-The server receives this for the dashboard.
+This information is useful to:
 
-But importantly:
+* The fleet server
+* The dashboard
+* Other robots
+* Collision-avoidance systems
+* Global planners
+* AI models
 
-**other robots also receive relevant state information.**
+Importantly:
 
-For example:
+> **Other robots must receive relevant state information directly through the distributed communication system.**
 
-```text
-AMR1
-  │
-  ├── position
-  ├── velocity
-  ├── trajectory
-  └── intention
-          │
-          ▼
-       AMR2
-```
-
-This allows AMR2 to reason about AMR1.
+The server should not be required to relay every robot observation before another robot can react.
 
 ---
 
-# 10. Robot Intentions
+# 19. Robot Intent
 
-Telemetry tells robots:
+Telemetry answers:
 
 > "Where is the other robot?"
 
-Intent information tells them:
+Intent answers:
 
-> "What is the other robot planning to do?"
+> "What does the other robot intend to do?"
 
 For example:
 
@@ -464,39 +769,42 @@ AMR1:
 Current:
 (10,10)
 
-Planning:
+Planned:
 (10,10)
-    ↓
+   ↓
 (10,15)
-    ↓
+   ↓
 (20,15)
 ```
 
-AMR2 can detect:
+AMR2 can then determine that AMR1 intends to pass through a region that AMR2 is approaching.
 
-> "AMR1 intends to pass through the intersection I am approaching."
+Intent information can therefore improve:
 
-That is much more useful than just knowing AMR1's current position.
+* Conflict prediction
+* Collision avoidance
+* Priority negotiation
+* Reservation
+* Deadlock detection
+* AI observations
 
 ---
 
-# 11. Distributed Collision Resolution
+# 20. Distributed Collision Coordination
 
-Imagine:
+Consider two robots approaching the same intersection:
 
 ```text
                  AMR1
                    ↓
                    ↓
-             ──────X──────
+              ─────X─────
                    ↑
                    ↑
                  AMR2
 ```
 
-Each robot detects a potential conflict.
-
-They exchange:
+Robots exchange information such as:
 
 ```text
 position
@@ -505,61 +813,82 @@ planned path
 ETA
 task priority
 intent
+reservation
 ```
 
-Then a coordination mechanism determines:
+A coordination mechanism determines an appropriate action:
 
 ```text
 AMR1 → GO
 AMR2 → WAIT
 ```
 
-The decision should not simply be:
+The priority mechanism should eventually consider meaningful factors rather than relying only on robot ID.
 
-> "Robot with smaller ID wins."
-
-You can eventually use a priority function such as:
+Possible factors include:
 
 ```text
-priority =
-    task_priority
-  + waiting_time
-  + urgency
-  + other factors
+task priority
+waiting time
+urgency
+ETA
+current progress
+other fleet constraints
 ```
+
+The exact priority function can evolve independently.
 
 ---
 
-# 12. Deadlock Handling
+# 21. Reservations
 
-Collision avoidance isn't enough.
+For constrained warehouse regions such as:
 
-Consider:
+* Narrow aisles
+* Intersections
+* Choke points
+* Single-lane passages
+
+robots may exchange or maintain reservations representing intended occupancy.
+
+A reservation can conceptually contain:
+
+```text
+Robot
+Region
+Entry time
+Exit time
+Priority
+Task
+```
+
+Reservations should assist planning and coordination but must not replace the imminent-collision safety layer.
+
+A robot must still react to unexpected conditions.
+
+---
+
+# 22. Deadlock Handling
+
+Collision avoidance alone is insufficient.
+
+Robots can enter situations where every robot waits for another robot.
+
+Example:
 
 ```text
              AMR1
                ↓
                │
-        ───────┼───────
+         ──────┼──────
                │
                ↑
              AMR2
 ```
 
-Or more complex warehouse choke points:
+The system therefore requires explicit deadlock handling.
 
-```text
-      A →
-          ┌─────┐
-          │     │
-          │     │
-          └─────┘
-                ← B
-```
-
-Robots can enter situations where everyone waits.
-
-Your system needs:
+Conceptual process:
 
 ```text
 Conflict
@@ -572,18 +901,58 @@ Deadlock suspected
    ↓
 Distributed resolution
    ↓
-One robot gets priority
+One robot receives priority
    ↓
 Other robot waits/reroutes
 ```
 
-This should be a dedicated subsystem rather than something buried inside the path planner.
+Deadlock handling should be a dedicated subsystem rather than being hidden entirely inside the path planner.
+
+AI may eventually assist with deadlock prediction or resolution, but deterministic recovery must remain available.
 
 ---
 
-# 13. Failure Detection
+# 23. Dynamic Environment Handling
 
-Telemetry also gives you robot health monitoring.
+The warehouse is not necessarily static.
+
+The dashboard should be able to:
+
+* Add obstacles
+* Remove obstacles
+* Move obstacles
+* Change warehouse dimensions
+* Add pickup locations
+* Add drop-off locations
+* Create tasks
+
+A change should propagate through the system:
+
+```text
+Environment change
+       ↓
+State update
+       ↓
+Path validation
+       ↓
+Conflict detection
+       ↓
+Replanning / rerouting
+       ↓
+Local execution
+       ↓
+Safety validation
+```
+
+AI Global Planning Mode can use these changes to generate new routes, while Robot AI Mode can incorporate the changed environment into its local observations.
+
+---
+
+# 24. Robot Failure Detection and Recovery
+
+Robots periodically publish heartbeat/status information.
+
+Example:
 
 ```text
 AMR3
@@ -595,19 +964,27 @@ heartbeat
    X
 ```
 
-Other nodes notice:
+A timeout can produce:
 
 ```text
 No heartbeat
-      ↓
+     ↓
 Timeout
-      ↓
+     ↓
 AMR3 suspected failed
 ```
 
-Then the fleet can react.
+The fleet must then:
 
-If AMR3 owned Task 27:
+1. Mark the robot unavailable.
+2. Identify its active task.
+3. Determine whether the task was completed.
+4. Recover/requeue the task if necessary.
+5. Make the task available for another auction.
+6. Replan affected paths.
+7. Update the dashboard.
+
+For example:
 
 ```text
 Task 27
@@ -625,74 +1002,85 @@ New winner
 Task continues
 ```
 
-This is an important part of making the system **fault tolerant**.
+This makes the fleet fault tolerant.
 
 ---
 
-# 14. AI Layer
+# 25. Complete Task Lifecycle
 
-I would make AI an **optional optimization layer**, not the fundamental safety layer.
-
-Your architecture could eventually look like:
+A task should follow a well-defined state machine:
 
 ```text
-             LOCAL ROBOT
-                  │
-        ┌─────────▼─────────┐
-        │ Deterministic     │
-        │ Safety Layer      │
-        │                   │
-        │ • collision       │
-        │ • emergency stop  │
-        │ • constraints     │
-        │ • deadlock rules  │
-        └─────────┬─────────┘
-                  │
-        ┌─────────▼─────────┐
-        │ Planning /        │
-        │ Optimization      │
-        │                   │
-        │ A*                │
-        │ ORCA              │
-        │ AI model          │
-        │ learned policy    │
-        └───────────────────┘
+CREATED
+   │
+   ▼
+ANNOUNCED
+   │
+   ▼
+BIDDING
+   │
+   ▼
+ASSIGNED
+   │
+   ▼
+PLANNING
+   │
+   ▼
+EXECUTING
+   │
+   ├──────────────► BLOCKED
+   │                  │
+   │                  ▼
+   │               REROUTING
+   │                  │
+   │                  └──────► EXECUTING
+   │
+   ▼
+COMPLETED
 ```
 
-AI could later help with:
+Failures must also be explicit:
 
-* congestion prediction
-* task bidding
-* route selection
-* deadlock prediction
-* adaptive speed
-* parameter selection
-
-But the robot should still have deterministic safety constraints.
+```text
+EXECUTING
+    │
+    ▼
+  FAILURE
+    │
+    ▼
+TASK RECOVERY
+    │
+    ├──► Retry
+    ├──► Reassign
+    └──► Cancel
+```
 
 ---
 
-# 15. Dashboard Architecture
+# 26. Dashboard Architecture
 
-Your React + Canvas dashboard can be structured as:
+The dashboard is the primary human interface.
 
 ```text
-                 REACT DASHBOARD
-                       │
-          ┌────────────┼─────────────┐
-          ▼            ▼             ▼
-     Warehouse       Fleet         Tasks
-       Editor        Monitor        Panel
-          │            │             │
-          └────────────┼─────────────┘
-                       │
-                    API / Zenoh
-                       │
-                       ▼
-                    SERVER
+                  REACT DASHBOARD
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+      Warehouse         Fleet          Tasks
+        Editor          Monitor        Panel
+          │              │              │
+          └──────────────┼──────────────┘
+                         │
+                         ▼
+                   API / Zenoh
+                         │
+                         ▼
+                       SERVER
 ```
 
-### Warehouse editor
+The dashboard should provide:
+
+### Warehouse
 
 ```text
 Width: 30m
@@ -702,7 +1090,7 @@ Height: 20m
 [Remove obstacle]
 ```
 
-### Task controls
+### Task Controls
 
 ```text
 Task Generation
@@ -716,7 +1104,7 @@ Number of tasks: 20
 [Generate]
 ```
 
-### Fleet monitor
+### Fleet Monitor
 
 ```text
 AMR1   ONLINE    Task 12    82%
@@ -724,42 +1112,215 @@ AMR2   ONLINE    Task 15    64%
 AMR3   OFFLINE   ---        71%
 ```
 
-### Visualization
-
-Canvas displays:
+### Operating Mode
 
 ```text
-┌──────────────────────────────────────┐
-│                                      │
-│   ████                               │
-│   ████       🤖1 ──────→             │
-│                                      │
-│                🤖2                   │
-│                       █████           │
-│                                      │
-│                    🤖3 ───→          │
-│                                      │
-└──────────────────────────────────────┘
+Operating Mode
+
+○ Algorithm Only
+○ Robot AI
+○ AI Global Planning
 ```
 
-You can additionally display:
-
-* paths
-* planned trajectories
-* robot direction
-* task pickup/dropoff
-* collision warnings
-* reservations
-* communication state
-* deadlock state
+The selected mode should be visible during execution.
 
 ---
 
-# 16. Complete Data Flow
+# 27. Dashboard Visualization
 
-Now let's follow one task through the **entire system**.
+The Canvas-based visualization should display:
 
-### Step 1 — User creates warehouse
+* Warehouse boundaries
+* Obstacles
+* Robots
+* Robot direction
+* Robot paths
+* Planned trajectories
+* Pickup points
+* Drop-off points
+* Task assignments
+* Collision warnings
+* Reservations
+* Communication state
+* Deadlock state
+* Robot failures
+* Rerouting
+* AI decisions where useful
+
+For AI modes, additional useful information includes:
+
+```text
+AI action
+AI route proposal
+AI inference state
+Safety override
+Collision-avoidance intervention
+Rerouting event
+```
+
+The dashboard is primarily an **observation and configuration system**, not the component responsible for real-time robot control.
+
+---
+
+# 28. Mode Switching
+
+The three modes should use the same fleet infrastructure.
+
+Switching modes changes the decision/planning implementation:
+
+```text
+                    Fleet State
+                        │
+                        ▼
+                  Mode Selector
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+      Algorithm       Robot AI     Global AI
+      Planner          Policy       Planner
+          │             │             │
+          └─────────────┼─────────────┘
+                        ▼
+                Common Safety Layer
+                        │
+                        ▼
+                   Controller
+```
+
+The system should avoid duplicating:
+
+* Communication
+* Task management
+* Fleet coordination
+* Telemetry
+* Safety
+* Robot interfaces
+
+Only the appropriate decision/planning module should change.
+
+---
+
+# 29. AI and Safety Authority
+
+The final authority hierarchy is:
+
+```text
+                 EMERGENCY SAFETY
+                        ▲
+                        │
+                 highest authority
+                        │
+              IMMINENT COLLISION
+                        │
+                        ▼
+              LOCAL COLLISION
+                 AVOIDANCE
+                        │
+                        ▼
+              AI / LOCAL DECISION
+                        │
+                        ▼
+                PATH PLANNING
+                        │
+                        ▼
+               TASK ALLOCATION
+                        │
+                        ▼
+             DASHBOARD CONFIGURATION
+```
+
+This hierarchy is conceptual rather than a requirement that every component communicate synchronously.
+
+The critical rule is:
+
+> **No AI component may bypass the deterministic safety constraints governing physical movement.**
+
+---
+
+# 30. Simulation and Physical Deployment
+
+Robot logic should be separated from the physical robot interface.
+
+```text
+                 ROBOT AGENT
+                      │
+               ┌──────┴──────┐
+               │             │
+          Simulation       Hardware
+               │             │
+        2D / simulator   Sensors / motors
+```
+
+The same high-level robot architecture should therefore be usable with:
+
+* A software simulation
+* Raspberry Pi
+* Jetson-class edge hardware
+* Future physical AMRs
+
+AI inference should preferably run locally on the robot's edge computer.
+
+This maintains the distributed nature of the system and avoids making continuous cloud/server inference a requirement.
+
+---
+
+# 31. Communication Model
+
+The distributed communication layer should expose an abstraction rather than tying the robot logic directly to a particular transport implementation.
+
+The current distributed implementation uses **Zenoh**.
+
+Conceptually:
+
+```text
+Robot 1 ───────────┐
+                   │
+Robot 2 ───────────┼── Zenoh Network
+                   │
+Robot 3 ───────────┤
+                   │
+Fleet Server ──────┘
+```
+
+Communication should support messages for:
+
+```text
+robot/
+    state
+    telemetry
+    intent
+    status
+    heartbeat
+
+task/
+    announce
+    bid
+    assignment
+    progress
+    completion
+    failure
+
+coordination/
+    reservation
+    conflict
+    negotiation
+    priority
+
+system/
+    mode
+    configuration
+    emergency
+```
+
+The exact topic structure may evolve, but communication responsibilities should remain clearly separated.
+
+---
+
+# 32. Complete End-to-End Data Flow
+
+A complete task execution looks like:
+
+### Step 1 — Warehouse configuration
 
 ```text
 Dashboard
@@ -769,171 +1330,161 @@ Server
 Warehouse state
 ```
 
----
-
-### Step 2 — Server generates task
+### Step 2 — Task generation
 
 ```text
 Task Generator
-      ↓
+    ↓
 Task 42
-      ↓
+    ↓
 Zenoh
 ```
 
----
-
-### Step 3 — All robots receive it
+### Step 3 — Task announcement
 
 ```text
-              Task 42
-                 │
-       ┌─────────┼─────────┐
-       ▼         ▼         ▼
-     AMR1      AMR2      AMR3
+               Task 42
+                  │
+          ┌───────┼───────┐
+          ▼       ▼       ▼
+        AMR1    AMR2    AMR3
 ```
 
----
-
-### Step 4 — Robots calculate bids
+### Step 4 — Distributed bidding
 
 ```text
-AMR1 → 31
-AMR2 → 17
-AMR3 → 26
+AMR1 → bid
+AMR2 → bid
+AMR3 → bid
 ```
 
----
-
-### Step 5 — Distributed winner selection
+### Step 5 — Winner determination
 
 ```text
-AMR2 wins
+Distributed coordination
+          ↓
+      AMR2 wins
 ```
 
----
+### Step 6 — Decision/planning
 
-### Step 6 — AMR2 plans its route
+The selected operating mode determines what happens next.
 
 ```text
-Task
- ↓
-A*
- ↓
-Path
+Algorithm Only
+      ↓
+     A*
+
+Robot AI
+      ↓
+Neural Network
+
+AI Global Planning
+      ↓
+AI Global Planner
 ```
 
----
-
-### Step 7 — AMR2 starts moving
+### Step 7 — Local execution
 
 ```text
-Path
- ↓
-Local trajectory
- ↓
+Planning
+   ↓
+Local execution
+   ↓
+Collision avoidance
+   ↓
+Safety guard
+   ↓
 Controller
- ↓
+   ↓
 Robot
 ```
 
----
-
-### Step 8 — AMR2 continuously observes other robots
+### Step 8 — Continuous observation
 
 ```text
 AMR1 telemetry ──┐
 AMR3 telemetry ──┼──→ AMR2
-                 │
 AMR intentions ──┘
 ```
 
----
-
-### Step 9 — Conflict occurs
+### Step 9 — Conflict
 
 ```text
-AMR2 detects AMR1
-will occupy same
-intersection
+Potential conflict
+       ↓
+Prediction
+       ↓
+Coordination
+       ↓
+Wait / slow / modify trajectory / reroute
 ```
 
-Local coordination occurs.
+### Step 10 — Safety intervention if required
 
 ```text
-AMR2 → WAIT
-AMR1 → GO
+Imminent collision
+       ↓
+Safety override
+       ↓
+Stop / slow / emergency avoidance
 ```
 
----
-
-### Step 10 — AMR2 continues
-
-Once the intersection is clear:
+### Step 11 — Continue execution
 
 ```text
-WAIT
- ↓
-SAFE
- ↓
-CONTINUE
+Safe
+  ↓
+Continue
 ```
 
----
-
-### Step 11 — Robot reaches pickup
+### Step 12 — Task completion
 
 ```text
 MOVING_TO_PICKUP
         ↓
-     PICKING
-```
-
----
-
-### Step 12 — Robot goes to dropoff
-
-```text
-PICKING
-   ↓
+      PICKING
+        ↓
 MOVING_TO_DROPOFF
-   ↓
-DROPPING
-   ↓
-COMPLETED
+        ↓
+     DROPPING
+        ↓
+    COMPLETED
 ```
 
----
+### Step 13 — Next task
 
-### Step 13 — Another task appears
-
-AMR2 can participate in another auction.
+The robot becomes available and can participate in another distributed auction.
 
 ---
 
-# 17. What the Server Does vs What Robots Do
+# 33. Server vs Robot Responsibilities
 
-This distinction should remain extremely clear in your implementation.
+This distinction should remain explicit.
 
-| Function                  |  Server  |    Robot    |
-| ------------------------- | :------: | :---------: |
-| Warehouse configuration   |     ✓    |     Read    |
-| Dashboard                 |     ✓    |      —      |
-| Task generation           |     ✓    |      —      |
-| Task announcement         |     ✓    |   Receive   |
-| Task auction              |     —    |    **✓**    |
-| Task winner decision      |     —    |    **✓**    |
-| Local path planning       | Optional |    **✓**    |
-| Local trajectory planning |     —    |    **✓**    |
-| Collision avoidance       |     —    |    **✓**    |
-| Deadlock handling         |  Monitor |    **✓**    |
-| Robot telemetry           |  Collect |   **Send**  |
-| Robot health monitoring   |     ✓    |   **P2P**   |
-| Failure detection         |     ✓    |    **✓**    |
-| Task reassignment         | Announce | **Auction** |
-| Visualization             |     ✓    |      —      |
+| Function                  |  Server  |            Robot           |
+| ------------------------- | :------: | :------------------------: |
+| Warehouse configuration   |     ✓    |            Read            |
+| Dashboard                 |     ✓    |              —             |
+| Task generation           |     ✓    |              —             |
+| Task announcement         |     ✓    |           Receive          |
+| Task bidding              |     —    |            **✓**           |
+| Distributed task decision |     —    |            **✓**           |
+| Global path planning      | Optional |            **✓**           |
+| AI global planning        | Optional |   Depends on architecture  |
+| Robot AI policy           |     —    |            **✓**           |
+| Local trajectory planning |     —    |            **✓**           |
+| Collision avoidance       |     —    |            **✓**           |
+| Safety guard              |     —    |            **✓**           |
+| Deadlock handling         |  Monitor |            **✓**           |
+| Robot telemetry           |  Collect |          **Send**          |
+| Robot health monitoring   |     ✓    |            **✓**           |
+| Failure detection         |     ✓    |            **✓**           |
+| Task reassignment         | Announce | **Participate in auction** |
+| Visualization             |     ✓    |              —             |
+| Mode configuration        |     ✓    |        Receive/apply       |
 
-The most important columns are:
+The core division remains:
 
 > **Server = observe + organize**
 
@@ -941,9 +1492,9 @@ The most important columns are:
 
 ---
 
-# 18. Final Software Architecture
+# 34. Final Software Architecture
 
-I'd organize the actual project roughly like this:
+A logical project structure can be organized approximately as:
 
 ```text
 amr-fleet/
@@ -959,6 +1510,10 @@ amr-fleet/
 │   │
 │   ├── telemetry/
 │   │   └── telemetry_manager.py
+│   │
+│   ├── fleet/
+│   │   ├── fleet_manager.py
+│   │   └── health_monitor.py
 │   │
 │   └── server.py
 │
@@ -977,10 +1532,20 @@ amr-fleet/
 │   │   ├── global_planner.py
 │   │   └── local_planner.py
 │   │
+│   ├── ai/
+│   │   ├── robot_policy.py
+│   │   ├── global_planner.py
+│   │   └── inference.py
+│   │
 │   ├── avoidance/
 │   │   ├── collision.py
 │   │   ├── deadlock.py
 │   │   └── reservation.py
+│   │
+│   ├── safety/
+│   │   ├── guard.py
+│   │   ├── emergency.py
+│   │   └── constraints.py
 │   │
 │   ├── control/
 │   │   └── controller.py
@@ -1006,17 +1571,126 @@ amr-fleet/
     ├── planning/
     ├── auction/
     ├── collision/
+    ├── safety/
+    ├── ai/
     ├── communication/
     └── integration/
 ```
 
-This structure also supports your incremental development strategy because each major research component has a relatively isolated location.
+The exact language and directory structure may evolve. The important requirement is separation of responsibilities.
 
 ---
 
-# 19. The Core Concept
+# 35. Development Strategy
 
-If you have to explain the entire project in one diagram, I'd use this:
+Development should proceed incrementally while preserving the working deterministic baseline.
+
+```text
+Stage 1
+Deterministic multi-robot simulation
+        ↓
+Stage 2
+Distributed task allocation
+        ↓
+Stage 3
+Real distributed communication
+        ↓
+Stage 4
+Global + local path planning
+        ↓
+Stage 5
+Distributed collision avoidance
+        ↓
+Stage 6
+Deadlock + failure recovery
+        ↓
+Stage 7
+Dashboard observability/control
+        ↓
+Stage 8
+Algorithm-Only baseline stabilization
+        ↓
+Stage 9
+Neural-network robot policy
+        ↓
+Stage 10
+Deterministic AI safety guard rails
+        ↓
+Stage 11
+Robot AI Mode
+        ↓
+Stage 12
+AI global planning / rerouting
+        ↓
+Stage 13
+Three-mode evaluation
+        ↓
+Stage 14
+Simulation → edge hardware
+```
+
+The exact order may change during implementation, but the **Algorithm-Only mode should remain functional throughout development**.
+
+This provides a deterministic reference implementation against which AI behavior can be evaluated.
+
+---
+
+# 36. Evaluation
+
+The final system should be evaluated across the three operating modes.
+
+Relevant measurements include:
+
+### Fleet performance
+
+* Task completion rate
+* Average task completion time
+* Total travel distance
+* Robot utilization
+* Idle time
+* Task allocation efficiency
+
+### Navigation
+
+* Path length
+* Replanning frequency
+* Rerouting frequency
+* Congestion
+* Navigation failures
+
+### Coordination
+
+* Number of conflicts
+* Waiting time
+* Deadlock frequency
+* Deadlock recovery time
+* Communication latency
+* Coordination overhead
+
+### Safety
+
+* Collision count
+* Near-collision events
+* Emergency stops
+* Safety overrides
+* Minimum separation distance
+
+### AI
+
+* Inference latency
+* AI decision frequency
+* AI intervention/override rate
+* Route quality
+* Performance under unseen layouts
+* Performance under dynamic obstacles
+
+The purpose is not merely to demonstrate that AI can move a robot, but to determine how AI changes the behavior of a **distributed multi-robot fleet while deterministic safety remains enforced**.
+
+---
+
+# 37. Core Concept
+
+The entire system can be represented by:
 
 ```text
                          ┌───────────────┐
@@ -1024,77 +1698,87 @@ If you have to explain the entire project in one diagram, I'd use this:
                          └───────┬───────┘
                                  │
                                  ▼
-                    ┌────────────────────────┐
-                    │      FLEET SERVER      │
-                    │                        │
-                    │ Warehouse              │
-                    │ Task Generation        │
-                    │ Telemetry              │
-                    │ Monitoring              │
-                    └───────────┬────────────┘
-                                │
-                         Task announcement
-                                │
-                         ═══ ZENOH ═══
-                                │
-              ┌─────────────────┼─────────────────┐
-              │                 │                 │
-              ▼                 ▼                 ▼
-          ┌───────┐         ┌───────┐         ┌───────┐
-          │ AMR 1 │◄───────►│ AMR 2 │◄───────►│ AMR 3 │
-          └───┬───┘         └───┬───┘         └───┬───┘
-              │                 │                 │
-              │       P2P AUCTION /             │
-              │       COORDINATION              │
-              │                 │                 │
-              └─────────────────┼─────────────────┘
-                                │
-                         Winning robot
+                      ┌────────────────────┐
+                      │    FLEET SERVER    │
+                      │                    │
+                      │ Warehouse          │
+                      │ Task Generation    │
+                      │ Telemetry          │
+                      │ Monitoring         │
+                      │ Mode Configuration │
+                      └──────────┬─────────┘
+                                 │
+                           Task / State
+                                 │
+                          ═══ ZENOH ═══
+                                 │
+              ┌──────────────────┼──────────────────┐
+              │                  │                  │
+              ▼                  ▼                  ▼
+          ┌────────┐         ┌────────┐         ┌────────┐
+          │ AMR 1  │◄───────►│ AMR 2  │◄───────►│ AMR 3  │
+          └───┬────┘         └───┬────┘         └───┬────┘
+              │                  │                  │
+              └──────── P2P FLEET COORDINATION ────┘
+                                 │
+                                 ▼
+                       Winning Robot / Task
+                                 │
+                                 ▼
+                     ┌─────────────────────┐
+                     │ DECISION / PLANNING │
+                     │                     │
+                     │ Algorithmic         │
+                     │ Robot AI            │
+                     │ AI Global Planning  │
+                     └──────────┬──────────┘
                                 │
                                 ▼
-                       ┌────────────────┐
-                       │ GLOBAL PLANNER │
-                       │      A*        │
-                       └───────┬────────┘
-                               │
-                               ▼
-                       ┌────────────────┐
-                       │ LOCAL PLANNER  │
-                       └───────┬────────┘
-                               │
-                 ┌─────────────▼─────────────┐
-                 │   LOCAL SAFETY / CONTROL  │
-                 │                           │
-                 │ Collision avoidance       │
-                 │ Speed adjustment          │
-                 │ Trajectory adjustment     │
-                 │ Deadlock handling         │
-                 │ Emergency response        │
-                 └─────────────┬─────────────┘
-                               │
-                               ▼
-                            🤖 AMR
-                               │
-                               │
-                         telemetry /
-                         intentions
-                               │
-                               ▼
-                         Other AMRs
+                     ┌─────────────────────┐
+                     │ COLLISION AVOIDANCE │
+                     └──────────┬──────────┘
+                                │
+                                ▼
+                     ┌─────────────────────┐
+                     │  DETERMINISTIC      │
+                     │  SAFETY GUARD       │
+                     │                     │
+                     │ Emergency override  │
+                     │ Safe constraints    │
+                     └──────────┬──────────┘
+                                │
+                                ▼
+                           CONTROLLER
+                                │
+                                ▼
+                              🤖 AMR
+                                │
+                                │ telemetry
+                                │ intent
+                                ▼
+                           Other AMRs
 ```
 
-### The fundamental principle
+## Fundamental Principle
 
 **Centralized:**
 
-> The server knows the warehouse and tells robots what tasks exist.
+> The server knows the warehouse, manages system state, and announces available tasks.
 
 **Distributed:**
 
-> The robots decide among themselves who performs those tasks and coordinate with each other.
+> The robots communicate and collectively determine task ownership and coordinate their operation.
 
 **Local:**
 
-> Each robot decides how to safely execute its assigned task in the constantly changing environment.
+> Each robot decides how to execute its assigned task in the changing environment.
 
-That gives you a coherent **Edge-AI / distributed fleet coordination architecture** rather than just a multi-robot simulator with a server attached.
+**AI-enabled:**
+
+> Neural networks may provide robot-level decisions or global planning/rerouting depending on the selected operating mode.
+
+**Safety-critical:**
+
+> Deterministic collision avoidance and emergency safety constraints have higher authority than AI or normal planning.
+
+The resulting system is therefore a **distributed, multi-agent AMR fleet with interchangeable algorithmic and AI decision layers, peer-to-peer coordination, and deterministic safety guard rails**.
