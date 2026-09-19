@@ -2,13 +2,14 @@
 robot_node.py — Individual AMR process over Zenoh.
 
 Usage:
-    python -m robot.robot_node --id AMR1 [--url ws/127.0.0.1:10000]
+    python -m robot.robot_node --id AMR1 [--url ws/127.0.0.1:10000] [--mode SERVER_AUCTION]
 
 Options:
     --id    Robot identifier (required, e.g. AMR1)
     --url   Zenoh bridge WebSocket URL (default: ws/127.0.0.1:10000)
     --x     Initial x position (overridden by world/state spawn)
     --y     Initial y position
+    --mode  Auction mode: SERVER_AUCTION (default) | P2P_AUCTION
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import time
 import threading
 
 from common import topics
+from common.auction import AuctionMode
 from common.geometry import Rect
 from common.logger import get_logger
 from common.models import RobotStatus
@@ -38,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--url", default="ws/127.0.0.1:10000")
     p.add_argument("--x", type=float, default=0.0, help="Initial x (overridden by world/state)")
     p.add_argument("--y", type=float, default=0.0, help="Initial y (overridden by world/state)")
+    p.add_argument("--mode", default=AuctionMode.SERVER_AUCTION,
+                   choices=list(AuctionMode.VALID), help="Auction mode (default: SERVER_AUCTION)")
     return p.parse_args()
 
 
@@ -47,10 +51,11 @@ def parse_args() -> argparse.Namespace:
 
 class RobotNode:
     def __init__(self, robot_id: str, init_x: float, init_y: float,
-                 bus: ZenohBus, log):
+                 bus: ZenohBus, log, auction_mode: str = AuctionMode.SERVER_AUCTION):
         self.robot_id = robot_id
         self.bus = bus
         self.log = log
+        self.auction_mode = AuctionMode.normalize(auction_mode)
 
         # Mutable robot state
         self.state = RobotState(id=robot_id, x=init_x, y=init_y)
@@ -75,7 +80,8 @@ class RobotNode:
             get_obstacles=lambda: self.obstacles,
             get_fleet_snapshot=lambda: list(self.agent.fleet.values()) if hasattr(self, "agent") else [],
             get_world_bounds=lambda: (self.world["width"], self.world["height"]) if self.world else None,
-            disable_finalize=True,   # coordinator commits
+            disable_finalize=True,
+            auction_mode=self.auction_mode,
         )
 
         # Subscribe to all relevant topics
@@ -85,6 +91,8 @@ class RobotNode:
         bus.subscribe(topics.TASK_CANCELLED, self._on_task_cancelled)
         bus.subscribe(topics.AUCTION_RESULT, self._on_auction_result)
         bus.subscribe(topics.ROBOT_TELEMETRY, self._on_peer_telemetry)
+        bus.subscribe(topics.BID_PLACED, self._on_peer_bid)
+        bus.subscribe(topics.AUCTION_COMMIT, self._on_auction_commit)
 
         self._running = True
         self._last_tick = None
@@ -167,6 +175,14 @@ class RobotNode:
             f"[AUCTION] result {task_id} → winner={winner} committed={committed}{mine}"
         )
 
+    def _on_peer_bid(self, _topic: str, payload: dict) -> None:
+        """Peer bids — needed from every robot in P2P mode (and handy in server mode)."""
+        self.agent.on_bid_placed(payload, time.time())
+
+    def _on_auction_commit(self, _topic: str, payload: dict) -> None:
+        """Peer AUCTION_COMMIT — P2P mode winner announcements."""
+        self.agent.on_auction_commit(payload, time.time())
+
     def _on_peer_telemetry(self, _topic: str, payload: dict) -> None:
         self.agent.on_robot_telemetry(payload)
 
@@ -213,7 +229,7 @@ def main() -> None:
     log.info("Connected to Zenoh bridge")
 
     bus = ZenohBus(session, args.id, log)
-    node = RobotNode(args.id, args.x, args.y, bus, log)
+    node = RobotNode(args.id, args.x, args.y, bus, log, auction_mode=args.mode)
 
     stop_event = threading.Event()
 

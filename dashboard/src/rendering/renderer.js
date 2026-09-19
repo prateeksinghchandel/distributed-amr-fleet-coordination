@@ -1,11 +1,17 @@
 import { Camera } from './camera.js';
 import { formatWorldCoord, getGridSpacing } from './coordinates.js';
+import { paletteFor, withAlpha } from '../theme/palette.js';
 
 export class Renderer {
     constructor(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.camera = new Camera();
+        this.palette = paletteFor('dark', 'crimson');
+    }
+
+    setPalette(palette) {
+        if (palette) this.palette = palette;
     }
 
     resize() {
@@ -37,7 +43,7 @@ export class Renderer {
 
     drawBackground(w, h) {
         const { ctx } = this;
-        ctx.fillStyle = '#1a1a2e';
+        ctx.fillStyle = this.palette.canvasBg;
         ctx.fillRect(0, 0, w, h);
     }
 
@@ -52,7 +58,7 @@ export class Renderer {
         const startY = Math.floor((camera.y - halfH) / spacing) * spacing;
         const endY = Math.ceil((camera.y + halfH) / spacing) * spacing;
 
-        ctx.strokeStyle = '#2a2a4a';
+        ctx.strokeStyle = this.palette.gridLine;
         ctx.lineWidth = 0.5;
 
         for (let x = startX; x <= endX; x += spacing) {
@@ -71,7 +77,7 @@ export class Renderer {
             ctx.stroke();
         }
 
-        ctx.fillStyle = '#4a4a6a';
+        ctx.fillStyle = this.palette.gridLabel;
         ctx.font = `${Math.max(10, Math.min(14, 12 * camera.zoom))}px monospace`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
@@ -93,14 +99,15 @@ export class Renderer {
 
     drawBoundary(warehouse) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         const bl = camera.worldToScreen(0, 0, canvas.width, canvas.height);
         const tr = camera.worldToScreen(warehouse.width, warehouse.height, canvas.width, canvas.height);
 
-        ctx.strokeStyle = '#e94560';
+        ctx.strokeStyle = P.accent;
         ctx.lineWidth = 2;
         ctx.strokeRect(bl.x, bl.y, tr.x - bl.x, tr.y - bl.y);
 
-        ctx.fillStyle = '#e94560';
+        ctx.fillStyle = P.accent;
         ctx.font = '12px monospace';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'bottom';
@@ -116,22 +123,23 @@ export class Renderer {
         // 1. Delivery Zone on Left
         if (warehouse.deliveryZone) {
             const dz = warehouse.deliveryZone;
+            const P = this.palette;
             const bl = camera.worldToScreen(dz.x, dz.y, canvas.width, canvas.height);
             const tr = camera.worldToScreen(dz.x + dz.width, dz.y + dz.height, canvas.width, canvas.height);
             const zw = tr.x - bl.x;
             const zh = tr.y - bl.y;
 
             // Subtle zone background
-            ctx.fillStyle = 'rgba(0, 180, 255, 0.06)';
+            ctx.fillStyle = withAlpha(P.info, 0.06);
             ctx.fillRect(bl.x, bl.y, zw, zh);
-            ctx.strokeStyle = 'rgba(0, 200, 255, 0.35)';
+            ctx.strokeStyle = withAlpha(P.info, 0.35);
             ctx.lineWidth = 1;
             ctx.setLineDash([4, 4]);
             ctx.strokeRect(bl.x, bl.y, zw, zh);
             ctx.setLineDash([]);
 
             // Zone title
-            ctx.fillStyle = '#00c8ff';
+            ctx.fillStyle = P.info;
             ctx.font = 'bold 11px monospace';
             ctx.textAlign = 'left';
             ctx.textBaseline = 'top';
@@ -144,14 +152,14 @@ export class Renderer {
                 const dw = str.x - sbl.x;
                 const dh = str.y - sbl.y;
 
-                ctx.fillStyle = 'rgba(0, 80, 140, 0.6)';
+                ctx.fillStyle = withAlpha(P.info, 0.35);
                 ctx.fillRect(sbl.x, sbl.y, dw, dh);
-                ctx.strokeStyle = '#00c8ff';
+                ctx.strokeStyle = P.info;
                 ctx.lineWidth = 1.5;
                 ctx.strokeRect(sbl.x, sbl.y, dw, dh);
 
                 // Conveyor dock lines
-                ctx.strokeStyle = 'rgba(0, 200, 255, 0.25)';
+                ctx.strokeStyle = withAlpha(P.info, 0.25);
                 ctx.lineWidth = 1;
                 const step = Math.max(6, 8 * camera.zoom);
                 for (let lx = sbl.x + step; lx < sbl.x + dw; lx += step) {
@@ -162,7 +170,7 @@ export class Renderer {
                 }
 
                 // Dock Label
-                ctx.fillStyle = '#ffffff';
+                ctx.fillStyle = P.text;
                 ctx.font = 'bold 10px monospace';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
@@ -173,22 +181,23 @@ export class Renderer {
         // 2. AMR Charging Area on Right
         if (warehouse.chargingZone) {
             const cz = warehouse.chargingZone;
+            const P = this.palette;
             const bl = camera.worldToScreen(cz.x, cz.y, canvas.width, canvas.height);
             const tr = camera.worldToScreen(cz.x + cz.width, cz.y + cz.height, canvas.width, canvas.height);
             const zw = tr.x - bl.x;
             const zh = tr.y - bl.y;
 
             // Subtle zone background
-            ctx.fillStyle = 'rgba(0, 255, 136, 0.05)';
+            ctx.fillStyle = withAlpha(P.success, 0.05);
             ctx.fillRect(bl.x, bl.y, zw, zh);
-            ctx.strokeStyle = 'rgba(0, 255, 136, 0.35)';
+            ctx.strokeStyle = withAlpha(P.success, 0.35);
             ctx.lineWidth = 1;
             ctx.setLineDash([4, 4]);
             ctx.strokeRect(bl.x, bl.y, zw, zh);
             ctx.setLineDash([]);
 
             // Zone title
-            ctx.fillStyle = '#00ff88';
+            ctx.fillStyle = P.success;
             ctx.font = 'bold 11px monospace';
             ctx.textAlign = 'right';
             ctx.textBaseline = 'top';
@@ -201,15 +210,15 @@ export class Renderer {
                 const pw = ptr.x - pbl.x;
                 const ph = ptr.y - pbl.y;
 
-                ctx.fillStyle = 'rgba(0, 90, 50, 0.55)';
+                ctx.fillStyle = withAlpha(P.success, 0.35);
                 ctx.fillRect(pbl.x, pbl.y, pw, ph);
-                ctx.strokeStyle = '#00ff88';
+                ctx.strokeStyle = P.success;
                 ctx.lineWidth = 1.5;
                 ctx.strokeRect(pbl.x, pbl.y, pw, ph);
 
                 // Corner brackets on charging pad
                 const cl = Math.min(6, pw * 0.25);
-                ctx.strokeStyle = '#ffd43b';
+                ctx.strokeStyle = P.warning;
                 ctx.lineWidth = 1.5;
                 // Top-left
                 ctx.beginPath();
@@ -219,7 +228,7 @@ export class Renderer {
                 ctx.stroke();
 
                 // Lightning symbol & label
-                ctx.fillStyle = '#ffd43b';
+                ctx.fillStyle = P.warning;
                 ctx.font = 'bold 11px monospace';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
@@ -230,6 +239,7 @@ export class Renderer {
 
     drawObstacles(obstacles, shelves = []) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         const shelfIds = new Set((shelves || []).map((s) => s.id));
 
         for (const obs of obstacles) {
@@ -242,15 +252,15 @@ export class Renderer {
 
             if (isShelf) {
                 // Warehouse rack styling
-                ctx.fillStyle = '#2c251f';
+                ctx.fillStyle = P.shelfFill;
                 ctx.fillRect(bl.x, bl.y, w, h);
-                ctx.strokeStyle = '#ffa94d';
+                ctx.strokeStyle = P.shelfStroke;
                 ctx.lineWidth = 1.5;
                 ctx.strokeRect(bl.x, bl.y, w, h);
 
                 // Shelf internal compartment lines
                 const slots = 3;
-                ctx.strokeStyle = 'rgba(255, 169, 77, 0.35)';
+                ctx.strokeStyle = P.shelfSlot;
                 ctx.lineWidth = 1;
                 for (let s = 1; s < slots; s++) {
                     const cx = bl.x + (w / slots) * s;
@@ -260,20 +270,22 @@ export class Renderer {
                     ctx.stroke();
                 }
 
-                ctx.fillStyle = '#ffd43b';
+                ctx.fillStyle = P.warning;
                 ctx.font = 'bold 10px monospace';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
                 ctx.fillText(obs.id, bl.x + w / 2, bl.y + h / 2);
             } else {
-                // Standard obstacle styling
-                ctx.fillStyle = '#555577';
+                // Standard obstacle styling (dashed border → runtime, removable)
+                ctx.fillStyle = P.obstacleFill;
                 ctx.fillRect(bl.x, bl.y, w, h);
-                ctx.strokeStyle = '#e94560';
+                ctx.strokeStyle = P.obstacleStroke;
                 ctx.lineWidth = 1.5;
+                if (obs.type === 'obstacle') ctx.setLineDash([4, 4]);
                 ctx.strokeRect(bl.x, bl.y, w, h);
+                ctx.setLineDash([]);
 
-                ctx.fillStyle = '#aaaacc';
+                ctx.fillStyle = P.obstacleText;
                 ctx.font = '10px monospace';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
@@ -289,7 +301,7 @@ export class Renderer {
                     const spt = camera.worldToScreen(pt.x, pt.y, canvas.width, canvas.height);
                     ctx.beginPath();
                     ctx.arc(spt.x, spt.y, 2, 0, Math.PI * 2);
-                    ctx.fillStyle = 'rgba(255, 212, 59, 0.45)';
+                    ctx.fillStyle = withAlpha(P.warning, 0.45);
                     ctx.fill();
                 }
             }
@@ -298,22 +310,15 @@ export class Renderer {
 
     drawTasks(tasks) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         for (const task of tasks) {
-            const style = taskStyle(task.status);
+            if (TASK_TERMINAL.has(task.status)) continue;
+            const style = taskStyle(task.status, P);
             const pickup = camera.worldToScreen(task.pickup.x, task.pickup.y, canvas.width, canvas.height);
             const dropoff = camera.worldToScreen(task.dropoff.x, task.dropoff.y, canvas.width, canvas.height);
 
-            ctx.beginPath();
-            ctx.moveTo(pickup.x, pickup.y);
-            ctx.lineTo(dropoff.x, dropoff.y);
-            ctx.strokeStyle = style.line;
-            ctx.lineWidth = 1.2;
-            ctx.setLineDash([4, 4]);
-            ctx.stroke();
-            ctx.setLineDash([]);
-
             ctx.strokeStyle = style.color;
-            ctx.lineWidth = 2;
+            ctx.lineWidth = 1.5;
             ctx.fillStyle = 'transparent';
             ctx.beginPath();
             ctx.arc(pickup.x, pickup.y, 6, 0, Math.PI * 2);
@@ -330,7 +335,7 @@ export class Renderer {
             ctx.fill();
             ctx.beginPath();
             ctx.arc(dropoff.x, dropoff.y, 3, 0, Math.PI * 2);
-            ctx.fillStyle = '#1a1a2e';
+            ctx.fillStyle = P.canvasBg;
             ctx.fill();
             ctx.fillText('D', dropoff.x, dropoff.y + 10);
 
@@ -338,15 +343,14 @@ export class Renderer {
             ctx.fillStyle = style.text;
             ctx.font = '10px monospace';
             ctx.textAlign = 'center';
-            ctx.textBaseline = 'bottom';
-            const midX = (pickup.x + dropoff.x) / 2;
-            const midY = (pickup.y + dropoff.y) / 2 - 8;
-            ctx.fillText(label, midX, midY);
+            ctx.textBaseline = 'top';
+            ctx.fillText(label, pickup.x, pickup.y + 18);
         }
     }
 
     drawRobotPaths(robots) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         for (const robot of robots) {
             if (robot.targetX == null || robot.targetY == null) continue;
             const start = camera.worldToScreen(robot.x, robot.y, canvas.width, canvas.height);
@@ -355,7 +359,7 @@ export class Renderer {
             ctx.beginPath();
             ctx.moveTo(start.x, start.y);
             ctx.lineTo(end.x, end.y);
-            ctx.strokeStyle = 'rgba(0, 200, 255, 0.3)';
+            ctx.strokeStyle = withAlpha(P.info, 0.3);
             ctx.lineWidth = 1;
             ctx.setLineDash([5, 5]);
             ctx.stroke();
@@ -365,6 +369,7 @@ export class Renderer {
 
     drawRobots(robots, selectedRobotId) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         for (const robot of robots) {
             const screen = camera.worldToScreen(robot.x, robot.y, canvas.width, canvas.height);
             const r = robot.radius * camera.zoom;
@@ -373,11 +378,11 @@ export class Renderer {
             ctx.globalAlpha = robot.online ? (isSelected ? 1 : 0.75) : 0.3;
             ctx.beginPath();
             ctx.arc(screen.x, screen.y, Math.max(4, r), 0, Math.PI * 2);
-            ctx.fillStyle = robot.online ? robot.color : '#555577';
+            ctx.fillStyle = robot.online ? robot.color : P.obstacleFill;
             ctx.fill();
             ctx.globalAlpha = 1;
 
-            ctx.strokeStyle = isSelected ? '#ffffff' : 'rgba(255,255,255,0.5)';
+            ctx.strokeStyle = isSelected ? P.selectionOutline : withAlpha(P.selectionOutline, 0.5);
             ctx.lineWidth = isSelected ? 2.5 : 1;
             ctx.stroke();
 
@@ -387,7 +392,7 @@ export class Renderer {
                 ctx.lineTo(screen.x + r, screen.y + r);
                 ctx.moveTo(screen.x + r, screen.y - r);
                 ctx.lineTo(screen.x - r, screen.y + r);
-                ctx.strokeStyle = '#e94560';
+                ctx.strokeStyle = P.danger;
                 ctx.lineWidth = 2;
                 ctx.stroke();
                 continue;
@@ -398,11 +403,11 @@ export class Renderer {
             ctx.beginPath();
             ctx.moveTo(screen.x, screen.y);
             ctx.lineTo(screen.x + dirX, screen.y + dirY);
-            ctx.strokeStyle = '#00ff88';
+            ctx.strokeStyle = P.success;
             ctx.lineWidth = 2.5;
             ctx.stroke();
 
-            ctx.fillStyle = '#fff';
+            ctx.fillStyle = P.text;
             ctx.font = `bold ${Math.max(10, Math.min(14, 12 * camera.zoom))}px monospace`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'bottom';
@@ -412,6 +417,7 @@ export class Renderer {
 
     drawTargetIndicator(scene) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         const robot = scene.selectedRobot;
         if (!robot || robot.targetX == null || robot.targetY == null) return;
 
@@ -419,7 +425,7 @@ export class Renderer {
 
         ctx.beginPath();
         ctx.arc(screen.x, screen.y, 8, 0, Math.PI * 2);
-        ctx.strokeStyle = '#00ff88';
+        ctx.strokeStyle = P.success;
         ctx.lineWidth = 2;
         ctx.setLineDash([3, 3]);
         ctx.stroke();
@@ -430,7 +436,7 @@ export class Renderer {
         ctx.lineTo(screen.x + 12, screen.y);
         ctx.moveTo(screen.x, screen.y - 12);
         ctx.lineTo(screen.x, screen.y + 12);
-        ctx.strokeStyle = '#00ff88';
+        ctx.strokeStyle = P.success;
         ctx.lineWidth = 1.5;
         ctx.stroke();
     }
@@ -438,7 +444,7 @@ export class Renderer {
     drawMouseCoords(worldX, worldY) {
         if (worldX === null || worldY === null) return;
         const { ctx } = this;
-        ctx.fillStyle = '#8888aa';
+        ctx.fillStyle = this.palette.gridLabel;
         ctx.font = '11px monospace';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'top';
@@ -447,6 +453,7 @@ export class Renderer {
 
     drawObstaclePreview(drag) {
         const { ctx, camera, canvas } = this;
+        const P = this.palette;
         const x = Math.min(drag.startX, drag.endX);
         const y = Math.min(drag.startY, drag.endY);
         const w = Math.abs(drag.endX - drag.startX);
@@ -457,15 +464,15 @@ export class Renderer {
         const sw = tr.x - bl.x;
         const sh = tr.y - bl.y;
 
-        ctx.fillStyle = 'rgba(85, 85, 119, 0.5)';
+        ctx.fillStyle = withAlpha(P.obstacleFill, 0.5);
         ctx.fillRect(bl.x, bl.y, sw, sh);
-        ctx.strokeStyle = '#e94560';
+        ctx.strokeStyle = P.accent;
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 4]);
         ctx.strokeRect(bl.x, bl.y, sw, sh);
         ctx.setLineDash([]);
 
-        ctx.fillStyle = '#e94560';
+        ctx.fillStyle = P.accent;
         ctx.font = '10px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
@@ -473,17 +480,15 @@ export class Renderer {
     }
 }
 
-function taskStyle(status) {
+const TASK_TERMINAL = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
+
+function taskStyle(status, P) {
     switch (status) {
-        case 'COMPLETED':
-            return { color: '#2ecc71', line: 'rgba(46,204,113,0.35)', text: '#2ecc71' };
-        case 'CANCELLED':
-        case 'FAILED':
-            return { color: '#e74c3c', line: 'rgba(231,76,60,0.35)', text: '#e74c3c' };
         case 'PICKING_UP':
         case 'DELIVERING':
-            return { color: '#00c8ff', line: 'rgba(0,200,255,0.5)', text: '#00c8ff' };
+            return { color: P.info, line: withAlpha(P.info, 0.5), text: P.info };
+        case 'ASSIGNED':
         default:
-            return { color: '#f5a623', line: 'rgba(245,166,35,0.5)', text: '#f5a623' };
+            return { color: P.warning, line: withAlpha(P.warning, 0.5), text: P.warning };
     }
 }

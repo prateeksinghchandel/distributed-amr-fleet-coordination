@@ -191,6 +191,7 @@ class ProcessManager:
             "--url", config.DEFAULT_AMR_URL,
             "--x", f"{entry['x']:.3f}",
             "--y", f"{entry['y']:.3f}",
+            "--mode", self.settings.auction_mode,
         ]
         return self.add_process(
             self.amr_process_name(amr_id),
@@ -200,20 +201,22 @@ class ProcessManager:
             env=backend_env(),
         )
 
-    def coordinator_process(self, preset: str, tasks: int, roster: list | None = None) -> ManagedProcess:
+    def coordinator_process(self, preset: str, tasks: int, roster: list | None = None,
+                            auction_mode: Optional[str] = None) -> ManagedProcess:
         if roster is None:
             roster = list(self.amrs.values())
-        cmd = self._coordinator_cmd(preset, tasks, roster)
+        mode = auction_mode or self.settings.auction_mode
+        cmd = self._coordinator_cmd(preset, tasks, roster, mode)
         return self.add_process(
             "coordinator",
             cmd,
             cwd=str(config.BACKEND_DIR),
-            detail=self._coordinator_detail(preset, tasks, roster),
+            detail=self._coordinator_detail(preset, tasks, roster, mode),
             env=backend_env(),
         )
 
     @staticmethod
-    def _coordinator_cmd(preset: str, tasks: int, roster: list) -> list:
+    def _coordinator_cmd(preset: str, tasks: int, roster: list, auction_mode: str) -> list:
         roster_arg = ",".join(f"{r['id']}:{r['x']}:{r['y']}" for r in roster)
         return [
             config.PYTHON_BIN,
@@ -222,12 +225,14 @@ class ProcessManager:
             "--tasks", str(tasks),
             "--url", config.COORDINATOR_URL,
             "--roster", roster_arg,
+            "--mode", auction_mode,
         ]
 
     @staticmethod
-    def _coordinator_detail(preset: str, tasks: int, roster: list) -> dict:
+    def _coordinator_detail(preset: str, tasks: int, roster: list, auction_mode: str) -> dict:
         roster_arg = ",".join(f"{r['id']}:{r['x']}:{r['y']}" for r in roster)
-        return {"type": "coordinator", "preset": preset, "tasks": tasks, "roster": roster_arg}
+        return {"type": "coordinator", "preset": preset, "tasks": tasks,
+                "roster": roster_arg, "auctionMode": auction_mode}
 
     def update_coordinator_cmd(self) -> None:
         """Refresh the coordinator's launch args from the current AMR set.
@@ -239,14 +244,16 @@ class ProcessManager:
         if coord is None:
             return
         roster = list(self.amrs.values())
-        coord.cmd = self._coordinator_cmd(self.settings.preset, self.settings.tasks, roster)
-        coord.detail = self._coordinator_detail(self.settings.preset, self.settings.tasks, roster)
+        coord.cmd = self._coordinator_cmd(self.settings.preset, self.settings.tasks, roster,
+                                          self.settings.auction_mode)
+        coord.detail = self._coordinator_detail(self.settings.preset, self.settings.tasks, roster,
+                                                self.settings.auction_mode)
 
     def zenohd_process(self) -> ManagedProcess:
         return self.add_process(
             "zenohd",
             [
-                resolve_bin("zenohd"),
+                resolve_bin("zenohd") or "zenohd",
                 "--no-multicast-scouting",
                 "--listen", f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}",
             ],
@@ -259,7 +266,7 @@ class ProcessManager:
         return self.add_process(
             "bridge",
             [
-                resolve_bin("zenoh-bridge-remote-api"),
+                resolve_bin("zenoh-bridge-remote-api") or "zenoh-bridge-remote-api",
                 "--no-multicast-scouting",
                 "--connect", f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}",
                 "--ws-port", str(config.ZENOH_WS_PORT),
@@ -387,6 +394,11 @@ class ProcessManager:
         try:
             child = await self.spawn(proc.cmd, cwd=proc.cwd, env=proc.env if proc.env is not None else None, log=self.log)
         except Exception as exc:
+            if proc.name in ("zenohd", "zenoh-bridge-remote-api") and resolve_bin(proc.name) is None:
+                env_key = {"zenohd": "ZENOH_ZENOHD", "zenoh-bridge-remote-api": "ZENOH_BRIDGE"}.get(proc.name)
+                raise DependencyError(
+                    f"cannot start {proc.name}: binary not found — install it or set {env_key}"
+                ) from exc
             proc.last_error = f"spawn failed: {exc}"
             raise ProcessError(f"{proc.name} {proc.last_error}") from exc
         proc.proc = child
@@ -505,12 +517,14 @@ class ProcessManager:
         self.update_coordinator_cmd()
         return {"ok": True, "id": amr_id}
 
-    def set_configuration(self, preset: Optional[str] = None, tasks: Optional[int] = None) -> dict:
+    def set_configuration(self, preset: Optional[str] = None, tasks: Optional[int] = None,
+                          auction_mode: Optional[str] = None) -> dict:
         coord = self.processes.get("coordinator")
         if coord and coord.state in ("STARTING", "RUNNING", "STOPPING"):
             raise ProcessError("stop the coordinator before changing its configuration")
-        self.settings.set(preset, tasks)
-        self.coordinator_process(self.settings.preset, self.settings.tasks, self.amr_store.list())
+        self.settings.set(preset, tasks, auction_mode)
+        self.coordinator_process(self.settings.preset, self.settings.tasks, self.amr_store.list(),
+                                 self.settings.auction_mode)
         return self.settings.to_dict()
 
     # ------------------------------------------------------------------

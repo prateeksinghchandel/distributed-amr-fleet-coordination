@@ -17,8 +17,14 @@ TASK_CANCELLED = "tasks/cancelled"
 BID_PLACED = "auction/bids"
 """Robot → Coordinator: bid submission during an auction round."""
 
+AUCTION_COMMIT = "auction/commit"
+"""Winner robot → Fleet: self-determined winner announcement (P2P_AUCTION only)."""
+
 AUCTION_RESULT = "auction/results"
-"""Coordinator → Fleet: winner + committed flag for a completed auction."""
+"""Coordinator → Fleet: winner + committed flag for a completed auction.
+
+In P2P_AUCTION mode the result is published by the winning robot (for fleet
+observability) rather than by the coordinator, which stays a passive ledger."""
 
 ROBOT_TELEMETRY = "robots/telemetry"
 """Robot → Coordinator: position / status heartbeat, published every 0.5 s."""
@@ -37,3 +43,13 @@ CONTROL_TASK_ASSIGN = "control/tasks/assign"
 
 CONTROL_TASK_CANCEL = "control/tasks/cancel"
 """Dashboard → Coordinator: cancel a task."""
+
+CONTROL_OBSTACLE_ADD = "control/world/obstacles/add"
+"""Dashboard → Coordinator: add a runtime obstacle rectangle to the live world.
+
+Runtime obstacles are session-scoped (they join the preset shelf racks and are
+removed when the coordinator restarts). The coordinator re-publishes world/state
+immediately so robots re-plan around them."""
+
+CONTROL_OBSTACLE_REMOVE = "control/world/obstacles/remove"
+"""Dashboard → Coordinator: remove a runtime obstacle by its id."""

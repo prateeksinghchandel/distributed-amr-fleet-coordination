@@ -73,6 +73,7 @@ class BidCosts(BaseModel):
 class TaskNewPayload(BaseModel):
     """topics.TASK_NEW — coordinator → fleet."""
     taskId: str
+    auctionId: Optional[str] = None   # explicit auction round id (P2P_AUCTION)
     pickup: Point
     dropoff: Point
     priority: Optional[int] = 1
@@ -91,20 +92,33 @@ class TaskCancelledPayload(BaseModel):
 
 
 class BidPlacedPayload(BaseModel):
-    """topics.BID_PLACED — robot → coordinator."""
+    """topics.BID_PLACED — robot → fleet (coordinator or peers)."""
     taskId: str
+    auctionId: Optional[str] = None    # auction round id when present
     robotId: str
     bid: Optional[float] = None        # None means ineligible
     costs: Optional[BidCosts] = None
     reason: Optional[str] = None       # ineligibility reason
 
 
-class AuctionResultPayload(BaseModel):
-    """topics.AUCTION_RESULT — coordinator → fleet."""
+class AuctionCommitPayload(BaseModel):
+    """topics.AUCTION_COMMIT — winner → fleet (P2P_AUCTION only)."""
     taskId: str
+    auctionId: str
+    robotId: str                    # the committing winner robot
+    winner: str
+    bidCount: int = 0
+    bids: list[BidPlacedPayload] = Field(default_factory=list)
+
+
+class AuctionResultPayload(BaseModel):
+    """topics.AUCTION_RESULT — winner/coordinator → fleet."""
+    taskId: str
+    auctionId: Optional[str] = None    # the committed round
     winner: Optional[str] = None
     bids: list[BidPlacedPayload] = Field(default_factory=list)
     committed: bool = False
+    conflict: Optional[bool] = None    # True ⇒ divergent winner aborted
 
 
 class TelemetryPayload(BaseModel):

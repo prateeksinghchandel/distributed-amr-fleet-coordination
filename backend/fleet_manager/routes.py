@@ -102,6 +102,7 @@ async def api_coordinator_configure(request: web.Request) -> web.Response:
     body = await request.json()
     preset = (body.get("preset") or "").upper().strip()
     tasks = body.get("tasks")
+    auction_mode = (body.get("auctionMode") or "").upper().strip() or None
     if preset and preset not in ("MICRO_FULFILLMENT", "ECOMMERCE", "DISTRIBUTION"):
         return _err(400, f"unsupported preset '{preset}'")
     if tasks is not None:
@@ -109,7 +110,9 @@ async def api_coordinator_configure(request: web.Request) -> web.Response:
             tasks = int(tasks)
         except ValueError:
             return _err(400, "tasks must be an integer")
-    pm.set_configuration(preset or None, tasks)
+    if auction_mode and auction_mode not in ("SERVER_AUCTION", "P2P_AUCTION"):
+        return _err(400, f"unsupported auction mode '{auction_mode}'")
+    pm.set_configuration(preset or None, tasks, auction_mode)
     return _ok(pm.status())
 
 

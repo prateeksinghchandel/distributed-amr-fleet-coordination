@@ -2,7 +2,7 @@
 
 Two small files under backend/state/:
     amrs.json      - configured AMR fleet (id, x, y)
-    settings.json  - manager settings (coordinator preset / task count)
+    settings.json  - manager settings (coordinator preset / task count / auction mode)
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ import json
 import threading
 from pathlib import Path
 from typing import Optional
+
+from common.auction import AuctionMode
 
 RESERVED_NAMES = {"zenohd", "bridge", "coordinator", "server"}
 
@@ -76,32 +78,41 @@ class AmrStore:
 
 
 class SettingsStore:
-    def __init__(self, path: Path, default_preset: str = "MICRO_FULFILLMENT", default_tasks: int = 1):
+    def __init__(self, path: Path, default_preset: str = "MICRO_FULFILLMENT", default_tasks: int = 1,
+                 default_auction_mode: str = AuctionMode.SERVER_AUCTION):
         self.path = Path(path)
         self._lock = threading.Lock()
         self.preset = default_preset
         self.tasks = default_tasks
+        self.auction_mode = AuctionMode.normalize(default_auction_mode)
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text())
                 self.preset = data.get("preset", default_preset)
                 self.tasks = int(data.get("tasks", default_tasks))
+                self.auction_mode = AuctionMode.normalize(data.get("auctionMode", self.auction_mode))
             except (OSError, ValueError):
                 pass
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"preset": self.preset, "tasks": self.tasks}, indent=2))
+        tmp.write_text(json.dumps(
+            {"preset": self.preset, "tasks": self.tasks, "auctionMode": self.auction_mode},
+            indent=2,
+        ))
         tmp.replace(self.path)
 
-    def set(self, preset: Optional[str] = None, tasks: Optional[int] = None) -> dict:
+    def set(self, preset: Optional[str] = None, tasks: Optional[int] = None,
+            auction_mode: Optional[str] = None) -> dict:
         if preset:
             self.preset = preset
         if tasks is not None:
             self.tasks = max(0, int(tasks))
+        if auction_mode is not None:
+            self.auction_mode = AuctionMode.normalize(auction_mode)
         self.save()
         return self.to_dict()
 
     def to_dict(self) -> dict:
-        return {"preset": self.preset, "tasks": self.tasks}
+        return {"preset": self.preset, "tasks": self.tasks, "auctionMode": self.auction_mode}

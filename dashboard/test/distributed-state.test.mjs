@@ -440,16 +440,22 @@ async function connectedState(sessionOpts = {}) {
     const okRandom = state.generateRandomTasks(3);
     const okAssign = state.assignTask('T-A1', 'AMR1');
     const okCancel = state.cancelTask('T-A1');
+    const okAddObstacle = state.addObstacle({ x: 2, y: 3, width: 1, height: 2 });
+    const okRemoveObstacle = state.removeObstacleById('OBS01');
     await sleep(5);
 
     check('createTask publishes control/tasks/create', okCreate === true);
     check('generateRandomTasks publishes control/tasks/create (randomCount)', okRandom === true);
     check('assignTask publishes control/tasks/assign', okAssign === true);
     check('cancelTask publishes control/tasks/cancel', okCancel === true);
+    check('addObstacle publishes obstacles/add', okAddObstacle === true);
+    check('removeObstacleById publishes obstacles/remove', okRemoveObstacle === true);
 
     const topicsPublished = session.puts.map((p) => p.topic);
-    check('all control topics published once', ['control/tasks/create', 'control/tasks/create', 'control/tasks/assign', 'control/tasks/cancel']
-        .every((t, i) => topicsPublished[i] === t));
+    check('all control topics published in order',
+        ['control/tasks/create', 'control/tasks/create', 'control/tasks/assign',
+         'control/tasks/cancel', 'control/world/obstacles/add', 'control/world/obstacles/remove']
+            .every((t, i) => topicsPublished[i] === t));
 
     const createPut = session.puts.find((p) => p.topic === TOPICS.CONTROL_TASK_CREATE);
     const parsed = JSON.parse(createPut.payload);
@@ -459,6 +465,14 @@ async function connectedState(sessionOpts = {}) {
 
     const randomPut = session.puts.find((p) => p.topic === TOPICS.CONTROL_TASK_CREATE && /randomCount/.test(p.payload));
     check('random command carries randomCount', randomPut && JSON.parse(randomPut.payload).payload.randomCount === 3);
+
+    const obstaclePut = session.puts.find((p) => p.topic === TOPICS.CONTROL_OBSTACLE_ADD);
+    const obstacleParsed = JSON.parse(obstaclePut.payload);
+    check('obstacle add payload carries rect', obstacleParsed.payload.x === 2 && obstacleParsed.payload.width === 1);
+
+    const removePut = session.puts.find((p) => p.topic === TOPICS.CONTROL_OBSTACLE_REMOVE);
+    check('obstacle remove payload carries id',
+        removePut && JSON.parse(removePut.payload).payload.id === 'OBS01');
 
     await state.dispose();
 }

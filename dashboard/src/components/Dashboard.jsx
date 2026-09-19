@@ -1,21 +1,42 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Header from './Header.jsx';
-import Sidebar from './Sidebar.jsx';
+import FleetSidebar from './FleetSidebar.jsx';
+import Inspector from './Inspector.jsx';
+import EventLog from './EventLog.jsx';
 import WarehouseCanvas from './WarehouseCanvas.jsx';
-import FleetPanel from './FleetPanel.jsx';
-import BottomPanel from './BottomPanel.jsx';
-import FleetControl from './FleetControl.jsx';
+import SettingsModal from './settings/SettingsModal.jsx';
+import StartupScreen from './StartupScreen.jsx';
+import TaskDrawer from './drawers/TaskDrawer.jsx';
+import AuctionDrawer from './drawers/AuctionDrawer.jsx';
+import AmrDrawer from './drawers/AmrDrawer.jsx';
+import { useFleetManager } from '../hooks/useFleetManager.js';
 import { createDistributedFleetState } from '../distributed/DistributedFleetState.js';
+import { useTheme } from '../theme/ThemeContext.jsx';
+import { OPERATING_MODES } from './ModeSelector.jsx';
 
 const fleet = createDistributedFleetState();
+const STORAGE_MODE = 'amr_mode';
+
+function loadMode() {
+    try {
+        const m = localStorage.getItem(STORAGE_MODE);
+        if (m && OPERATING_MODES[m]) return m;
+    } catch { /* private mode */ }
+    return 'NORMAL';
+}
 
 export default function Dashboard() {
+    const { palette: P } = useTheme();
+    const { status, managerAvailable } = useFleetManager();
     const [, setTick] = useState(0);
-    const [logs, setLogs] = useState(() => fleet.logs.map((e) => `[${e.time}] ${e.message}`));
-    const logsSeenRef = useRef(fleet.logs.length);
     const [debug, setDebug] = useState({});
-    const [cameraResetToken, setCameraResetToken] = useState(0);
+    const [mode, setMode] = useState(loadMode);
+    const [drawer, setDrawer] = useState(null); // 'tasks' | 'auctions' | 'amrs' | null
+    const [settingsOpen, setSettingsOpen] = useState(false);
+    const [settingsTab, setSettingsTab] = useState('GENERAL');
+    const [selection, setSelection] = useState(null); // {type:'robot'|'task', id}
     const lastWorldSyncRef = useRef(0);
+    const lastSelectedRef = useRef(fleet.selectedRobotId);
 
     useEffect(() => {
         const unsubscribe = fleet.subscribe(() => {
@@ -24,22 +45,35 @@ export default function Dashboard() {
                 lastWorldSyncRef.current = now;
                 setTick((t) => t + 1);
             }
-            const newCount = fleet.logs.length;
-            if (newCount !== logsSeenRef.current) {
-                const extra = fleet.logs.slice(logsSeenRef.current);
-                logsSeenRef.current = newCount;
-                if (extra.length > 0) {
-                    setLogs((prev) => [...prev.slice(-399), ...extra.map((e) => `[${e.time}] ${e.message}`)]);
-                }
+            if (fleet.selectedRobotId !== lastSelectedRef.current) {
+                lastSelectedRef.current = fleet.selectedRobotId;
+                setSelection({ type: 'robot', id: fleet.selectedRobotId });
             }
         });
-
         return () => unsubscribe();
     }, []);
 
-    const handleResetCamera = useCallback(() => {
-        setCameraResetToken((t) => t + 1);
+    const handleModeChange = useCallback((m) => {
+        setMode(m);
+        try {
+            localStorage.setItem(STORAGE_MODE, m);
+        } catch { /* private mode */ }
     }, []);
+
+    const fleetRunning = Boolean(status && status.ready && managerAvailable);
+
+    if (!fleetRunning) {
+        return <StartupScreen fleet={fleet} mode={mode} onModeChange={handleModeChange} />;
+    }
+
+    const openSettings = (tab = 'GENERAL') => {
+        setSettingsTab(tab);
+        setSettingsOpen(true);
+    };
+
+    const effectiveSelection = selection && selection.type === 'task'
+        ? (fleet.tasksList.some((t) => t.id === selection.id) ? selection : { type: 'robot', id: fleet.selectedRobotId })
+        : { type: 'robot', id: fleet.selectedRobotId };
 
     return (
         <div style={{
@@ -47,24 +81,72 @@ export default function Dashboard() {
             width: '100vw',
             display: 'flex',
             flexDirection: 'column',
-            background: '#0a0a1a',
-            color: '#e0e0e0',
-            fontFamily: 'monospace'
+            background: P.background,
+            color: P.text,
+            fontFamily: 'monospace',
         }}>
-            <Header fleet={fleet} onResetCamera={handleResetCamera} />
-            <FleetControl fleet={fleet} />
+            <Header
+                fleet={fleet}
+                mode={mode}
+                onModeChange={handleModeChange}
+                onOpenSettings={() => openSettings()}
+                onOpenInfrastructure={() => openSettings('INFRASTRUCTURE')}
+            />
+
             <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-                <Sidebar fleet={fleet} />
+                <FleetSidebar
+                    fleet={fleet}
+                    selectedRobotId={fleet.selectedRobotId}
+                    onSelectRobot={(id) => { fleet.setSelectedRobot(id); setSelection({ type: 'robot', id }); }}
+                    onOpenTasks={() => setDrawer('tasks')}
+                    onOpenAuctions={() => setDrawer('auctions')}
+                    onOpenAmrs={() => setDrawer('amrs')}
+                />
                 <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
                     <WarehouseCanvas
                         fleet={fleet}
-                        cameraResetToken={cameraResetToken}
                         onCameraChange={setDebug}
+                        palette={P}
                     />
                 </div>
-                <FleetPanel fleet={fleet} />
+                <Inspector
+                    fleet={fleet}
+                    selection={effectiveSelection}
+                    mode={mode}
+                    onSelectRobot={(id) => { fleet.setSelectedRobot(id); setSelection({ type: 'robot', id }); }}
+                    onSelectTask={(id) => setSelection({ type: 'task', id })}
+                    onCancelTask={(id) => fleet.cancelTask(id)}
+                />
             </div>
-            <BottomPanel logs={logs} debug={debug} fleet={fleet} />
+
+            <EventLog fleet={fleet} height={190} />
+
+            {drawer === 'tasks' && (
+                <TaskDrawer
+                    fleet={fleet}
+                    onClose={() => setDrawer(null)}
+                    onSelectTask={(id) => { setSelection({ type: 'task', id }); setDrawer(null); }}
+                />
+            )}
+            {drawer === 'auctions' && (
+                <AuctionDrawer
+                    fleet={fleet}
+                    onClose={() => setDrawer(null)}
+                    onSelectTask={(id) => { setSelection({ type: 'task', id }); setDrawer(null); }}
+                />
+            )}
+            {drawer === 'amrs' && (
+                <AmrDrawer status={status} onClose={() => setDrawer(null)} />
+            )}
+
+            {settingsOpen && (
+                <SettingsModal
+                    fleet={fleet}
+                    debug={debug}
+                    initialTab={settingsTab}
+                    onClose={() => setSettingsOpen(false)}
+                />
+            )}
         </div>
     );
 }

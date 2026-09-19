@@ -3,6 +3,7 @@ export const TOPICS = {
     TASK_ASSIGNED: 'tasks/assigned',
     TASK_CANCELLED: 'tasks/cancelled',
     BID_PLACED: 'auction/bids',
+    AUCTION_COMMIT: 'auction/commit',
     AUCTION_RESULT: 'auction/results',
     ROBOT_TELEMETRY: 'robots/telemetry',
     ROBOT_INTENT: 'robots/intent',
@@ -10,4 +11,6 @@ export const TOPICS = {
     CONTROL_TASK_CREATE: 'control/tasks/create',
     CONTROL_TASK_ASSIGN: 'control/tasks/assign',
     CONTROL_TASK_CANCEL: 'control/tasks/cancel',
+    CONTROL_OBSTACLE_ADD: 'control/world/obstacles/add',
+    CONTROL_OBSTACLE_REMOVE: 'control/world/obstacles/remove',
 };

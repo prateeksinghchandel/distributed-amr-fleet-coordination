@@ -3,24 +3,3 @@
     padding: 0;
     box-sizing: border-box;
 }
-
-html, body, #root {
-    width: 100vw;
-    height: 100vh;
-    overflow: hidden;
-    background: #0a0a1a;
-}
-
-::-webkit-scrollbar {
-    width: 6px;
-}
-::-webkit-scrollbar-track {
-    background: #16213e;
-}
-::-webkit-scrollbar-thumb {
-    background: #0f3460;
-    border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-    background: #e94560;
-}

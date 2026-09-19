@@ -446,7 +446,8 @@ async def test_set_configuration(tmp_path):
     joined = " ".join(pm.processes["coordinator"].cmd)
     assert "--preset ECOMMERCE" in joined
     assert "--tasks 3" in joined
-    assert pm.settings.to_dict() == {"preset": "ECOMMERCE", "tasks": 3}
+    assert pm.settings.to_dict() == {"preset": "ECOMMERCE", "tasks": 3,
+                                     "auctionMode": "SERVER_AUCTION"}
 
 
 @pytest.mark.asyncio

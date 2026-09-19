@@ -1,10 +1,17 @@
 """
 agent.py — FleetAgent: auction bidding logic for an individual Python AMR.
 
-Mirrors FleetAgent.js exactly:
-  - Subscribes to TASK_NEW, BID_PLACED, ROBOT_TELEMETRY, TASK_ASSIGNED, TASK_CANCELLED
+Mirrors FleetAgent.js:
+  - Subscribes to TASK_NEW, BID_PLACED, AUCTION_COMMIT, ROBOT_TELEMETRY,
+    TASK_ASSIGNED, TASK_CANCELLED
   - Computes multi-factor bids (travel + congestion + battery + workload)
-  - Finalization is DISABLED on robot nodes (coordinatorCommit only; disableFinalize=True)
+  - SERVER_AUCTION (default): finalization is DISABLED on robot nodes
+    (coordinatorCommit only; disableFinalize=True). The coordinator agent is
+    the sole finalizer.
+  - P2P_AUCTION: robots exchange bids and each robot runs
+    common.auction.select_winner at the deadline. The winner publishes an
+    AUCTION_COMMIT, waits a commit window for conflicting commits, then
+    self-publishes TASK_ASSIGNED and starts execution.
   - Publishes own telemetry every TELEMETRY_PERIOD seconds
 """
 
@@ -14,6 +21,17 @@ import time
 from typing import Optional, Callable
 
 from common import topics
+from common.auction import (
+    AuctionMode,
+    B_ABORTED,
+    B_COMMITTED,
+    B_CONFLICT,
+    B_ROUND,
+    B_SELF_ASSIGNED,
+    B_WAITING_FINALIZATION,
+    COMMIT_WINDOW_S,
+    select_winner as select_winner_shared,
+)
 from robot.battery import BATTERY_CRITICAL_THRESHOLD
 from robot.planning.astar import AStarPlanner, PathNotFoundError, path_distance
 
@@ -47,19 +65,15 @@ def _dist(x1: float, y1: float, x2: float, y2: float) -> float:
 
 
 def select_winner(bids: list[dict]) -> Optional[str]:
-    """Select lowest-bid robot. Tie-break: lexicographically smaller robotId."""
-    best: Optional[str] = None
-    best_bid = float("inf")
-    for b in bids:
-        bid_val = b.get("bid")
-        if bid_val is None or not math.isfinite(float(bid_val)):
-            continue
-        bid_val = float(bid_val)
-        robot_id = b.get("robotId", "")
-        if bid_val < best_bid or (bid_val == best_bid and (best is None or robot_id < best)):
-            best = robot_id
-            best_bid = bid_val
-    return best
+    """Select lowest-bid robot. Tie-break: lexicographically smaller robotId.
+
+    Delegates to the shared deterministic protocol function in
+    common/auction.py so server and robots always agree.
+    """
+    return select_winner_shared({
+        b.get("robotId", ""): {"cost": b.get("bid")}
+        for b in bids
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +94,7 @@ class FleetAgent:
     get_obstacles : callable() → list[Rect-like objects with inflated_contains(x,y,margin)]
     get_fleet_snapshot : callable() → list[dict]  (peer telemetry snapshots)
     disable_finalize : bool  — True for robot nodes (coordinator finalizes)
+    auction_mode : str       — AuctionMode.SERVER_AUCTION (default) or P2P_AUCTION
     """
 
     def __init__(
@@ -93,6 +108,7 @@ class FleetAgent:
         get_world_bounds: Callable[[], tuple[float, float] | None] = lambda: None,
         disable_finalize: bool = True,
         coordinator_commit: Optional[Callable[[str, str, list[dict]], bool]] = None,
+        auction_mode: str = AuctionMode.SERVER_AUCTION,
     ):
         self.robot_id = robot_id
         self._get_robot = get_robot
@@ -103,17 +119,27 @@ class FleetAgent:
         self._get_world_bounds = get_world_bounds
         self.disable_finalize = disable_finalize
         self._coordinator_commit = coordinator_commit
+        self.auction_mode = AuctionMode.normalize(auction_mode)
 
         # fleet: robotId → latest telemetry dict
         self.fleet: dict[str, dict] = {
             snap["robotId"]: snap for snap in get_fleet_snapshot()
         }
 
-        # auction rounds: taskId → round dict
+        # auction rounds: auctionKey → round dict (auctionId when present, else taskId)
         self.rounds: dict[str, dict] = {}
 
         self._telemetry_timer = TELEMETRY_PERIOD
         self._active = True
+
+    # ------------------------------------------------------------------
+    # Round keying
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _auction_key(payload: dict) -> str:
+        """Uniquely identify an auction round, preferring the explicit auctionId."""
+        return payload.get("auctionId") or payload.get("taskId") or ""
 
     # ------------------------------------------------------------------
     # Message handlers  (called from message loop / subscription callbacks)
@@ -121,19 +147,34 @@ class FleetAgent:
 
     def on_task_new(self, payload: dict, timestamp: float) -> None:
         task_id = payload.get("taskId", "")
-        pickup = payload.get("pickup", {})
-        dropoff = payload.get("dropoff", {})
-
-        if task_id in self.rounds:
+        auction_id = payload.get("auctionId")
+        key = auction_id or task_id
+        if not key:
             return
 
+        existing = self.rounds.get(key)
+        if existing is not None and not existing["done"]:
+            return
+
+        pickup = payload.get("pickup", {})
+        dropoff = payload.get("dropoff", {})
+        p2p = self.auction_mode == AuctionMode.P2P_AUCTION
+
         roster_size = max(1, len(self._get_fleet_snapshot()))
-        self.rounds[task_id] = {
+        self.rounds[key] = {
             "taskId": task_id,
+            "auctionId": auction_id,
             "bids": {},
             "rosterSize": roster_size,
             "deadline": timestamp + DEADLINE,
             "done": False,
+            "p2p": p2p,
+            "phase": B_ROUND,
+            "winner": None,
+            "self_won": False,
+            "external_winner": None,
+            "commit_at": None,
+            "subject": task_id,
         }
 
         robot = self._get_robot()
@@ -142,15 +183,25 @@ class FleetAgent:
 
         result = self.compute_bid(pickup, dropoff)
         if result["eligible"]:
-            bid_entry = {"bid": result["bid"], "costs": result["costs"], "reason": None}
+            bid_entry = {"bid": result["bid"], "costs": result["costs"], "reason": None,
+                         "taskId": task_id}
         else:
-            bid_entry = {"bid": None, "costs": None, "reason": result["reason"]}
+            bid_entry = {"bid": None, "costs": None, "reason": result["reason"],
+                         "taskId": task_id}
 
-        self._publish(topics.BID_PLACED, {
+        bid_payload = {
             "taskId": task_id,
             "robotId": self.robot_id,
             **bid_entry,
-        })
+        }
+        if p2p:
+            bid_payload["auctionId"] = key
+        self._publish(topics.BID_PLACED, bid_payload)
+
+        # Own bid is part of the local bid set so the deadline-time
+        # select_winner sees it even if our echo is not redelivered.
+        if p2p:
+            self.rounds[key]["bids"][self.robot_id] = bid_payload
 
         if result["eligible"]:
             self._log(f"[AUCTION] {task_id} bid from {self.robot_id}: {result['bid']:.2f}")
@@ -158,14 +209,65 @@ class FleetAgent:
             self._log(f"[AUCTION] {task_id} {self.robot_id} not bidding ({result['reason']})")
 
     def on_bid_placed(self, payload: dict, timestamp: float) -> None:
-        task_id = payload.get("taskId", "")
-        round_ = self.rounds.get(task_id)
+        key = self._auction_key(payload)
+        round_ = self.rounds.get(key)
         if not round_ or round_["done"]:
             return
         robot_id = payload.get("robotId", "")
+        if not robot_id:
+            return
+        # Duplicate bids from the same robot are ignored; the first bid wins.
         if robot_id not in round_["bids"]:
             round_["bids"][robot_id] = payload
-        self._try_finalize(task_id, timestamp)
+        if not round_["p2p"]:
+            self._try_finalize(key, timestamp)
+
+    def on_auction_commit(self, payload: dict, timestamp: float) -> None:
+        """Peer AUCTION_COMMIT handling — P2P_AUCTION only (server-mode ignores)."""
+        key = payload.get("auctionId") or payload.get("taskId", "")
+        round_ = self.rounds.get(key)
+        if not round_ or not round_["p2p"] or round_["done"]:
+            return
+        source = payload.get("robotId", "")
+        winner = payload.get("winner")
+        if not source or not winner:
+            return
+        if source == self.robot_id:
+            return  # our own echo — no-op
+
+        if winner != self.robot_id:
+            round_["winner"] = winner
+            round_["external_winner"] = winner
+            if round_["self_won"]:
+                # We already committed believing we won, but a peer claims a
+                # different winner. Divergent view ⇒ conflict: abort and never
+                # execute.
+                round_["done"] = True
+                round_["phase"] = B_CONFLICT
+                self._publish(topics.AUCTION_RESULT, {
+                    "taskId": round_["subject"],
+                    "auctionId": round_["auctionId"],
+                    "winner": winner,
+                    "bids": list(round_["bids"].values()),
+                    "committed": False,
+                    "conflict": True,
+                })
+                self._log(
+                    f"[AUCTION] {round_['subject']} CONFLICT — {source} commits "
+                    f"{winner}, we computed {self.robot_id}; aborting"
+                )
+            else:
+                # Not finalised yet: remember the observed winner. When we
+                # finalise, if we disagree we abort without ever committing.
+                round_["phase"] = B_COMMITTED
+            return
+
+        # winner == self but committed by a peer: a peer claiming we won is a
+        # protocol violation (only the winner self-commits) — ignore.
+        self._log(
+            f"[AUCTION] {round_['subject']} unexpected commit from {source} "
+            f"claiming {winner}; ignoring"
+        )
 
     def on_robot_telemetry(self, payload: dict) -> None:
         robot_id = payload.get("robotId", "")
@@ -173,10 +275,15 @@ class FleetAgent:
             self.fleet[robot_id] = payload
 
     def on_task_resolved(self, payload: dict) -> None:
-        self.rounds.pop(payload.get("taskId", ""), None)
+        self._forget_task_rounds(payload.get("taskId", ""))
 
     def forget_round(self, task_id: str) -> None:
-        self.rounds.pop(task_id, None)
+        self._forget_task_rounds(task_id)
+
+    def _forget_task_rounds(self, task_id: str) -> None:
+        """Drop rounds belonging to a task (matched by taskId, any keying)."""
+        for key in [k for k, r in self.rounds.items() if r["subject"] == task_id]:
+            self.rounds.pop(key, None)
 
     # ------------------------------------------------------------------
     # Bidding computation
@@ -301,10 +408,108 @@ class FleetAgent:
                 committed = False
         self._publish(topics.AUCTION_RESULT, {
             "taskId": task_id,
+            "auctionId": round_.get("auctionId"),
             "winner": winner,
             "bids": bids,
             "committed": committed,
         })
+
+    # ------------------------------------------------------------------
+    # P2P finalization — every robot runs select_winner at the deadline
+    # ------------------------------------------------------------------
+
+    def _finalize_p2p(self, key: str, now: float) -> None:
+        round_ = self.rounds.get(key)
+        if not round_ or round_["done"] or round_.get("frozen", False):
+            return
+        round_["frozen"] = True
+        bids = list(round_["bids"].values())
+        winner = select_winner(bids)
+        round_["winner"] = winner
+
+        if winner is None:
+            round_["phase"] = B_ABORTED
+            round_["done"] = True
+            self._log(f"[AUCTION] {round_['subject']} no eligible robot — no commit")
+            self._publish(topics.AUCTION_RESULT, {
+                "taskId": round_["subject"],
+                "auctionId": round_["auctionId"],
+                "winner": None,
+                "bids": bids,
+                "committed": False,
+            })
+            return
+
+        # If a peer already claimed a different winner before we finalised, our
+        # view is divergent — abort without ever committing (never execute).
+        external = round_.get("external_winner")
+        if winner == self.robot_id and external is not None and external != self.robot_id:
+            round_["done"] = True
+            round_["phase"] = B_CONFLICT
+            self._publish(topics.AUCTION_RESULT, {
+                "taskId": round_["subject"],
+                "auctionId": round_["auctionId"],
+                "winner": external,
+                "bids": bids,
+                "committed": False,
+                "conflict": True,
+            })
+            self._log(
+                f"[AUCTION] {round_['subject']} CONFLICT at finalize — peer "
+                f"committed {external}, we computed {self.robot_id}; aborting"
+            )
+            return
+
+        round_["phase"] = B_WAITING_FINALIZATION
+        if winner == self.robot_id:
+            round_["self_won"] = True
+            round_["commit_at"] = now + COMMIT_WINDOW_S
+            commit_payload = {
+                "taskId": round_["subject"],
+                "auctionId": round_["auctionId"],
+                "robotId": self.robot_id,
+                "winner": self.robot_id,
+                "bidCount": len(bids),
+                "bids": bids,
+            }
+            self._publish(topics.AUCTION_COMMIT, commit_payload)
+            self._log(
+                f"[AUCTION] {round_['subject']} {self.robot_id} wins "
+                f"(bid {self._own_bid(bids)}) → AUCTION_COMMIT"
+            )
+        else:
+            self._log(f"[AUCTION] {round_['subject']} winner = {winner} (awaiting commit)")
+
+    def _own_bid(self, bids: list[dict]) -> str:
+        for b in bids:
+            if b.get("robotId") == self.robot_id:
+                return f"{b.get('bid')}"
+        return "-"
+
+    def _self_assign_p2p(self, key: str, now: float) -> None:
+        """Winner self-publishes its assignment after the commit window."""
+        round_ = self.rounds.get(key)
+        if not round_ or round_["done"] or not round_.get("self_won"):
+            return
+        if now < round_["commit_at"]:
+            return
+        round_["done"] = True
+        round_["phase"] = B_SELF_ASSIGNED
+        bids = list(round_["bids"].values())
+        self._publish(topics.TASK_ASSIGNED, {
+            "taskId": round_["subject"],
+            "robotId": self.robot_id,
+            "source": "auction",
+        })
+        self._publish(topics.AUCTION_RESULT, {
+            "taskId": round_["subject"],
+            "auctionId": round_["auctionId"],
+            "winner": self.robot_id,
+            "bids": bids,
+            "committed": True,
+            "conflict": None,
+        })
+        self._log(f"[AUCTION] {round_['subject']} committed to {self.robot_id} (P2P self-assign)")
 
     # ------------------------------------------------------------------
     # Periodic tick (call from main loop)
@@ -315,6 +520,18 @@ class FleetAgent:
         if self._telemetry_timer <= 0:
             self._telemetry_timer += TELEMETRY_PERIOD
             self._publish_telemetry()
+
+        if self.auction_mode == AuctionMode.P2P_AUCTION:
+            if self.rounds:
+                for key in list(self.rounds):
+                    round_ = self.rounds.get(key)
+                    if not round_ or round_["done"]:
+                        continue
+                    if not round_.get("frozen") and now >= round_["deadline"]:
+                        self._finalize_p2p(key, now)
+                    if round_.get("self_won"):
+                        self._self_assign_p2p(key, now)
+            return
 
         if self.disable_finalize:
             return

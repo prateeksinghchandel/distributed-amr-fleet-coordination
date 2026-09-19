@@ -1,8 +1,12 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
+import { useTheme } from '../theme/ThemeContext.jsx';
+import { ui, taskColor } from '../theme/ui.js';
 
-const sectionHeader = { fontSize: 11, color: '#888', marginBottom: 6, letterSpacing: 1 };
+const TASK_TERMINAL = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
 
-export default function TaskPanel({ fleet }) {
+export default function TaskPanel({ fleet, onSelectTask, maxTasks = 50 }) {
+    const { palette: P } = useTheme();
+    const S = ui(P);
     const [genMode, setGenMode] = useState('manual');
     const [pX, setPX] = useState('5');
     const [pY, setPY] = useState('8');
@@ -13,7 +17,15 @@ export default function TaskPanel({ fleet }) {
     const [pickupList, setPickupList] = useState('4, 4\n14, 6\n24, 9');
     const [count, setCount] = useState('5');
     const [assignSel, setAssignSel] = useState({});
+    const [selectedId, setSelectedId] = useState(null);
     const connected = fleet.isConnected;
+    const n = Math.min(fleet.tasksList.length, Math.max(0, maxTasks));
+    const ordered = [...fleet.tasksList].sort((a, b) => {
+        const aTerm = TASK_TERMINAL.has(a.status);
+        const bTerm = TASK_TERMINAL.has(b.status);
+        if (aTerm !== bTerm) return aTerm ? 1 : -1;
+        return (b.updatedAt || 0) - (a.updatedAt || 0) || (b.createdAt || 0) - (a.createdAt || 0);
+    });
 
     const createManual = () => {
         fleet.createTask(
@@ -34,19 +46,20 @@ export default function TaskPanel({ fleet }) {
         fleet.generateRandomTasks(Number.parseInt(count, 10) || 0);
     };
 
+    const selectTask = (taskId) => {
+        setSelectedId(taskId);
+        if (onSelectTask) onSelectTask(taskId);
+    };
+
     return (
-        <div style={{ padding: 12, borderBottom: '1px solid #0f3460' }}>
-            <div style={sectionHeader}>TASK GENERATOR</div>
-            <div style={{ fontSize: 10, color: '#666', marginBottom: 6 }}>
+        <div style={{ padding: 12 }}>
+            <div style={S.sectionTitle}>TASK GENERATOR</div>
+            <div style={{ fontSize: 10, color: P.textDim, marginBottom: 6 }}>
                 Commands are sent to the Python coordinator ({fleet.conn.url}) — tasks appear once auctioned.
             </div>
             <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
                 {[['manual', 'Manual'], ['same', 'Same Dropoff'], ['random', 'Random']].map(([key, label]) => (
-                    <button
-                        key={key}
-                        style={tabStyle(genMode === key)}
-                        onClick={() => setGenMode(key)}
-                    >
+                    <button key={key} style={S.tab(genMode === key)} onClick={() => setGenMode(key)}>
                         {label}
                     </button>
                 ))}
@@ -54,53 +67,47 @@ export default function TaskPanel({ fleet }) {
 
             {genMode === 'manual' && (
                 <div>
-                    <div style={labelStyle}>Pickup</div>
+                    <div style={S.label}>Pickup</div>
                     <PointRow x={pX} y={pY} onX={setPX} onY={setPY} />
-                    <div style={labelStyle}>Dropoff</div>
+                    <div style={S.label}>Dropoff</div>
                     <PointRow x={dX} y={dY} onX={setDX} onY={setDY} />
-                    <button style={actionButtonStyle(connected)} disabled={!connected} onClick={createManual}>Create Task</button>
+                    <button style={S.button('primary')} disabled={!connected} onClick={createManual}>Create Task</button>
                 </div>
             )}
 
             {genMode === 'same' && (
                 <div>
-                    <div style={labelStyle}>Common dropoff</div>
+                    <div style={S.label}>Common dropoff</div>
                     <PointRow x={sDX} y={sDY} onX={setSDX} onY={setSDY} />
-                    <div style={labelStyle}>Pickups (one &quot;x, y&quot; per line)</div>
-                    <textarea
-                        style={textareaStyle}
-                        rows={4}
-                        value={pickupList}
-                        onChange={(e) => setPickupList(e.target.value)}
-                    />
-                    <button style={actionButtonStyle(connected)} disabled={!connected} onClick={createSameDropoff}>Generate</button>
+                    <div style={S.label}>Pickups (one &quot;x, y&quot; per line)</div>
+                    <textarea style={S.textarea} rows={4} value={pickupList} onChange={(e) => setPickupList(e.target.value)} />
+                    <button style={S.button('primary')} disabled={!connected} onClick={createSameDropoff}>Generate</button>
                 </div>
             )}
 
             {genMode === 'random' && (
                 <div>
-                    <div style={labelStyle}>Number of tasks</div>
-                    <input
-                        type="number"
-                        style={numInputStyle}
-                        value={count}
-                        min="1"
-                        onChange={(e) => setCount(e.target.value)}
-                    />
-                    <button style={actionButtonStyle(connected)} disabled={!connected} onClick={createRandom}>Generate</button>
+                    <div style={S.label}>Number of tasks</div>
+                    <input style={S.input} type="number" value={count} min="1" onChange={(e) => setCount(e.target.value)} />
+                    <div style={{ height: 4 }} />
+                    <button style={S.button('primary')} disabled={!connected} onClick={createRandom}>Generate</button>
                 </div>
             )}
 
-            <div style={{ ...sectionHeader, marginTop: 14 }}>TASKS ({fleet.tasksList.length})</div>
+            <div style={{ ...S.sectionTitle, marginTop: 14 }}>
+                TASKS ({n}{fleet.tasksList.length > n ? ` of ${fleet.tasksList.length}` : ''})
+            </div>
             {fleet.tasksList.length === 0 && (
-                <div style={{ fontSize: 11, color: '#666' }}>No tasks yet</div>
+                <div style={{ fontSize: 11, color: P.textDim }}>No tasks yet</div>
             )}
-            {fleet.tasksList.slice().reverse().map((task) => (
+            {ordered.slice(0, maxTasks).map((task) => (
                 <TaskRow
                     key={task.id}
                     task={task}
                     fleet={fleet}
                     connected={connected}
+                    isSelected={selectedId === task.id}
+                    onSelect={() => selectTask(task.id)}
                     assignSel={assignSel[task.id] || ''}
                     onAssignSel={(v) => setAssignSel((prev) => ({ ...prev, [task.id]: v }))}
                 />
@@ -109,12 +116,15 @@ export default function TaskPanel({ fleet }) {
     );
 }
 
-function TaskRow({ task, fleet, connected, assignSel, onAssignSel }) {
+function TaskRow({ task, fleet, connected, isSelected, onSelect, assignSel, onAssignSel }) {
+    const { palette: P } = useTheme();
+    const S = ui(P);
     const pending = task.status === 'PENDING';
     const active = task.status === 'ASSIGNED' || task.status === 'PICKING_UP' || task.status === 'DELIVERING';
     const available = fleet.robotsList.filter(
         (r) => r.online && (r.currentTaskId === null || r.status === 'COMPLETED')
     );
+    const statusColor = taskColor(P, task.status);
 
     const assign = () => {
         if (!assignSel) return;
@@ -122,30 +132,36 @@ function TaskRow({ task, fleet, connected, assignSel, onAssignSel }) {
     };
 
     return (
-        <div data-task={task.id} style={{
-            padding: 6,
-            marginBottom: 4,
-            borderRadius: 3,
-            border: '1px solid #0f3460',
-            background: '#0a0a1a',
-            fontSize: 11
-        }}>
+        <div
+            data-task={task.id}
+            onClick={onSelect}
+            style={{
+                padding: 6,
+                marginBottom: 4,
+                borderRadius: 3,
+                cursor: 'pointer',
+                border: `1px solid ${isSelected ? P.accent : P.border}`,
+                background: isSelected ? P.surfaceActive : P.surfaceElevated,
+                fontSize: 11,
+            }}
+        >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontWeight: 'bold', color: '#e0e0e0' }}>{task.id}</span>
-                <span style={{ color: taskStatusColor(task.status) }}>{task.status}</span>
+                <span style={{ fontWeight: 'bold', color: P.text }}>{task.id}</span>
+                <span style={{ color: statusColor }}>{task.status}</span>
             </div>
-            <div style={{ color: '#aaa', marginTop: 2 }}>
+            <div style={{ color: P.textMuted, marginTop: 2 }}>
                 P({task.pickup.x.toFixed(1)}, {task.pickup.y.toFixed(1)})
                 {' → '}
                 D({task.dropoff.x.toFixed(1)}, {task.dropoff.y.toFixed(1)})
             </div>
             {task.assignedRobotId && (
-                <div style={{ color: '#00c8ff', marginTop: 2 }}>Assigned to {task.assignedRobotId}</div>
+                <div style={{ color: P.info, marginTop: 2 }}>Assigned to {task.assignedRobotId}</div>
             )}
             {pending && (
-                <div style={{ display: 'flex', gap: 4, marginTop: 4, alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: 4, marginTop: 4, alignItems: 'center' }}
+                    onClick={(e) => e.stopPropagation()}>
                     <select
-                        style={selectStyle}
+                        style={S.select}
                         value={assignSel}
                         disabled={!connected || available.length === 0}
                         onChange={(e) => onAssignSel(e.target.value)}
@@ -155,14 +171,14 @@ function TaskRow({ task, fleet, connected, assignSel, onAssignSel }) {
                             <option key={r.id} value={r.id}>{r.id}</option>
                         ))}
                     </select>
-                    <button style={actionButtonStyle(connected)} disabled={!connected || !assignSel} onClick={assign}>Assign</button>
+                    <button style={S.button('primary')} disabled={!connected || !assignSel} onClick={assign}>Assign</button>
                 </div>
             )}
             {active && (
                 <button
-                    style={{ ...actionButtonStyle(connected), marginTop: 4, background: '#3a1a1a', borderColor: '#e94560' }}
+                    style={{ ...S.button('danger'), marginTop: 4 }}
                     disabled={!connected}
-                    onClick={() => fleet.cancelTask(task.id)}
+                    onClick={(e) => { e.stopPropagation(); fleet.cancelTask(task.id); }}
                 >
                     Cancel task
                 </button>
@@ -188,60 +204,13 @@ function parsePointList(text) {
     return { points, invalid };
 }
 
-function taskStatusColor(status) {
-    switch (status) {
-        case 'COMPLETED': return '#2ecc71';
-        case 'CANCELLED':
-        case 'FAILED': return '#e74c3c';
-        case 'PICKING_UP':
-        case 'DELIVERING':
-        case 'ASSIGNED': return '#00c8ff';
-        default: return '#f5a623';
-    }
-}
-
 function PointRow({ x, y, onX, onY }) {
+    const { palette: P } = useTheme();
+    const S = ui(P);
     return (
         <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-            <input type="number" style={numInputStyle} value={x} onChange={(e) => onX(e.target.value)} />
-            <input type="number" style={numInputStyle} value={y} onChange={(e) => onY(e.target.value)} />
+            <input type="number" style={S.input} value={x} onChange={(e) => onX(e.target.value)} />
+            <input type="number" style={S.input} value={y} onChange={(e) => onY(e.target.value)} />
         </div>
     );
-}
-
-const labelStyle = { fontSize: 11, color: '#888', marginBottom: 3 };
-
-const numInputStyle = {
-    width: '100%', padding: '3px 4px', background: '#0a0a1a', color: '#e0e0e0',
-    border: '1px solid #0f3460', borderRadius: 3, fontSize: 12,
-    boxSizing: 'border-box', fontFamily: 'inherit'
-};
-
-const textareaStyle = {
-    width: '100%', padding: '4px', background: '#0a0a1a', color: '#e0e0e0',
-    border: '1px solid #0f3460', borderRadius: 3, fontSize: 11,
-    boxSizing: 'border-box', fontFamily: 'inherit', resize: 'vertical', marginBottom: 6
-};
-
-const selectStyle = {
-    flex: 1, padding: '3px 4px', background: '#0a0a1a', color: '#e0e0e0',
-    border: '1px solid #0f3460', borderRadius: 3, fontSize: 11, fontFamily: 'inherit'
-};
-
-function actionButtonStyle(connected) {
-    const base = {
-        padding: '4px 10px', background: '#0f3460', color: '#e0e0e0',
-        border: '1px solid #00c8ff', borderRadius: 4, cursor: 'pointer',
-        fontSize: 11, fontFamily: 'inherit'
-    };
-    if (!connected) return { ...base, opacity: 0.45, cursor: 'not-allowed' };
-    return base;
-}
-
-function tabStyle(active) {
-    return {
-        flex: 1, padding: '4px 0', background: active ? '#e94560' : '#0f3460',
-        color: '#e0e0e0', border: 'none', borderRadius: 4, cursor: 'pointer',
-        fontSize: 11, fontFamily: 'inherit'
-    };
 }

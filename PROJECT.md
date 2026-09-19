@@ -1314,6 +1314,41 @@ system/
 
 The exact topic structure may evolve, but communication responsibilities should remain clearly separated.
 
+### 31.1 Auction modes
+
+**Server-Auction** (default, `AuctionMode.SERVER_AUCTION`): robots bid on `auction/bids`; the coordinator's coordinator-agent aggregates bids, picks the winner with the same deterministic `select_winner` used everywhere, and publishes `tasks/assigned` itself. This is the legacy flow and remains the default so existing deployments are unaffected.
+
+**P2P-Auction** (`AuctionMode.P2P_AUCTION`): the coordinator is a *passive ledger*, not a decision-maker.
+
+```text
+Server                                     robots
+  │                                           │
+  ├── tasks/new (+ auctionId, scheme T:A<N>) ─┤ every robot
+  │                                           ▼
+  │        (each robot stores its own bid locally)
+  │           bid broadcast: auction/bids (+ auctionId)
+  │                ▲         ▼
+  │                └─ peer ⇄ peer ─┘        (no server role)
+  │                                           │
+  │                     at deadline each robot runs select_winner
+  │                                           │
+  │ ◄────────────────── auction/commit ─────── winner self-commits
+  │   (apply_auction_commit: idempotent ledger, no assignment here)
+  │                                           │
+  │                    winner waits COMMIT_WINDOW_S (0.6 s)
+  │                                           │
+  │ ◄────────────────── tasks/assigned ─────── winner self-assigns
+  │                     (server only records)
+```
+
+* Announce carries a unique `auctionId` (`f"{task_id}:A{attempt}"`); every round, bid, commit and result carries it, so re-auctions of the same task (e.g. `T4:A1`, `T4:A2`) are unambiguous.
+* Each robot publishes its own bid and *also* keeps it locally, so a robot can always compute the winner even while peers' messages are in flight.
+* Deadlines: `DEADLINE_S = 1.0`; the server independently re-auctions a non-committing task after `DEADLINE + P2P_COMMIT_GRACE_S = 2.4 s` (`sync_auction_timeout`).
+* Conflict safety: if a peer's `auction/commit` names a different winner than the robot's own `select_winner` result, the robot aborts the round (`B_CONFLICT`) and never executes — determinism plus an "at-most-one-committer" abort; the server ledger is single-assignment as an independent backstop.
+* A failed auction-sourced winner is re-auctioned automatically (fresh `auctionId`); manually assigned tasks are never re-auctioned.
+
+Select `AuctionMode` per process via `--mode server_auction|p2p_auction` (`server.server_node`, `robot/robot_node.py`, fleet-manager `POST /api/coordinator/configure`), and it is broadcast in `world/state` as `auctionMode`.
+
 ---
 
 # 32. Complete End-to-End Data Flow

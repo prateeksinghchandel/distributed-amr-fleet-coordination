@@ -66,7 +66,8 @@ def _checkin(bus, layout, robot_id):
 def test_server_subscribes_to_all_control_topics():
     bus, _layout, _server = _make_server()
     for topic in (topics.CONTROL_TASK_CREATE, topics.CONTROL_TASK_ASSIGN,
-                  topics.CONTROL_TASK_CANCEL):
+                  topics.CONTROL_TASK_CANCEL, topics.CONTROL_OBSTACLE_ADD,
+                  topics.CONTROL_OBSTACLE_REMOVE):
         assert topic in bus.handlers, f"Server did not subscribe to {topic}"
 
 
@@ -139,12 +140,76 @@ def test_control_cancel_unknown_task_is_noop():
     assert not any(topic == topics.TASK_CANCELLED for topic, _ in bus.messages)
 
 
+def test_control_obstacle_add_applies_and_publishes_world():
+    bus, layout, server = _make_server()
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {"x": 3.0, "y": 2.0, "width": 1.5, "height": 2.5})
+    assert len(server.runtime_obstacles) == 1
+    obs = server.runtime_obstacles[0]
+    assert obs["id"].startswith("OBS")
+    assert obs["type"] == "obstacle"
+    assert obs["x"] == 3.0 and obs["y"] == 2.0
+    assert obs["width"] == 1.5 and obs["height"] == 2.5
+    # World/state re-published immediately with preset racks + runtime obstacle.
+    world = bus.messages[-1]
+    assert world[0] == topics.WORLD_STATE
+    assert len(world[1]["obstacles"]) == len(layout.obstacles()) + 1
+
+
+def test_control_obstacle_add_clamps_to_bounds():
+    bus, layout, server = _make_server()
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {
+        "x": layout.width - 0.2, "y": layout.height - 0.2, "width": 50.0, "height": 50.0,
+    })
+    obs = server.runtime_obstacles[0]
+    assert obs["x"] + obs["width"] <= layout.width + 0.001
+    assert obs["y"] + obs["height"] <= layout.height + 0.001
+
+
+def test_control_obstacle_add_too_small_ignored():
+    bus, _layout, server = _make_server()
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {"x": 3.0, "y": 2.0, "width": 0.2, "height": 2.0})
+    assert server.runtime_obstacles == []
+
+
+def test_control_obstacle_add_updates_existing_id():
+    bus, _layout, server = _make_server()
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {"id": "OBS", "x": 1.0, "y": 1.0, "width": 1, "height": 1})
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {"id": "OBS", "x": 8.0, "y": 8.0, "width": 2, "height": 2})
+    assert len(server.runtime_obstacles) == 1
+    assert server.runtime_obstacles[0]["x"] == 8.0 and server.runtime_obstacles[0]["width"] == 2.0
+
+
+def test_control_obstacle_remove_removes_and_publishes():
+    bus, _layout, server = _make_server()
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {"x": 1.0, "y": 1.0, "width": 1, "height": 1})
+    bus.publish(topics.CONTROL_OBSTACLE_ADD, {"x": 8.0, "y": 8.0, "width": 1, "height": 1})
+    oid = server.runtime_obstacles[0]["id"]
+    bus.publish(topics.CONTROL_OBSTACLE_REMOVE, {"id": oid})
+    assert len(server.runtime_obstacles) == 1
+    assert all(o["id"] != oid for o in server.runtime_obstacles)
+    world = bus.messages[-1]
+    assert world[0] == topics.WORLD_STATE
+    assert world[1]["obstacles"][-1]["id"] == server.runtime_obstacles[0]["id"]
+
+
+def test_control_obstacle_remove_unknown_noop():
+    bus, _layout, server = _make_server()
+    messages_before = len(bus.messages)
+    bus.publish(topics.CONTROL_OBSTACLE_REMOVE, {"id": "NOPE"})
+    # Only the remove command itself lands on the bus — no world re-publish.
+    assert len(bus.messages) == messages_before + 1
+    assert bus.messages[-1][0] == topics.CONTROL_OBSTACLE_REMOVE
+    assert not any(topic == topics.WORLD_STATE for topic, _ in bus.messages[messages_before:])
+
+
 def test_mirrors_js_topics_file():
     """The JS topics.js constants must match the Python ones byte-for-byte."""
     js_topics = {
         "CONTROL_TASK_CREATE": "control/tasks/create",
         "CONTROL_TASK_ASSIGN": "control/tasks/assign",
         "CONTROL_TASK_CANCEL": "control/tasks/cancel",
+        "CONTROL_OBSTACLE_ADD": "control/world/obstacles/add",
+        "CONTROL_OBSTACLE_REMOVE": "control/world/obstacles/remove",
     }
     for name, value in js_topics.items():
         assert getattr(topics, name) == value

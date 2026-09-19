@@ -1,0 +1,47 @@
+/* theme.css — theme-driven global chrome. Semantic tokens are defined here
+   only for global surfaces (body, scrollbars); components read colors from
+   the JS palette (ThemeContext). */
+
+:root {
+    color-scheme: dark;
+    --amr-scroll-track: #16213e;
+    --amr-scroll-thumb: #0f3460;
+    --amr-scroll-thumb-hover: #e94560;
+}
+
+[data-theme='light'] {
+    color-scheme: light;
+    --amr-scroll-track: #dfe6f2;
+    --amr-scroll-thumb: #aebad4;
+    --amr-scroll-thumb-hover: #5c6a86;
+}
+
+html,
+body,
+#root {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+}
+
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: var(--amr-scroll-track);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--amr-scroll-thumb);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--amr-scroll-thumb-hover);
+}
+
+button,
+input,
+select,
+textarea {
+    font-family: inherit;
+}

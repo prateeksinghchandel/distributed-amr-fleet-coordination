@@ -59,6 +59,7 @@ export class DistributedFleetState {
         this.logs = [];
         this.lastUpdate = 0;
         this.selectedRobotId = null;
+        this.auctionMode = null;
         this.connection = {
             status: this.conn.status,
             detail: this.conn.statusDetail,
@@ -86,6 +87,11 @@ export class DistributedFleetState {
 
     get isConnected() {
         return this.connection.status === CONNECTION_STATUS.CONNECTED;
+    }
+
+    clearLogs() {
+        this.logs = [];
+        this._markUpdated();
     }
 
     // ------------------------------------------------------------------
@@ -177,6 +183,7 @@ export class DistributedFleetState {
             [TOPICS.TASK_ASSIGNED, (m) => this.onTaskAssigned(m.payload)],
             [TOPICS.TASK_CANCELLED, (m) => this.onTaskCancelled(m.payload)],
             [TOPICS.BID_PLACED, (m) => this.onBidPlaced(m.payload)],
+            [TOPICS.AUCTION_COMMIT, (m) => this.onAuctionCommit(m.payload)],
             [TOPICS.AUCTION_RESULT, (m) => this.onAuctionResult(m.payload)],
         ];
         for (const [topic, handler] of subscriptions) {
@@ -194,6 +201,7 @@ export class DistributedFleetState {
 
     onWorldState(payload) {
         if (!payload || typeof payload.width !== 'number' || typeof payload.height !== 'number') return;
+        const { auctionMode } = payload;
         payload = {
             width: payload.width,
             height: payload.height,
@@ -202,6 +210,7 @@ export class DistributedFleetState {
             deliveryDocks: payload.deliveryDocks || [],
             roster: payload.roster || [],
         };
+        if (auctionMode) this.auctionMode = auctionMode;
         this.warehouse = this._buildWarehouse(payload);
         this._applyRosterColors(payload.roster);
         this.addLog(`World state: ${payload.width}×${payload.height}m, ` +
@@ -287,10 +296,11 @@ export class DistributedFleetState {
 
     onBidPlaced(payload) {
         if (!payload || typeof payload.taskId !== 'string' || typeof payload.robotId !== 'string') return;
-        let taskBids = this.liveBids.get(payload.taskId);
+        const key = payload.auctionId || payload.taskId;
+        let taskBids = this.liveBids.get(key);
         if (!taskBids) {
             taskBids = new Map();
-            this.liveBids.set(payload.taskId, taskBids);
+            this.liveBids.set(key, taskBids);
         }
         taskBids.set(payload.robotId, {
             robotId: payload.robotId,
@@ -301,15 +311,41 @@ export class DistributedFleetState {
         this._markUpdated();
     }
 
+    onAuctionCommit(payload) {
+        if (!payload || typeof payload.taskId !== 'string' || typeof payload.winner !== 'string') return;
+        this.auctions.unshift({
+            taskId: payload.taskId,
+            auctionId: payload.auctionId || null,
+            winner: payload.winner,
+            committedBy: payload.robotId || payload.winner,
+            bids: Array.isArray(payload.bids)
+                ? payload.bids.map((b) => ({
+                      robotId: b.robotId,
+                      bid: typeof b.bid === 'number' ? b.bid : null,
+                      costs: b.costs || null,
+                      reason: b.reason || null,
+                  }))
+                : [],
+            committed: true,
+            reason: null,
+            time: new Date().toLocaleTimeString(),
+        });
+        if (this.auctions.length > MAX_AUCTION_HISTORY) this.auctions.pop();
+        this.addLog(`[AUCTION] ${payload.taskId} committed for ${payload.winner} by ${payload.robotId || payload.winner}`);
+        this._markUpdated();
+    }
+
     onAuctionResult(payload) {
         if (!payload || typeof payload.taskId !== 'string') return;
         const taskId = payload.taskId;
+        const key = payload.auctionId || payload.taskId;
         const winner = payload.winner || null;
         const committed = Boolean(payload.committed);
         const bids = Array.isArray(payload.bids) ? payload.bids : [];
-        this.liveBids.delete(taskId);
+        this.liveBids.delete(key);
         this.auctions.unshift({
             taskId,
+            auctionId: payload.auctionId || null,
             winner,
             bids: bids.map((b) => ({
                 robotId: b.robotId,
@@ -318,6 +354,7 @@ export class DistributedFleetState {
                 reason: b.reason || null,
             })),
             committed,
+            conflict: Boolean(payload.conflict),
             reason: winner ? (committed ? null : 'commit failed') : 'no eligible robot',
             time: new Date().toLocaleTimeString(),
         });
@@ -545,6 +582,56 @@ export class DistributedFleetState {
         const ok = this.conn.publish(TOPICS.CONTROL_TASK_CANCEL, { taskId });
         if (ok) this.addLog(`Requested cancellation of task ${taskId}`);
         return ok;
+    }
+
+    addObstacle(rect) {
+        if (!this.isConnected) {
+            this.addLog('Command rejected: not connected');
+            return false;
+        }
+        const ok = this.conn.publish(TOPICS.CONTROL_OBSTACLE_ADD, {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        });
+        if (ok) {
+            this.addLog(`Obstacle requested: ${rect.width.toFixed(1)}×${rect.height.toFixed(1)}m ` +
+                `@ (${rect.x.toFixed(1)}, ${rect.y.toFixed(1)})`);
+        }
+        return ok;
+    }
+
+    removeObstacleById(id) {
+        if (!this.isConnected) {
+            this.addLog('Command rejected: not connected');
+            return false;
+        }
+        if (!id) return false;
+        const ok = this.conn.publish(TOPICS.CONTROL_OBSTACLE_REMOVE, { id });
+        if (ok) this.addLog(`Obstacle removal requested for ${id}`);
+        return ok;
+    }
+
+    obstacleAt(x, y, margin = 0.05) {
+        if (!this.warehouse) return null;
+        for (const obs of this.warehouse.obstacles) {
+            if (obs.type === 'shelf') continue;
+            const px = x >= obs.x - margin && x <= obs.x + obs.width + margin;
+            const py = y >= obs.y - margin && y <= obs.y + obs.height + margin;
+            if (px && py) return obs;
+        }
+        return null;
+    }
+
+    shelfAt(x, y, margin = 0.05) {
+        if (!this.warehouse) return null;
+        for (const shelf of this.warehouse.shelves) {
+            const px = x >= shelf.x - margin && x <= shelf.x + shelf.width + margin;
+            const py = y >= shelf.y - margin && y <= shelf.y + shelf.height + margin;
+            if (px && py) return shelf;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------
