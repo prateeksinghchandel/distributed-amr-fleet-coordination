@@ -16,6 +16,7 @@ import { ROBOT_COLORS } from '../simulation/robotColors.js';
 
 export const TASK_STATUS = {
     PENDING: 'PENDING',
+    AUCTIONING: 'AUCTIONING',
     ASSIGNED: 'ASSIGNED',
     PICKING_UP: 'PICKING_UP',
     DELIVERING: 'DELIVERING',
@@ -31,12 +32,13 @@ const ROBOT_RADIUS = 0.4;
 
 const STATUS_RANK = {
     PENDING: 1,
-    ASSIGNED: 2,
-    PICKING_UP: 3,
-    DELIVERING: 4,
-    COMPLETED: 5,
-    CANCELLED: 5,
-    FAILED: 5,
+    AUCTIONING: 2,
+    ASSIGNED: 3,
+    PICKING_UP: 4,
+    DELIVERING: 5,
+    COMPLETED: 6,
+    CANCELLED: 6,
+    FAILED: 6,
 };
 
 export class DistributedFleetState {
@@ -201,7 +203,7 @@ export class DistributedFleetState {
 
     onWorldState(payload) {
         if (!payload || typeof payload.width !== 'number' || typeof payload.height !== 'number') return;
-        const { auctionMode } = payload;
+        const { auctionMode, tasks, taskStats, robotStats, metrics } = payload;
         payload = {
             width: payload.width,
             height: payload.height,
@@ -211,6 +213,10 @@ export class DistributedFleetState {
             roster: payload.roster || [],
         };
         if (auctionMode) this.auctionMode = auctionMode;
+        if (Array.isArray(tasks)) this._syncAuthoritativeTasks(tasks);
+        if (taskStats) this.taskStats = taskStats;
+        if (robotStats) this.robotStats = robotStats;
+        if (metrics) this.metrics = metrics;
         this.warehouse = this._buildWarehouse(payload);
         this._applyRosterColors(payload.roster);
         this.addLog(`World state: ${payload.width}×${payload.height}m, ` +
@@ -373,9 +379,48 @@ export class DistributedFleetState {
         task.updatedAt = Date.now();
     }
 
+    _syncAuthoritativeTasks(tasks) {
+        for (const t of tasks) {
+            if (!t || typeof t.id !== 'string') continue;
+            const id = t.id;
+            const existing = this.tasks.get(id);
+            const task = {
+                id,
+                taskId: id,
+                pickup: t.pickup && typeof t.pickup.x === 'number'
+                    ? { x: t.pickup.x, y: t.pickup.y }
+                    : (existing ? existing.pickup : { x: 0, y: 0 }),
+                dropoff: t.dropoff && typeof t.dropoff.x === 'number'
+                    ? { x: t.dropoff.x, y: t.dropoff.y }
+                    : (existing ? existing.dropoff : { x: 0, y: 0 }),
+                priority: typeof t.priority === 'number' ? t.priority : (existing ? existing.priority : 1),
+                status: typeof t.status === 'string' ? t.status : (existing ? existing.status : TASK_STATUS.PENDING),
+                assignedRobotId: t.assignedRobotId || null,
+                assignedSource: t.assignedSource || null,
+                createdAt: typeof t.createdAt === 'number' ? t.createdAt : (existing ? existing.createdAt : Date.now()),
+                assignedAt: t.assignedAt || null,
+                completedAt: t.completedAt || (existing ? existing.completedAt : null),
+                updatedAt: Date.now(),
+            };
+            if (!existing) {
+                this.tasks.set(id, task);
+                this.taskOrder.push(id);
+                this.addLog(`Task ${id} mirrored from world/state (${task.status})`);
+            } else {
+                this.tasks.set(id, task);
+                if (!this.taskOrder.includes(id)) this.taskOrder.push(id);
+            }
+        }
+    }
+
     _syncTaskStatuses() {
         let changed = false;
         for (const task of this.tasksList) {
+            // terminal statuses come from the authoritative ledger; stale or
+            // offline telemetry must never regress them.
+            if (task.status === TASK_STATUS.COMPLETED ||
+                task.status === TASK_STATUS.CANCELLED ||
+                task.status === TASK_STATUS.FAILED) continue;
             if (!task.assignedRobotId) continue;
             const robot = this.robots.get(task.assignedRobotId);
             if (!robot || robot.currentTaskId !== task.id) continue;

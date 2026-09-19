@@ -94,6 +94,11 @@ class FleetAgent:
     get_obstacles : callable() → list[Rect-like objects with inflated_contains(x,y,margin)]
     get_fleet_snapshot : callable() → list[dict]  (peer telemetry snapshots)
     disable_finalize : bool  — True for robot nodes (coordinator finalizes)
+    eligible_filter : Optional[callable(robot_id) → bool]
+                  Only for the coordinator finalizer (SERVER_AUCTION): narrows
+                  the candidate set with the authoritative availability ledger
+                  before winner selection. Busy robots can never win a round
+                  even if their telemetry lags.
     auction_mode : str       — AuctionMode.SERVER_AUCTION (default) or P2P_AUCTION
     """
 
@@ -108,6 +113,7 @@ class FleetAgent:
         get_world_bounds: Callable[[], tuple[float, float] | None] = lambda: None,
         disable_finalize: bool = True,
         coordinator_commit: Optional[Callable[[str, str, list[dict]], bool]] = None,
+        eligible_filter: Optional[Callable[[str], bool]] = None,
         auction_mode: str = AuctionMode.SERVER_AUCTION,
     ):
         self.robot_id = robot_id
@@ -119,6 +125,7 @@ class FleetAgent:
         self._get_world_bounds = get_world_bounds
         self.disable_finalize = disable_finalize
         self._coordinator_commit = coordinator_commit
+        self.eligible_filter = eligible_filter
         self.auction_mode = AuctionMode.normalize(auction_mode)
 
         # fleet: robotId → latest telemetry dict
@@ -398,6 +405,16 @@ class FleetAgent:
             return
         round_["done"] = True
         bids = list(round_["bids"].values())
+        if self.eligible_filter is not None:
+            # Narrow the candidate set to robots the authoritative ledger says
+            # are available (one active assignment per robot invariant).
+            available_bids = [b for b in bids if self.eligible_filter(b.get("robotId"))]
+            if len(available_bids) != len(bids):
+                self._log(
+                    f"[AUCTION] {task_id} filtered {len(bids) - len(available_bids)} "
+                    f"ineligible bid(s) (ledger busy)"
+                )
+            bids = available_bids
         winner = select_winner(bids)
         committed = False
         if winner and self._coordinator_commit is not None:
@@ -462,6 +479,26 @@ class FleetAgent:
 
         round_["phase"] = B_WAITING_FINALIZATION
         if winner == self.robot_id:
+            if self._self_blocked():
+                # We'd win this round but already hold (or have committed to) a
+                # different task. Abort WITHOUT committing so the server ledger
+                # times the round out and re-auctions the task cleanly. This
+                # closes the P2P race where consecutive rounds could otherwise
+                # land two tasks on the same robot.
+                round_["done"] = True
+                round_["phase"] = B_ABORTED
+                self._log(
+                    f"[AUCTION] {round_['subject']} {self.robot_id} would win but "
+                    f"is already busy — aborting without commit"
+                )
+                self._publish(topics.AUCTION_RESULT, {
+                    "taskId": round_["subject"],
+                    "auctionId": round_["auctionId"],
+                    "winner": None,
+                    "bids": bids,
+                    "committed": False,
+                })
+                return
             round_["self_won"] = True
             round_["commit_at"] = now + COMMIT_WINDOW_S
             commit_payload = {
@@ -479,6 +516,20 @@ class FleetAgent:
             )
         else:
             self._log(f"[AUCTION] {round_['subject']} winner = {winner} (awaiting commit)")
+
+    def _self_blocked(self) -> bool:
+        """Robot-side busy check for P2P self-commits.
+
+        A robot must never commit for a second task while it already executes
+        one or is awaiting assignment of an earlier self-win.
+        """
+        robot = self._get_robot()
+        if robot.get("currentTaskId") and robot.get("status") != "COMPLETED":
+            return True
+        for _, r in self.rounds.items():
+            if r.get("self_won") and not r.get("done"):
+                return True
+        return False
 
     def _own_bid(self, bids: list[dict]) -> str:
         for b in bids:

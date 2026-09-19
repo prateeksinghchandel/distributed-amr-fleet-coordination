@@ -134,6 +134,7 @@ export const ui = (P) => ({
 /** Count helpers reused across summary components. */
 export const TASK_STATUS = {
     PENDING: 'PENDING',
+    AUCTIONING: 'AUCTIONING',
     ASSIGNED: 'ASSIGNED',
     PICKING_UP: 'PICKING_UP',
     DELIVERING: 'DELIVERING',

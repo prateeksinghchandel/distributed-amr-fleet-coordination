@@ -106,6 +106,7 @@ class ServerNode:
                 get_fleet_snapshot=self.telemetry.snapshot,
                 disable_finalize=False,
                 coordinator_commit=self._coordinator_commit,
+                eligible_filter=self._auction_eligible_robot,
             )
 
         # Runtime obstacles (session-scoped, added via the dashboard). They join
@@ -180,6 +181,10 @@ class ServerNode:
         else:
             self.log.warning(f"[AUCTION] {task_id} commit failed for {winner}")
         return committed
+
+    def _auction_eligible_robot(self, robot_id: str) -> bool:
+        """Auction candidates must be available per the authoritative ledger."""
+        return self.tasks.is_robot_available(robot_id)
 
     def _on_bid_placed(self, _topic: str, payload: dict) -> None:
         if self.auction_agent is None:
@@ -324,6 +329,10 @@ class ServerNode:
             "deliveryDocks": self.layout.delivery_docks(),
             "roster": self.roster,
             "auctionMode": self.auction_mode,
+            "tasks": self.tasks.world_tasks(),
+            "taskStats": self.tasks.task_stats(),
+            "robotStats": self.tasks.robot_stats(),
+            "metrics": self.tasks.metrics_dict(),
         })
         self.log.info(
             f"World state published ({self.layout.width}×{self.layout.height}, "

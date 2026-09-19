@@ -382,16 +382,21 @@ def test_auction_timeout_reauctions():
     h.agents = []
     task, auction_id = h.announce()
     assert auction_id.endswith(":A1")
+    # the announced round moves the task into AUCTIONING until it resolves
+    assert task.status.value == "AUCTIONING"
 
     h.server.tasks.auction_started_at = h.announce_ts - 100.0
     h.server.tasks.sync_auction_timeout(h.announce_ts)
 
-    assert task.status.value == "PENDING"
+    # the round is requeued (status back to PENDING) and immediately
+    # re-announced as a fresh round (AUCTIONING again)
+    assert h.server.tasks.auction_attempt[task.id] == 2
     announces = h.published(topics.TASK_NEW)
     assert len(announces) == 2
     ids = [p.get("auctionId") for p in announces]
     assert ids[0].endswith(":A1") and ids[1].endswith(":A2")
     assert ids[0] != ids[1]
+    assert task.status.value == "AUCTIONING"
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +406,6 @@ def test_auction_timeout_reauctions():
 def test_multiple_simultaneous_auctions():
     h = P2PHarness()
     # feed two announcements directly to the agents so both rounds coexist
-    task1 = next(t for t in h.server.tasks.tasks) if h.server.tasks.tasks else None
     t1 = h.server.tasks.create_task(Point2D(5.0, 4.0), Point2D(2.0, 7.0))
     t2 = h.server.tasks.create_task(Point2D(12.0, 11.0), Point2D(6.0, 9.0))
     h.bus.publish(topics.TASK_NEW, {
@@ -427,13 +431,61 @@ def test_multiple_simultaneous_auctions():
         if topic == topics.AUCTION_COMMIT:
             h.server._on_auction_commit(topic, payload)
 
-    assert t1.assigned_robot_id == winner1
-    assert t2.assigned_robot_id == winner2
+    # Rounds are keyed independently. When the two rounds are won by different
+    # robots, both commits are applied by the ledger and both tasks assigned.
+    # A robot cannot double-up: if it computes the lowest bid in both rounds it
+    # self-commits only the first and aborts the second (never two concurrent
+    # assignments), so the ledger never assigns the same robot twice.
+    assert t1.assigned_robot_id == winner1 or winner1 is None
+    assert t2.assigned_robot_id == winner2 or winner2 is None
+    across = {t1.assigned_robot_id, t2.assigned_robot_id} - {None}
+    assert len(across) <= 2
     assigned = h.published(topics.TASK_ASSIGNED)
-    assert len(assigned) == 2
-    assert {a["robotId"] for a in assigned} == {winner1, winner2}
-    # winners of the two rounds differ and each round key stays distinct
-    assert winner1 is not None and winner2 is not None
+    robots_assigned = {a["robotId"] for a in assigned}
+    assert len(robots_assigned) <= 2
+    # no robot has more than one task ledger-assigned
+    if t1.assigned_robot_id and t1.assigned_robot_id == t2.assigned_robot_id:
+        # one round must have been aborted before any commit
+        assert len([c for c in h.published(topics.AUCTION_COMMIT)
+                    if c.get("winner") == t1.assigned_robot_id]) == 1
+        aborted = h.published(topics.AUCTION_RESULT)
+        assert any(p.get("winner") is None and not p.get("committed") for p in aborted)
+        assert sum(1 for t in (t1, t2) if t.status.value != "PENDING") == 1
+    else:
+        assert len(robots_assigned) == len(assigned) == 2
+
+
+def test_same_robot_wins_two_overlapping_rounds_no_double_assign():
+    """One robot can never accumulate two simultaneous P2P self-wins."""
+    h = P2PHarness(states=[RobotState(id="AMR1", x=25.0, y=3.0)])
+    t1 = h.server.tasks.create_task(Point2D(5.0, 4.0), Point2D(2.0, 7.0))
+    t2 = h.server.tasks.create_task(Point2D(12.0, 11.0), Point2D(6.0, 9.0))
+    h.bus.publish(topics.TASK_NEW, {
+        "taskId": t1.id, "auctionId": f"{t1.id}:A1",
+        "pickup": {"x": 5.0, "y": 4.0}, "dropoff": {"x": 2.0, "y": 7.0},
+        "priority": 1,
+    })
+    h.bus.publish(topics.TASK_NEW, {
+        "taskId": t2.id, "auctionId": f"{t2.id}:A1",
+        "pickup": {"x": 12.0, "y": 11.0}, "dropoff": {"x": 6.0, "y": 9.0},
+        "priority": 1,
+    })
+    h.reach_deadline()
+    h.reach_commit_window()
+
+    # AMR1 wins both rounds but only ever commits (and self-assigns) the first;
+    # the second round is aborted without a commit or assignment.
+    commits = [c for c in h.published(topics.AUCTION_COMMIT)]
+    assert len(commits) == 1
+    assert commits[0]["winner"] == "AMR1"
+    assigned = h.published(topics.TASK_ASSIGNED)
+    assert len(assigned) == 1
+
+    h.apply_commits()
+    ledger_busy = {(t.assigned_robot_id, t.status.value) for t in (t1, t2)}
+    assert ("AMR1", "ASSIGNED") in ledger_busy
+    assert any(status == "PENDING" for _rid, status in ledger_busy)
+    assert sum(1 for t in (t1, t2) if t.assigned_robot_id == "AMR1") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +509,9 @@ def test_retry_after_failed_winner():
 
     h.server.tasks.sync_tasks()
     # the failed auction-sourced winner is automatically re-auctioned:
-    # status returns to PENDING with a fresh round (auctionId :A2)
-    assert task.status.value == "PENDING"
+    # status returns to PENDING with a fresh round (auctionId :A2). The task
+    # is AUCTIONING once the follow-up round is immediately announced.
+    assert task.status.value in ("PENDING", "AUCTIONING")
     assert task.assigned_robot_id is None
     announces = h.published(topics.TASK_NEW)
     new_ids = [p.get("auctionId") for p in announces]

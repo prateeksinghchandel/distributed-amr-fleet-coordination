@@ -28,12 +28,18 @@ class RobotStatus(str, Enum):
 
 class TaskStatus(str, Enum):
     PENDING = "PENDING"
+    AUCTIONING = "AUCTIONING"   # announced, waiting for a round to resolve
     ASSIGNED = "ASSIGNED"
     PICKING_UP = "PICKING_UP"
     DELIVERING = "DELIVERING"
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+
+    @classmethod
+    def available_to_claim(cls, status: "TaskStatus") -> bool:
+        """Statuses a task may be claimed from (pending or in an open round)."""
+        return status in (cls.PENDING, cls.AUCTIONING)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +153,13 @@ class WorldStatePayload(BaseModel):
     chargingPads: list[dict] = Field(default_factory=list)
     deliveryDocks: list[dict] = Field(default_factory=list)
     roster: list[RosterEntry] = Field(default_factory=list)
+    auctionMode: Optional[str] = None
+    # Authoritative task ledger + aggregate stats (dashboard consumes these
+    # instead of inferring task state from telemetry).
+    tasks: list[dict] = Field(default_factory=list)
+    taskStats: Optional[dict] = None
+    robotStats: Optional[dict] = None
+    metrics: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

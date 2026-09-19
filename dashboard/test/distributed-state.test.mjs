@@ -395,6 +395,76 @@ async function connectedState(sessionOpts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// DistributedFleetState — authoritative world/state task sync
+// ---------------------------------------------------------------------------
+
+{
+    const world = (tasks = [], extra = {}) => ({
+        width: 30,
+        height: 30,
+        roster: [
+            { id: 'AMR1', x: 0, y: 0 }, { id: 'AMR2', x: 5, y: 5 },
+        ],
+        auctionMode: 'P2P_AUCTION',
+        tasks,
+        taskStats: {
+            total: tasks.length, pending: 0, auctioning: tasks.filter((t) => t.status === 'AUCTIONING').length,
+            active: 0, completed: 0, failed: 0, cancelled: 0, waiting: 0, inFlight: null,
+        },
+        robotStats: [{ robotId: 'AMR1', status: 'IDLE', currentTaskId: null, battery: 88, online: true, ledgerBusy: false, available: true }],
+        metrics: { counters: { created: 2, completed: 0 }, avgCompletionS: 0.0, active: 0, waiting: 0 },
+        ...extra,
+    });
+
+    const state = await connectedState();
+    const session = state.conn.session;
+
+    // First browse: a task mid-auction plus a completed one.
+    session.deliverPython(TOPICS.WORLD_STATE, world([
+        { id: 'T-W1', taskId: 'T-W1', status: 'AUCTIONING', assignedRobotId: null, pickup: { x: 4, y: 4 }, dropoff: { x: 26, y: 15 }, priority: 1, createdAt: 1000 },
+        { id: 'T-W2', taskId: 'T-W2', status: 'COMPLETED', assignedRobotId: 'AMR1', pickup: { x: 3, y: 3 }, dropoff: { x: 25, y: 2 }, priority: 1, createdAt: 500, completedAt: 1000 },
+    ]));
+    await sleep(5);
+    check('world/state mirrors an AUCTIONING task verbatim',
+        state.tasksList.find((t) => t.id === 'T-W1').status === TASK_STATUS.AUCTIONING);
+    check('world/state mirrors a COMPLETED task verbatim',
+        state.tasksList.find((t) => t.id === 'T-W2').status === TASK_STATUS.COMPLETED);
+    check('world/state carries taskStats + metrics',
+        state.taskStats && state.metrics && state.metrics.counters.created === 2);
+    check('world/state carries robotStats', state.robotStats && state.robotStats[0].available === true);
+
+    // Offline/stale telemetry must not demote the authoritative COMPLETED state.
+    session.deliverPython(TOPICS.ROBOT_TELEMETRY, {
+        robotId: 'AMR1', x: 26, y: 15, status: 'IDLE', battery: 88, currentTaskId: null, online: false,
+    });
+    await sleep(5);
+    check('telemetry cannot regress an authoritative terminal task',
+        state.tasksList.find((t) => t.id === 'T-W2').status === TASK_STATUS.COMPLETED);
+
+    // Requeued task: world overwrites a stale AUCTIONING display with PENDING.
+    session.deliverPython(TOPICS.WORLD_STATE, world([
+        { id: 'T-W1', taskId: 'T-W1', status: 'PENDING', assignedRobotId: null, pickup: { x: 4, y: 4 }, dropoff: { x: 26, y: 15 }, priority: 1, createdAt: 1000 },
+        { id: 'T-W2', taskId: 'T-W2', status: 'COMPLETED', assignedRobotId: 'AMR1', pickup: { x: 3, y: 3 }, dropoff: { x: 25, y: 2 }, priority: 1, createdAt: 500, completedAt: 1000 },
+    ]));
+    await sleep(5);
+    check('world/state applies a PENDING reset over AUCTIONING',
+        state.tasksList.find((t) => t.id === 'T-W1').status === TASK_STATUS.PENDING);
+    check('world/state does not duplicate tasks', state.tasksList.length === 2);
+
+    // Assignment appearing in world/state updates the mirror too.
+    session.deliverPython(TOPICS.WORLD_STATE, world([
+        { id: 'T-W1', taskId: 'T-W1', status: 'ASSIGNED', assignedRobotId: 'AMR2', pickup: { x: 4, y: 4 }, dropoff: { x: 26, y: 15 }, priority: 1, createdAt: 1000, assignedAt: 1500 },
+        { id: 'T-W2', taskId: 'T-W2', status: 'COMPLETED', assignedRobotId: 'AMR1', pickup: { x: 3, y: 3 }, dropoff: { x: 25, y: 2 }, priority: 1, createdAt: 500, completedAt: 1000 },
+    ]));
+    await sleep(5);
+    check('world/state assignment updates the task',
+        state.tasksList.find((t) => t.id === 'T-W1').status === TASK_STATUS.ASSIGNED &&
+        state.tasksList.find((t) => t.id === 'T-W1').assignedRobotId === 'AMR2');
+
+    await state.dispose();
+}
+
+// ---------------------------------------------------------------------------
 // DistributedFleetState — auctions
 // ---------------------------------------------------------------------------
 

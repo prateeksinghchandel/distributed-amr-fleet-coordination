@@ -1055,6 +1055,23 @@ TASK RECOVERY
     └──► Cancel
 ```
 
+**Implementation status.** The concrete `TaskStatus` machine in `task_manager.py` is:
+
+```text
+PENDING ── announce ──► AUCTIONING ── claim/commit ──► ASSIGNED ──► PICKING_UP ──► DELIVERING ──► COMPLETED
+   ▲                        │
+   └── requeue (timeout /   └──► retries exhausted ──► requeue at queue tail
+        no eligible robot /      (or cancel / fail via control topics)
+        no commit / watchdog)
+```
+
+* `AUCTIONING` is set the moment a task is announced; it is never permanent. On timeout, no-commit, no-winner or a failed winner the task is reset to `PENDING` and re-auctioned (fresh `auctionId` `T:A<N>`, max retries).
+* **One active assignment per robot.** TaskManager keeps the authoritative ledger; `is_robot_available` returns false while the robot has an `ASSIGNED`/`PICKING_UP`/`DELIVERING` task or reports telemetry busy (online, battery above critical, no live `currentTaskId`, or a `COMPLETED` hold). Availability gates announcement (`_any_eligible_robot`), bid filtering (the coordinator-agent's `eligible_filter` in `server_node.py` for SERVER mode), and every `assign_task`/`apply_auction_commit` call. Stale "IDLE-looking" telemetry is overridden by the ledger, so a busy robot never accumulates a second task.
+* **Assignment watchdog.** `sync_tasks` runs continuously; if a robot was assigned a task but neither picks it up nor fails within `ASSIGN_WATCHDOG_S = 8 s`, the assignment is recovered: auction-sourced tasks are re-auctioned, manually assigned tasks are marked `FAILED` (never silently re-auctioned).
+* **P2P self-block.** A robot that already won a concurrent round (its `self_won` flag is still pending) aborts a second simultaneous self-win at its deadline and never accepts the double assignment; the server's timeout then requeues the aborted round.
+* **Just-completed robots are reusable.** The robot controller keeps `currentTaskId` set through the `COMPLETED` hold (so the server's `sync_tasks` observes the completion), then transitions to `IDLE`. After that the robot is eligible for the next auction.
+* **Authoritative ledger → dashboard.** `world/state` now carries `tasks` (the full ledger), `taskStats`, `robotStats` and `metrics`. The dashboard mirrors these verbatim, so task statuses can never go stale; the telemetry-derived fallback cannot regress a terminal state.
+
 ---
 
 # 26. Dashboard Architecture

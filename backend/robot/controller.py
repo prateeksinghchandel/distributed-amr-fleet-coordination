@@ -134,13 +134,23 @@ class MotionController:
             return
 
         # Completed dwell: hold COMPLETED for one telemetry window so the
-        # coordinator and dashboards can observe the completion before the
-        # robot returns to charge / idle.
-        if s.status == RobotStatus.COMPLETED and s._completed_timer > 0:
-            s._completed_timer -= dt
-            s.speed = 0.0
-            s.battery = max(0.0, s.battery - IDLE_DRAIN_PER_SEC * dt)
-            return
+        # coordinator and dashboards can observe the completion — the robot
+        # keeps current_task_id set so the server ledger can sync the task to
+        # COMPLETED — before the robot returns to charge / idle.
+        if s.status == RobotStatus.COMPLETED:
+            if s._completed_timer > 0:
+                s._completed_timer -= dt
+                s.speed = 0.0
+                s.battery = max(0.0, s.battery - IDLE_DRAIN_PER_SEC * dt)
+                return
+            # Hold expired: the completion has been observable for a full
+            # telemetry window. Free the robot for new assignments.
+            s.current_task_id = None
+            s.pickup = None
+            s.dropoff = None
+            s._completed_timer = 0.0
+            s.status = RobotStatus.IDLE
+            self._log(f"{s.id} completion hold expired — available for new tasks")
 
         # Autonomous Return-to-Charge Lifecycle:
         # If robot is low battery (< WARN) and not busy delivering, or IDLE with

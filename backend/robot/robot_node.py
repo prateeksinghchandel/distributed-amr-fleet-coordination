@@ -22,7 +22,6 @@ from common import topics
 from common.auction import AuctionMode
 from common.geometry import Rect
 from common.logger import get_logger
-from common.models import RobotStatus
 from robot.agent import FleetAgent
 from robot.communication import ZenohBus, open_session
 from robot.controller import MotionController, RobotState
@@ -200,10 +199,6 @@ class RobotNode:
 
         self.controller.update(dt, self.obstacles, bounds={"width": self.world.get("width", 30), "height": self.world.get("height", 20)})
         self.agent.tick(dt, now)
-
-        # If task just completed, reset current_task_id so agent can accept new tasks
-        if self.state.status == RobotStatus.COMPLETED:
-            self.state.current_task_id = None
 
     def shutdown(self) -> None:
         self._running = False
