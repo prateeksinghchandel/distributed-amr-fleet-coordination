@@ -15,9 +15,26 @@ let bridgeChild = null;
 const children = [];
 
 function resolveBridge() {
-    if (process.env.ZENOH_BRIDGE && fs.existsSync(process.env.ZENOH_BRIDGE)) return process.env.ZENOH_BRIDGE;
-    const local = path.join(ROOT, 'tools', 'zenoh', 'zenoh-bridge-remote-api');
-    if (fs.existsSync(local)) return local;
+    if (process.env.ZENOH_BRIDGE && fs.existsSync(process.env.ZENOH_BRIDGE)) return { bin: process.env.ZENOH_BRIDGE, isPlugin: false };
+    const exts = process.platform === 'win32' ? ['.exe', ''] : [''];
+    for (const ext of exts) {
+        const local = path.join(ROOT, 'tools', 'zenoh', 'zenoh-bridge-remote-api' + ext);
+        if (fs.existsSync(local)) return { bin: local, isPlugin: false };
+    }
+    const pathDirs = (process.env.PATH || '').split(path.delimiter);
+    for (const dir of pathDirs) {
+        for (const ext of exts) {
+            const cand = path.join(dir, 'zenoh-bridge-remote-api' + ext);
+            if (dir && fs.existsSync(cand)) return { bin: cand, isPlugin: false };
+        }
+    }
+    // Windows plugin fallback: zenohd + zenoh_plugin_remote_api.dll
+    const toolsDir = path.join(ROOT, 'tools', 'zenoh');
+    const zenohd = path.join(toolsDir, process.platform === 'win32' ? 'zenohd.exe' : 'zenohd');
+    const plugin = path.join(toolsDir, process.platform === 'win32' ? 'zenoh_plugin_remote_api.dll' : 'libzenoh_plugin_remote_api.so');
+    if (fs.existsSync(zenohd) && fs.existsSync(plugin)) {
+        return { bin: zenohd, isPlugin: true, toolsDir };
+    }
     return null;
 }
 
@@ -26,7 +43,7 @@ function portOpen(port, timeoutMs = 3000) {
         const sock = net.connect({ port, host: '127.0.0.1' });
         const t = setTimeout(() => {
             sock.destroy();
-            resolve(false);
+            tryLocalhost();
         }, timeoutMs);
         sock.on('connect', () => {
             clearTimeout(t);
@@ -35,8 +52,24 @@ function portOpen(port, timeoutMs = 3000) {
         });
         sock.on('error', () => {
             clearTimeout(t);
-            resolve(false);
+            tryLocalhost();
         });
+        function tryLocalhost() {
+            const s2 = net.connect({ port, host: 'localhost' });
+            const t2 = setTimeout(() => {
+                s2.destroy();
+                resolve(false);
+            }, timeoutMs);
+            s2.on('connect', () => {
+                clearTimeout(t2);
+                s2.end();
+                resolve(true);
+            });
+            s2.on('error', () => {
+                clearTimeout(t2);
+                resolve(false);
+            });
+        }
     });
 }
 
@@ -75,7 +108,10 @@ if (!bridge) {
 if (await portOpen(WS_PORT)) {
     check('router already running (reused)', true);
 } else {
-    bridgeChild = spawn(bridge, ['--no-multicast-scouting', '--ws-port', String(WS_PORT)], {
+    const bridgeArgs = bridge.isPlugin
+        ? ['--no-multicast-scouting', '--listen', 'tcp/127.0.0.1:7447', '--plugin-search-dir', bridge.toolsDir, '-P', 'remote_api', '--cfg', `plugins/remote_api/websocket_port:${WS_PORT}`]
+        : ['--no-multicast-scouting', '--ws-port', String(WS_PORT)];
+    bridgeChild = spawn(bridge.bin, bridgeArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
     });
     bridgeChild.stderr.on('data', () => {});

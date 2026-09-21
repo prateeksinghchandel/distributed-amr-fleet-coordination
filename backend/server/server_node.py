@@ -17,6 +17,7 @@ Options:
 from __future__ import annotations
 import argparse
 import json
+import math
 import sys
 import time
 import threading
@@ -109,6 +110,10 @@ class ServerNode:
                 eligible_filter=self._auction_eligible_robot,
             )
 
+        self._pad_owners: dict[str, str] = {}
+        self._standby_spots: list[dict] = []
+        self._rebuild_charge_allocation()
+
         # Runtime obstacles (session-scoped, added via the dashboard). They join
         # the preset shelf racks in every world/state publication, so robots
         # path-plan around them until the coordinator restarts.
@@ -131,9 +136,52 @@ class ServerNode:
         bus.subscribe(topics.CONTROL_TASK_CANCEL, self._on_control_cancel)
         bus.subscribe(topics.CONTROL_OBSTACLE_ADD, self._on_control_obstacle_add)
         bus.subscribe(topics.CONTROL_OBSTACLE_REMOVE, self._on_control_obstacle_remove)
+        bus.subscribe(topics.CONTROL_ROSTER_UPDATE, self._on_control_roster_update)
 
         # Publish initial world state
         self._publish_world()
+
+    def _rebuild_charge_allocation(self) -> None:
+        self._pad_owners = {}
+        self._standby_spots = []
+        has_home_bay = any(bool(r.get("homeBay")) for r in self.roster)
+        if has_home_bay:
+            for r in self.roster:
+                hb = r.get("homeBay")
+                if hb and isinstance(hb, dict):
+                    kind = hb.get("kind")
+                    if kind == "pad" and hb.get("padId"):
+                        self._pad_owners[hb["padId"]] = r["id"]
+                    elif kind == "standby":
+                        self._standby_spots.append({
+                            "slot": hb.get("slot", 0),
+                            "x": hb.get("x", r.get("x", 0.0)),
+                            "y": hb.get("y", r.get("y", 0.0)),
+                            "robotId": r["id"],
+                        })
+        else:
+            if hasattr(self.layout, "charging_zone") and hasattr(self.layout.charging_zone, "pads"):
+                for pad in self.layout.charging_zone.pads:
+                    if getattr(pad, "assigned_robot_id", None):
+                        self._pad_owners[pad.id] = pad.assigned_robot_id
+
+    def _on_control_roster_update(self, _topic: str, payload: dict) -> None:
+        raw_roster = payload.get("roster", [])
+        new_roster = []
+        for item in raw_roster:
+            if isinstance(item, str):
+                new_roster.append(parse_roster_entry(item))
+            elif isinstance(item, dict):
+                new_roster.append(item)
+        old_ids = {r["id"] for r in self.roster}
+        new_ids = {r["id"] for r in new_roster}
+        removed = old_ids - new_ids
+        for rid in removed:
+            self.tasks.cancel_tasks_for_robot(rid)
+        self.roster = new_roster
+        self._rebuild_charge_allocation()
+        self._publish_world()
+        self.log.info(f"Dynamic roster update applied ({len(self.roster)} robot(s))")
 
     # ------------------------------------------------------------------
     # Zenoh message handlers
@@ -320,14 +368,40 @@ class ServerNode:
             self._publish_world()
             self._last_world = now
 
+    def _pad_centroid(self, pad: dict) -> tuple[float, float]:
+        sp = pad.get("spawnPoint")
+        if sp and isinstance(sp, dict) and "x" in sp and "y" in sp:
+            return (float(sp["x"]), float(sp["y"]))
+        w = float(pad.get("width", 0.0))
+        h = float(pad.get("height", 0.0))
+        return (float(pad.get("x", 0.0)) + w / 2.0, float(pad.get("y", 0.0)) + h / 2.0)
+
+    def _pad_occupied_by_robot(self, pad: dict) -> Optional[str]:
+        """Check telemetry fleet for a robot currently within PAD_OCCUPANCY of pad centre."""
+        c = self._pad_centroid(pad)
+        for r in self.telemetry.fleet.values():
+            if not r.get("online", True):
+                continue
+            rx = float(r.get("x", 0.0))
+            ry = float(r.get("y", 0.0))
+            if math.dist((rx, ry), c) <= 0.6:
+                return r.get("robotId")
+        return None
+
     def _publish_world(self) -> None:
+        pads = self.layout.charging_pads()
+        for pad in pads:
+            pad["assignedRobotId"] = self._pad_owners.get(pad["id"])
+            occupant = self._pad_occupied_by_robot(pad)
+            pad["occupiedBy"] = occupant
         self.bus.publish(topics.WORLD_STATE, {
             "width": self.layout.width,
             "height": self.layout.height,
             "obstacles": self.layout.obstacles() + self.runtime_obstacles,
-            "chargingPads": self.layout.charging_pads(),
+            "chargingPads": pads,
             "deliveryDocks": self.layout.delivery_docks(),
             "roster": self.roster,
+            "standbySpots": self._standby_spots,
             "auctionMode": self.auction_mode,
             "tasks": self.tasks.world_tasks(),
             "taskStats": self.tasks.task_stats(),
@@ -351,6 +425,33 @@ class ServerNode:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def parse_roster_entry(token: str) -> dict:
+    parts = token.strip().split(":")
+    if len(parts) >= 8:
+        rid, x, y, kind, slot, pad_id, sb_x, sb_y = parts[:8]
+        is_pad = (kind == "pad")
+        return {
+            "id": rid,
+            "x": float(x),
+            "y": float(y),
+            "homeBay": {
+                "kind": kind,
+                "slot": int(slot) if slot else 0,
+                "padId": pad_id if pad_id else None,
+                "x": float(x) if is_pad else (float(sb_x) if sb_x else float(x)),
+                "y": float(y) if is_pad else (float(sb_y) if sb_y else float(y)),
+            },
+        }
+    if len(parts) >= 3:
+        return {
+            "id": parts[0],
+            "x": float(parts[1]),
+            "y": float(parts[2]),
+            "homeBay": None,
+        }
+    return {"id": parts[0], "x": 0.0, "y": 0.0, "homeBay": None}
+
+
 def main() -> None:
     args = parse_args()
     log = get_logger("server")
@@ -367,12 +468,10 @@ def main() -> None:
 
     # Build roster
     if args.roster:
-        roster = []
-        for entry in args.roster.split(","):
-            parts = entry.split(":")
-            roster.append({"id": parts[0], "x": float(parts[1]), "y": float(parts[2])})
+        roster = [parse_roster_entry(entry) for entry in args.roster.split(",") if entry.strip()]
     else:
-        roster = layout.roster()
+        from fleet_manager.charge_allocation import allocate_charge_spots
+        roster = allocate_charge_spots(layout, [r.id for r in layout.robots])
     log.info(f"Roster: {[r['id'] for r in roster]}")
 
     # Open Zenoh session

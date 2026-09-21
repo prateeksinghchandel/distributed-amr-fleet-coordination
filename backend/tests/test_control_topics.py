@@ -210,6 +210,120 @@ def test_mirrors_js_topics_file():
         "CONTROL_TASK_CANCEL": "control/tasks/cancel",
         "CONTROL_OBSTACLE_ADD": "control/world/obstacles/add",
         "CONTROL_OBSTACLE_REMOVE": "control/world/obstacles/remove",
+        "CONTROL_ROSTER_UPDATE": "control/roster/update",
     }
     for name, value in js_topics.items():
         assert getattr(topics, name) == value
+
+
+def test_world_state_tags_pads_with_assigned_robot_id():
+    """World state chargingPads must include assignedRobotId from pad owners."""
+    bus = FakeBus()
+    layout = build_from_preset("ECOMMERCE")
+    pads = layout.charging_pads()
+    assert len(pads) >= 2
+    pad0_id = pads[0]["id"]
+    roster = [
+        {"id": "AMR1", "x": 27.75, "y": 5.0, "homeBay": {"kind": "pad", "padId": pad0_id, "slot": 0}},
+    ]
+    server = ServerNode(layout, roster, bus, _Log(), task_count=0)
+    world_msgs = [msg for top, msg in bus.messages if top == topics.WORLD_STATE]
+    assert len(world_msgs) >= 1
+    world = world_msgs[-1]
+    assigned_pads = {p["id"]: p.get("assignedRobotId") for p in world["chargingPads"]}
+    assert assigned_pads.get(pad0_id) == "AMR1"
+
+
+def test_world_state_contains_standby_spots():
+    """World state includes standbySpots list when standby robots exist."""
+    bus = FakeBus()
+    layout = build_from_preset("ECOMMERCE")
+    roster = [
+        {"id": "AMR1", "x": 27.75, "y": 5.0, "homeBay": {"kind": "pad", "padId": "BAY-1", "slot": 0}},
+        {"id": "AMR4", "x": 2.0, "y": 4.0, "homeBay": {"kind": "standby", "padId": None, "slot": 0, "x": 2.0, "y": 4.0}},
+    ]
+    server = ServerNode(layout, roster, bus, _Log(), task_count=0)
+    world_msgs = [msg for top, msg in bus.messages if top == topics.WORLD_STATE]
+    world = world_msgs[-1]
+    assert "standbySpots" in world
+    assert len(world["standbySpots"]) == 1
+    assert world["standbySpots"][0]["robotId"] == "AMR4"
+    assert world["standbySpots"][0]["slot"] == 0
+
+
+def test_control_roster_update_updates_coordinator_dynamically():
+    """CONTROL_ROSTER_UPDATE updates coordinator roster, pad allocation, and publishes WORLD_STATE."""
+    bus, layout, server = _make_server()
+
+    # Publish roster update adding AMR_NEW and updating homeBay
+    new_roster = [
+        {"id": "AMR_NEW", "x": 1.0, "y": 1.0, "homeBay": {"kind": "standby", "slot": 0, "padId": None, "x": 1.0, "y": 1.0}},
+    ]
+    bus.publish(topics.CONTROL_ROSTER_UPDATE, {"roster": new_roster})
+
+    assert len(server.roster) == 1
+    assert server.roster[0]["id"] == "AMR_NEW"
+    assert len(server._standby_spots) == 1
+    assert server._standby_spots[0]["robotId"] == "AMR_NEW"
+
+    # Verify a new WORLD_STATE message was emitted with updated roster & standby spots
+    latest_world = [msg for top, msg in bus.messages if top == topics.WORLD_STATE][-1]
+    assert len(latest_world["roster"]) == 1
+    assert latest_world["roster"][0]["id"] == "AMR_NEW"
+    assert len(latest_world["standbySpots"]) == 1
+
+def test_control_roster_update_cancels_tasks_for_removed_robot():
+    """CONTROL_ROSTER_UPDATE cancels tasks assigned to removed robots."""
+    bus, layout, server = _make_server()
+    _checkin(bus, layout, "AMR1")
+
+    # Create a task and assign it to AMR1
+    task = server.tasks.create_task(
+        pickup=Point2D(5.0, 4.0), dropoff=Point2D(2.0, 7.0), announce=False
+    )
+    server.tasks.assign_task(task.id, "AMR1", source="manual")
+    assert task.status.value == "ASSIGNED"
+    assert task.assigned_robot_id == "AMR1"
+
+    # Publish roster update removing AMR1
+    new_roster = [
+        {"id": "AMR_NEW", "x": 1.0, "y": 1.0, "homeBay": {"kind": "standby", "slot": 0, "padId": None, "x": 1.0, "y": 1.0}},
+    ]
+    bus.publish(topics.CONTROL_ROSTER_UPDATE, {"roster": new_roster})
+
+    # Task should be cancelled
+    assert task.status.value == "CANCELLED"
+    assert task.assigned_robot_id is None
+
+    # New roster should only have AMR_NEW
+    assert len(server.roster) == 1
+    assert server.roster[0]["id"] == "AMR_NEW"
+
+
+def test_world_state_includes_occupied_by():
+    """World state chargingPads include occupiedBy from telemetry fleet."""
+    bus = FakeBus()
+    layout = build_from_preset("ECOMMERCE")
+    pads = layout.charging_pads()
+    pad0_id = pads[0]["id"]
+    roster = [
+        {"id": "AMR1", "x": 27.75, "y": 5.0, "homeBay": {"kind": "pad", "padId": pad0_id, "slot": 0}},
+    ]
+    server = ServerNode(layout, roster, bus, _Log(), task_count=0)
+
+    # Simulate AMR1 reporting telemetry on its pad
+    bus.publish(topics.ROBOT_TELEMETRY, {
+        "robotId": "AMR1", "x": pads[0]["spawnPoint"]["x"],
+        "y": pads[0]["spawnPoint"]["y"], "heading": 0.0,
+        "status": "CHARGING", "battery": 80.0,
+        "currentTaskId": None, "blocked": False, "online": True,
+    })
+
+    # Publish world state (triggered by heartbeat or explicit call)
+    server._publish_world()
+
+    world_msgs = [msg for top, msg in bus.messages if top == topics.WORLD_STATE]
+    assert len(world_msgs) >= 1
+    world = world_msgs[-1]
+    pad0 = next(p for p in world["chargingPads"] if p["id"] == pad0_id)
+    assert pad0["occupiedBy"] == "AMR1"

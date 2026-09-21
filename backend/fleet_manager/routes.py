@@ -123,11 +123,14 @@ async def api_amr_create(request: web.Request) -> web.Response:
     amr_id = str(body.get("id") or "").strip()
     if not amr_id:
         return _err(400, "AMR id is required")
-    try:
-        x = float(body.get("x", 0.0))
-        y = float(body.get("y", 0.0))
-    except (TypeError, ValueError):
-        return _err(400, "x/y must be numbers")
+    x = None
+    y = None
+    if "x" in body and "y" in body and body["x"] is not None and body["y"] is not None:
+        try:
+            x = float(body["x"])
+            y = float(body["y"])
+        except (TypeError, ValueError):
+            return _err(400, "x/y must be numbers")
     try:
         entry = await pm.create_amr(amr_id, x, y)
     except ProcessError as exc:
@@ -142,7 +145,7 @@ async def api_amr_remove(request: web.Request) -> web.Response:
     try:
         result = await pm.remove_amr(amr_id)
     except ProcessError as exc:
-        return _err(409, str(exc))
+        return _err(400 if "still running" in str(exc) else 409, str(exc))
     return _ok({**result, "status": pm.status()})
 
 

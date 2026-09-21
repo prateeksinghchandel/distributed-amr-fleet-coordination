@@ -16,8 +16,8 @@
     "test:phase5": "node test/phase5-python-fleet.test.mjs",
     "fleet": "bash scripts/start-fleet.sh",
     "fleet:stop": "bash scripts/start-fleet.sh --stop",
-    "zenohd": "bash scripts/zenohd.sh",
-    "fleet-manager": "PYTHONPATH=../backend ../.venv/bin/python -m fleet_manager"
+    "setup:zenoh": "node scripts/download-zenoh.mjs",
+    "fleet-manager": "node scripts/run-fleet-manager.mjs"
   },
   "dependencies": {
     "@eclipse-zenoh/zenoh-ts": "^1.10.1",

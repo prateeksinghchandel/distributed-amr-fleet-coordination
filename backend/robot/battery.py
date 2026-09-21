@@ -16,6 +16,7 @@ from typing import Optional
 BATTERY_FULL = 100.0
 BATTERY_WARN_THRESHOLD = 25.0    # physical return-to-charge threshold (controller.py)
 BATTERY_CRITICAL_THRESHOLD = 10.0
+CHARGE_REQUEST_THRESHOLD = 60.0  # standby (overflow) robots request a pad below this
 CHARGE_RATE_PER_SEC = 8.0        # +8.0% per sec while charging on pad
 # NOTE: TRAVEL_DRAIN_PER_METER and IDLE_DRAIN_PER_SEC are the runtime values the
 # MotionController applies. The auction bid threshold in agent.py/FleetAgent.js

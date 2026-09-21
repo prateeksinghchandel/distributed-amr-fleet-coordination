@@ -13,4 +13,5 @@ export const TOPICS = {
     CONTROL_TASK_CANCEL: 'control/tasks/cancel',
     CONTROL_OBSTACLE_ADD: 'control/world/obstacles/add',
     CONTROL_OBSTACLE_REMOVE: 'control/world/obstacles/remove',
+    CONTROL_ROSTER_UPDATE: 'control/roster/update',
 };

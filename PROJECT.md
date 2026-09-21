@@ -1834,3 +1834,33 @@ The entire system can be represented by:
 > Deterministic collision avoidance and emergency safety constraints have higher authority than AI or normal planning.
 
 The resulting system is therefore a **distributed, multi-agent AMR fleet with interchangeable algorithmic and AI decision layers, peer-to-peer coordination, and deterministic safety guard rails**.
+
+---
+
+# 38. Robot Charge Points & Dynamic Fleet Roster
+
+### 38.1 Charge Spot Allocation & Persistence
+Each AMR configured in the fleet has an assigned charge spot persisted in `backend/state/amrs.json` as `homeBay`:
+* **Primary Charging Pads (`kind: "pad"`):** Robots up to the layout's pad count are designated pad owners. Each owner is assigned a specific charging bay (`padId`) and rests at the pad centroid (`spawnPoint`).
+* **Standby Overflow Slots (`kind: "standby"`):** Robots exceeding pad capacity are assigned deterministic standby slots located along the charging bay buffer lane.
+
+When new AMRs are created, charge spots are automatically assigned to the lowest-index free pad (or lowest-index free standby slot if all pads are owned) without requiring manual coordinate inputs. When an AMR is removed, its spot is immediately released back to the allocation pool.
+
+### 38.2 Centroid Navigation & Effective Charging
+Charging pads define a bounding box `[x, y, width, height]` and a centroid `spawnPoint`.
+* Motion planning navigates robots to the pad centroid `(spawnPoint.x, spawnPoint.y)` rather than bounding-box corners.
+* Charging is effective only within `PAD_OCCUPANCY = 0.6 m` of the pad centroid (`CHARGE_RATE_PER_SEC = 8.0 %/s`).
+
+### 38.3 Smart Turnover & Yielding Rules
+* **Pad Owner Trickle-Parking:** Pad owners rest on their assigned pad when idle, maintaining 100% battery.
+* **Owner Yielding to Needy Robots:** A pad owner vacates its pad and retreats to its standby slot whenever any off-pad robot drops below the warning threshold (`battery < BATTERY_WARN_THRESHOLD = 25%`).
+* **Standby Robot Seeking:** Standby robots wait at their standby parking slot when all pads are occupied. As soon as a pad becomes free, they seek the lowest-index free pad to charge.
+* **Immediate Vacation at 100%:** An overflow robot charging on another robot's pad vacates immediately upon reaching 100% battery, freeing the pad for other AMRs.
+
+### 38.4 Dynamic Roster Updates (Zero-Restart Fleet Modification)
+Fleet modification occurs dynamically without restarting running processes:
+* **Zenoh Topic:** `topics.CONTROL_ROSTER_UPDATE = "control/roster/update"`
+* **8-Field Roster Token:** `id:x:y:kind:slot:padId:standbyX:standbyY` (with legacy 3-field backwards-compatibility).
+* **Coordinator Integration:** `ServerNode` subscribes to roster updates, rebuilds `_pad_owners` and `_standby_spots`, and broadcasts updated `world/state` with `assignedRobotId` per pad and active `standbySpots`.
+* **Safe Removal:** AMRs must be stopped before removal (`DELETE /api/amrs/{id}` returns 400 if still running), preventing orphan processes or phantom states.
+

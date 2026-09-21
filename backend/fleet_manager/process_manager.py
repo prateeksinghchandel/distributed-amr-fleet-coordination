@@ -15,12 +15,15 @@ import asyncio
 import os
 import shutil
 import socket
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
+from common import topics
 from . import config
+from .charge_allocation import allocate_charge_spots, assign_charge_spot, roster_token
 
 MAX_LOG_LINES = 2000
 
@@ -47,22 +50,44 @@ class ProcessError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def resolve_bin(name: str) -> Optional[str]:
-    """Mirror dashboard/scripts/zenohd.sh binary resolution."""
+    """Resolve binary location cross-platform (Windows .exe, Linux/macOS, TOOLS_DIR, PATH)."""
     env_key = {"zenohd": "ZENOH_ZENOHD", "zenoh-bridge-remote-api": "ZENOH_BRIDGE"}.get(name)
+    names_to_check = [name]
+    if sys.platform == "win32" and not name.lower().endswith(".exe"):
+        names_to_check = [f"{name}.exe", name]
+
     if env_key:
         cand = os.environ.get(env_key)
-        if cand and os.access(cand, os.X_OK):
-            return cand
-    local = config.TOOLS_DIR / name
-    if os.access(local, os.X_OK):
-        return str(local)
-    return shutil.which(name)
+        if cand:
+            p = Path(cand)
+            if p.is_file() and (os.access(cand, os.X_OK) or sys.platform == "win32"):
+                return str(p.resolve())
+
+    for n in names_to_check:
+        local = config.TOOLS_DIR / n
+        if local.is_file() and (os.access(local, os.X_OK) or sys.platform == "win32"):
+            return str(local.resolve())
+
+    for n in names_to_check:
+        found = shutil.which(n)
+        if found:
+            return found
+
+    return None
 
 
 def resolve_zenoh_bins() -> dict:
+    router = resolve_bin("zenohd")
+    bridge = resolve_bin("zenoh-bridge-remote-api")
+    if bridge is None and router is not None:
+        # Check if remote_api plugin is present alongside zenohd (Windows plugin mode)
+        plugin_dll = config.TOOLS_DIR / "zenoh_plugin_remote_api.dll"
+        plugin_so = config.TOOLS_DIR / "libzenoh_plugin_remote_api.so"
+        if plugin_dll.is_file() or plugin_so.is_file():
+            bridge = router
     return {
-        "zenohd": resolve_bin("zenohd"),
-        "bridge": resolve_bin("zenoh-bridge-remote-api"),
+        "zenohd": router,
+        "bridge": bridge,
     }
 
 
@@ -81,12 +106,14 @@ async def default_spawn(args, *, cwd, env=None, log=None):
 
 
 async def default_zenoh_available(port: int) -> bool:
-    """True when something is listening on 127.0.0.1:port."""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-            return True
-    except OSError:
-        return False
+    """True when something is listening on 127.0.0.1:port or localhost:port."""
+    for host in ("127.0.0.1", "localhost"):
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +164,7 @@ class ProcessManager:
         graceful_stop_s: float = config.GRACEFUL_STOP_TIMEOUT_S,
         amr_store=None,
         settings=None,
+        publish_cb: Optional[Callable] = None,
     ):
         self.spawn = spawn or default_spawn
         self.zenoh_available = zenoh_available or default_zenoh_available
@@ -145,6 +173,9 @@ class ProcessManager:
         self.bootstrap_s = bootstrap_s
         self.check_timeout_s = check_timeout_s
         self.graceful_stop_s = graceful_stop_s
+        self.publish_cb = publish_cb
+        self.charge_spots: dict[str, dict] = {}
+        self._preset_layout_cache: dict[str, object] = {}
 
         if amr_store is None or settings is None:
             from .amr_store import AmrStore, SettingsStore
@@ -168,6 +199,88 @@ class ProcessManager:
         self._monitor_task: Optional[asyncio.Task] = None
 
         self.build_registry()
+
+    def _preset_layout(self, preset: Optional[str] = None):
+        p = preset or self.settings.preset
+        if p not in self._preset_layout_cache:
+            from server.warehouse import build_from_preset
+            self._preset_layout_cache[p] = build_from_preset(p)
+        return self._preset_layout_cache[p]
+
+    def _reconcile_charge_spots(self) -> None:
+        layout = self._preset_layout()
+        self.charge_spots.clear()
+        for rid, entry in self.amrs.items():
+            hb = entry.get("homeBay")
+            if hb and isinstance(hb, dict) and hb.get("kind"):
+                self.charge_spots[rid] = hb
+        self._promote_standby_to_pads(layout)
+        for rid, entry in self.amrs.items():
+            if rid not in self.charge_spots:
+                spot = assign_charge_spot(layout, self.charge_spots, rid)
+                entry["homeBay"] = spot["homeBay"]
+                entry["x"] = spot["x"]
+                entry["y"] = spot["y"]
+                self.charge_spots[rid] = spot["homeBay"]
+                try:
+                    self.amr_store.update(rid, entry)
+                except Exception as exc:
+                    self.log(f"Failed to update AMR store for {rid}: {exc}")
+
+    def _promote_standby_to_pads(self, layout) -> bool:
+        """Upgrade standby robots to unowned charging pads and persist the change.
+
+        Returns True when at least one standby robot was promoted. Existing
+        homeBay entries are refreshed so pad-free fleets always occupy their own
+        station once capacity allows (e.g. after a preset switch or a pad owner
+        removal).
+        """
+        changed = False
+        from .charge_allocation import promote_standby_to_pads
+        for rid, spot in promote_standby_to_pads(layout, self.charge_spots).items():
+            entry = self.amrs[rid]
+            entry["homeBay"] = spot
+            entry["x"] = float(spot["x"])
+            entry["y"] = float(spot["y"])
+            self.charge_spots[rid] = spot
+            changed = True
+            try:
+                self.amr_store.update(rid, entry)
+                self.log(f"{rid} promoted to charging pad {spot['padId']}")
+            except Exception as exc:
+                self.log(f"Failed to persist promotion for {rid}: {exc}")
+        if changed:
+            self.update_coordinator_cmd()
+        return changed
+
+    def charge_roster(self) -> list[dict]:
+        roster = []
+        for rid, entry in self.amrs.items():
+            hb = self.charge_spots.get(rid, entry.get("homeBay"))
+            item = dict(entry)
+            item["homeBay"] = hb
+            roster.append(item)
+        return roster
+
+    def _roster_token(self, entry: dict) -> str:
+        return roster_token(entry)
+
+    def publish_roster_update(self) -> None:
+        payload = {"roster": self.charge_roster()}
+        if getattr(self, "publish_cb", None):
+            try:
+                self.publish_cb(topics.CONTROL_ROSTER_UPDATE, payload)
+            except Exception as exc:
+                self.log(f"publish_cb error: {exc}")
+        try:
+            from robot.communication import open_session, ZenohBus
+            session = open_session(f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}")
+            bus = ZenohBus(session, "fleet-manager", self.log)
+            bus.publish(topics.CONTROL_ROSTER_UPDATE, payload)
+            session.close()
+            self.log(f"Roster update published to coordinator ({len(self.charge_roster())} robots)")
+        except Exception as exc:
+            self.log(f"Direct Zenoh roster publish failed: {exc}")
 
     # ------------------------------------------------------------------
     # Process registry
@@ -204,7 +317,7 @@ class ProcessManager:
     def coordinator_process(self, preset: str, tasks: int, roster: list | None = None,
                             auction_mode: Optional[str] = None) -> ManagedProcess:
         if roster is None:
-            roster = list(self.amrs.values())
+            roster = self.charge_roster()
         mode = auction_mode or self.settings.auction_mode
         cmd = self._coordinator_cmd(preset, tasks, roster, mode)
         return self.add_process(
@@ -215,9 +328,9 @@ class ProcessManager:
             env=backend_env(),
         )
 
-    @staticmethod
-    def _coordinator_cmd(preset: str, tasks: int, roster: list, auction_mode: str) -> list:
-        roster_arg = ",".join(f"{r['id']}:{r['x']}:{r['y']}" for r in roster)
+    @classmethod
+    def _coordinator_cmd(cls, preset: str, tasks: int, roster: list, auction_mode: str) -> list:
+        roster_arg = ",".join(roster_token(r) for r in roster)
         return [
             config.PYTHON_BIN,
             "-m", "server.server_node",
@@ -228,9 +341,9 @@ class ProcessManager:
             "--mode", auction_mode,
         ]
 
-    @staticmethod
-    def _coordinator_detail(preset: str, tasks: int, roster: list, auction_mode: str) -> dict:
-        roster_arg = ",".join(f"{r['id']}:{r['x']}:{r['y']}" for r in roster)
+    @classmethod
+    def _coordinator_detail(cls, preset: str, tasks: int, roster: list, auction_mode: str) -> dict:
+        roster_arg = ",".join(roster_token(r) for r in roster)
         return {"type": "coordinator", "preset": preset, "tasks": tasks,
                 "roster": roster_arg, "auctionMode": auction_mode}
 
@@ -243,7 +356,7 @@ class ProcessManager:
         coord = self.processes.get("coordinator")
         if coord is None:
             return
-        roster = list(self.amrs.values())
+        roster = self.charge_roster()
         coord.cmd = self._coordinator_cmd(self.settings.preset, self.settings.tasks, roster,
                                           self.settings.auction_mode)
         coord.detail = self._coordinator_detail(self.settings.preset, self.settings.tasks, roster,
@@ -263,14 +376,34 @@ class ProcessManager:
         )
 
     def bridge_process(self) -> ManagedProcess:
-        return self.add_process(
-            "bridge",
-            [
-                resolve_bin("zenoh-bridge-remote-api") or "zenoh-bridge-remote-api",
+        bridge_bin = resolve_bin("zenoh-bridge-remote-api")
+        if bridge_bin is not None:
+            cmd = [
+                bridge_bin,
                 "--no-multicast-scouting",
                 "--connect", f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}",
                 "--ws-port", str(config.ZENOH_WS_PORT),
-            ],
+            ]
+        elif resolve_bin("zenohd") and (config.TOOLS_DIR / "zenoh_plugin_remote_api.dll").is_file():
+            # Windows plugin mode: zenohd running remote_api plugin with WebSocket listener
+            cmd = [
+                resolve_bin("zenohd"),
+                "--no-multicast-scouting",
+                "--listen", f"ws/127.0.0.1:{config.ZENOH_WS_PORT}",
+                "--connect", f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}",
+                "--plugin-search-dir", str(config.TOOLS_DIR),
+                "-P", "remote_api",
+            ]
+        else:
+            cmd = [
+                "zenoh-bridge-remote-api",
+                "--no-multicast-scouting",
+                "--connect", f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}",
+                "--ws-port", str(config.ZENOH_WS_PORT),
+            ]
+        return self.add_process(
+            "bridge",
+            cmd,
             cwd=str(config.DASHBOARD_DIR),
             detail={"type": "infrastructure", "port": config.ZENOH_WS_PORT,
                     "url": f"ws/127.0.0.1:{config.ZENOH_WS_PORT}", "readyCheck": "tcp"},
@@ -286,9 +419,10 @@ class ProcessManager:
         entries = self.amr_store.list()
         self.zenohd_process()
         self.bridge_process()
-        self.coordinator_process(self.settings.preset, self.settings.tasks, entries)
         self.amrs = {e["id"]: dict(e) for e in entries}
-        for entry in entries:
+        self._reconcile_charge_spots()
+        self.coordinator_process(self.settings.preset, self.settings.tasks, self.charge_roster())
+        for entry in self.amrs.values():
             self.register_amr(entry)
 
     # ------------------------------------------------------------------
@@ -402,12 +536,12 @@ class ProcessManager:
             proc.last_error = f"spawn failed: {exc}"
             raise ProcessError(f"{proc.name} {proc.last_error}") from exc
         proc.proc = child
-        proc.pid = getattr(child, "pid", None)
+        proc.pid = getattr(child, "pid", None) if child is not None else None
         proc.state = "STARTING"
         proc.started_at = time.time()
         proc.last_error = None
         proc.log_lines.clear()
-        proc.readers = [
+        proc.readers = [] if child is None else [
             asyncio.get_event_loop().create_task(
                 self._drain(proc.name, child.stdout, proc.log_lines.append)
             ),
@@ -487,21 +621,39 @@ class ProcessManager:
             index += 1
         return f"AMR{index}"
 
-    async def create_amr(self, amr_id: str, x: float, y: float) -> dict:
+    async def create_amr(self, amr_id: str, x: Optional[float] = None, y: Optional[float] = None) -> dict:
         if amr_id in ("zenohd", "bridge", "coordinator", "server"):
             raise ProcessError(f"'{amr_id}' is a reserved component name")
         if amr_id in self.amrs:
             raise ProcessError(f"AMR '{amr_id}' already exists")
-        entry = {"id": amr_id, "x": round(float(x), 2), "y": round(float(y), 2)}
+        layout = self._preset_layout()
+        self._promote_standby_to_pads(layout)
+        spot = assign_charge_spot(layout, self.charge_spots, amr_id)
+        pos_x = spot["x"] if x is None else round(float(x), 2)
+        pos_y = spot["y"] if y is None else round(float(y), 2)
+        entry = {
+            "id": amr_id,
+            "x": pos_x,
+            "y": pos_y,
+            "homeBay": spot["homeBay"],
+        }
         self.amrs[amr_id] = entry
+        self.charge_spots[amr_id] = spot["homeBay"]
         self.register_amr(entry)
         try:
             self.amr_store.add(entry)
         except Exception:
             self.amrs.pop(amr_id, None)
+            self.charge_spots.pop(amr_id, None)
             self.processes.pop(self.amr_process_name(amr_id), None)
             raise
         self.update_coordinator_cmd()
+        self.publish_roster_update()
+        try:
+            await self.start(self.amr_process_name(amr_id), wait=False)
+            self.log(f"{amr_id} added and started (dynamic roster join)")
+        except (DependencyError, ProcessError) as exc:
+            self.log(f"WARN: {amr_id} added but auto-start deferred: {exc}")
         return entry
 
     async def remove_amr(self, amr_id: str) -> dict:
@@ -509,12 +661,17 @@ class ProcessManager:
         if not proc:
             raise ProcessError(f"AMR '{amr_id}' not configured")
         if proc.state in ("STARTING", "RUNNING", "STOPPING"):
-            raise ProcessError(f"AMR '{amr_id}' is still running — stop it before removing")
+            self.log(f"{amr_id} is {proc.state} — stopping before removal")
+            await self.stop(self.amr_process_name(amr_id))
         self.amrs.pop(amr_id, None)
+        self.charge_spots.pop(amr_id, None)
         self.processes.pop(self.amr_process_name(amr_id), None)
         if not self.amr_store.remove(amr_id):
             raise ProcessError(f"AMR '{amr_id}' not configured")
+        # Free pad from the removed owner: promote a standby robot into it
+        self._promote_standby_to_pads(self._preset_layout())
         self.update_coordinator_cmd()
+        self.publish_roster_update()
         return {"ok": True, "id": amr_id}
 
     def set_configuration(self, preset: Optional[str] = None, tasks: Optional[int] = None,
@@ -523,7 +680,8 @@ class ProcessManager:
         if coord and coord.state in ("STARTING", "RUNNING", "STOPPING"):
             raise ProcessError("stop the coordinator before changing its configuration")
         self.settings.set(preset, tasks, auction_mode)
-        self.coordinator_process(self.settings.preset, self.settings.tasks, self.amr_store.list(),
+        self._reconcile_charge_spots()
+        self.coordinator_process(self.settings.preset, self.settings.tasks, self.charge_roster(),
                                  self.settings.auction_mode)
         return self.settings.to_dict()
 
@@ -558,17 +716,21 @@ class ProcessManager:
         return results
 
     def readiness(self) -> bool:
+        """Readiness reflects the coordination stack, not AMR lifecycle state.
+
+        AMRs are individually manageable (start/stop/remove live, without a
+        fleet restart), so a STOPPED or STARTING AMR must not flag the whole
+        fleet as unready — otherwise the dashboard unmounts to the startup
+        screen every time an AMR is added/stopped/removed.
+        """
         infra = (self.processes.get("zenohd") or ManagedProcess("zenohd", [], "")).info()
         bridge = (self.processes.get("bridge") or ManagedProcess("bridge", [], "")).info()
         coord = (self.processes.get("coordinator") or ManagedProcess("coordinator", [], "")).info()
-        if not (infra["state"] == "RUNNING" and bridge["state"] == "RUNNING" and coord["state"] == "RUNNING"):
-            return False
-        if self.amrs:
-            return all(
-                self.processes[self.amr_process_name(a)].state == "RUNNING"
-                for a in self.amrs
-            )
-        return True
+        return (
+            infra["state"] == "RUNNING"
+            and bridge["state"] == "RUNNING"
+            and coord["state"] == "RUNNING"
+        )
 
     # ------------------------------------------------------------------
     # Status snapshot for the dashboard
@@ -627,6 +789,9 @@ def _preset_roster(preset: str) -> list:
     """Roster entries for a warehouse preset (used to seed a fresh AMR store)."""
     try:
         from server.warehouse import build_from_preset
-        return build_from_preset(preset).roster()
+        from .charge_allocation import allocate_charge_spots
+        layout = build_from_preset(preset)
+        robot_ids = [r.id for r in layout.robots]
+        return allocate_charge_spots(layout, robot_ids)
     except Exception:
         return []

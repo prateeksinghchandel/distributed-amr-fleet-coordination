@@ -358,6 +358,22 @@ class TaskManager:
         self._publish(topics.TASK_CANCELLED, task.to_cancel_dict())
         self._log(f"Task {task_id} cancelled")
 
+    def cancel_tasks_for_robot(self, robot_id: str) -> int:
+        """Cancel all tasks assigned to a removed robot. Returns count cancelled."""
+        count = 0
+        for task in self.tasks:
+            if task.assigned_robot_id == robot_id and task.status not in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED):
+                task.status = TaskStatus.CANCELLED
+                task.assigned_robot_id = None
+                task.assigned_source = None
+                task.assigned_at = None
+                count += 1
+        self.auction_queue = [t for t in self.auction_queue if t not in
+                              {task.id for task in self.tasks if task.assigned_robot_id == robot_id}]
+        if count > 0:
+            self._log(f"Cancelled {count} task(s) for removed robot {robot_id}")
+        return count
+
     # ------------------------------------------------------------------
     # Auction result handler (called by server_node on AUCTION_RESULT)
     # ------------------------------------------------------------------
