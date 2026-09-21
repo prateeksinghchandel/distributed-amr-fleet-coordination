@@ -39,7 +39,10 @@ class AmrStore:
         for entry in layout_roster:
             rid = entry.get("id")
             if rid:
-                self.amrs[rid] = {"id": rid, "x": float(entry.get("x", 0)), "y": float(entry.get("y", 0))}
+                record = {"id": rid, "x": float(entry.get("x", 0)), "y": float(entry.get("y", 0))}
+                if "homeBay" in entry:
+                    record["homeBay"] = entry["homeBay"]
+                self.amrs[rid] = record
         self.save()
         self.log(f"Seeded {len(self.amrs)} AMR(s) from preset '{preset}'")
 
@@ -65,6 +68,14 @@ class AmrStore:
         if amr_id in self.amrs:
             raise ValueError(f"AMR '{amr_id}' already exists")
         with self._lock:
+            self.amrs[amr_id] = dict(entry)
+            self.save()
+        return dict(entry)
+
+    def update(self, amr_id: str, entry: dict) -> dict:
+        with self._lock:
+            if amr_id not in self.amrs:
+                raise KeyError(f"AMR '{amr_id}' not found")
             self.amrs[amr_id] = dict(entry)
             self.save()
         return dict(entry)

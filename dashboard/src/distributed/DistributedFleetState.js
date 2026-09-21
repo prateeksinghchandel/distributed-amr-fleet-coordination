@@ -511,6 +511,7 @@ export class DistributedFleetState {
             obstacles: payload.obstacles || [],
             chargingPads,
             deliveryDocks,
+            standbySpots: payload.standbySpots || [],
             shelves: shelves.map((s) => ({ ...s, pickPoints: [] })),
             deliveryZone: this._zoneFromRects(deliveryDocks, 'stations'),
             chargingZone: this._zoneFromRects(chargingPads, 'pads'),
@@ -528,7 +529,7 @@ export class DistributedFleetState {
             y: Math.min(...ys),
             width: Math.max(...xe) - Math.min(...xs),
             height: Math.max(...ye) - Math.min(...ys),
-            [key]: items.map((i) => ({ id: i.id, x: i.x, y: i.y, width: i.width, height: i.height })),
+            [key]: items.map((i) => ({ ...i, id: i.id, x: i.x, y: i.y, width: i.width, height: i.height })),
         };
         return zone;
     }

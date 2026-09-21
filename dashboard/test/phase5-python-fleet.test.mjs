@@ -33,8 +33,22 @@ import { TOPICS } from '../src/simulation/messages/topics.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BACKEND = path.resolve(ROOT, '..', 'backend');
-const VENV_PYTHON = path.join(BACKEND, '..', '.venv', 'bin', 'python');
 const TOOLS = path.join(ROOT, 'tools', 'zenoh');
+
+function findVenvPython() {
+    if (process.env.PYTHON_BIN && fs.existsSync(process.env.PYTHON_BIN)) return process.env.PYTHON_BIN;
+    const candidates = [
+        path.join(BACKEND, '..', '.venv', 'Scripts', 'python.exe'),
+        path.join(BACKEND, '..', '.venv', 'bin', 'python'),
+        path.join(BACKEND, '..', 'venv', 'Scripts', 'python.exe'),
+        path.join(BACKEND, '..', 'venv', 'bin', 'python'),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    return process.platform === 'win32' ? 'python' : 'python3';
+}
+const VENV_PYTHON = findVenvPython();
 
 const WS_PORT = Number.parseInt(process.env.ZENOH_WS_PORT || '10000', 10);
 const TCP_PORT = Number.parseInt(process.env.ZENOH_TCP_PORT || '7447', 10);
@@ -56,10 +70,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function resolveTool(name) {
     const envKey = name.toUpperCase().replaceAll('-', '_') + '_BIN';
     if (process.env[envKey] && fs.existsSync(process.env[envKey])) return process.env[envKey];
-    const local = path.join(TOOLS, name);
-    if (fs.existsSync(local)) return local;
-    for (const dir of (process.env.PATH || '').split(':')) {
-        if (dir && fs.existsSync(path.join(dir, name))) return path.join(dir, name);
+    const exts = process.platform === 'win32' ? ['.exe', ''] : [''];
+    for (const ext of exts) {
+        const local = path.join(TOOLS, name + ext);
+        if (fs.existsSync(local)) return local;
+    }
+    const pathDirs = (process.env.PATH || '').split(path.delimiter);
+    for (const dir of pathDirs) {
+        for (const ext of exts) {
+            const cand = path.join(dir, name + ext);
+            if (dir && fs.existsSync(cand)) return cand;
+        }
+    }
+    if (name === 'zenoh-bridge-remote-api' && fs.existsSync(path.join(TOOLS, 'zenoh_plugin_remote_api.dll'))) {
+        const router = resolveTool('zenohd');
+        if (router) return router;
     }
     return null;
 }
@@ -67,9 +92,15 @@ function resolveTool(name) {
 function portOpen(port, timeoutMs = 1500) {
     return new Promise((resolve) => {
         const sock = net.connect({ port, host: '127.0.0.1' });
-        const t = setTimeout(() => { sock.destroy(); resolve(false); }, timeoutMs);
+        const t = setTimeout(() => { sock.destroy(); tryLocalhost(); }, timeoutMs);
         sock.on('connect', () => { clearTimeout(t); sock.end(); resolve(true); });
-        sock.on('error', () => { clearTimeout(t); resolve(false); });
+        sock.on('error', () => { clearTimeout(t); tryLocalhost(); });
+        function tryLocalhost() {
+            const s2 = net.connect({ port, host: 'localhost' });
+            const t2 = setTimeout(() => { s2.destroy(); resolve(false); }, timeoutMs);
+            s2.on('connect', () => { clearTimeout(t2); s2.end(); resolve(true); });
+            s2.on('error', () => { clearTimeout(t2); resolve(false); });
+        }
     });
 }
 
@@ -131,7 +162,10 @@ if (!(await portOpen(TCP_PORT, 400))) {
 
 const bridgeUp = await portOpen(WS_PORT, 800);
 if (!bridgeUp) {
-    const c = startDaemon(bridge, ['--no-multicast-scouting', '--connect', `tcp/127.0.0.1:${TCP_PORT}`, '--ws-port', String(WS_PORT)], path.join(ROOT, 'logs', 'zenoh-bridge.log'));
+    const bridgeArgs = (bridge === router)
+        ? ['--no-multicast-scouting', '--listen', 'tcp/127.0.0.1:7448', '--connect', `tcp/127.0.0.1:${TCP_PORT}`, '--plugin-search-dir', TOOLS, '-P', 'remote_api', '--cfg', `plugins/remote_api/websocket_port:${WS_PORT}`]
+        : ['--no-multicast-scouting', '--connect', `tcp/127.0.0.1:${TCP_PORT}`, '--ws-port', String(WS_PORT)];
+    const c = startDaemon(bridge, bridgeArgs, path.join(ROOT, 'logs', 'zenoh-bridge.log'));
     infra.push(c);
     await pollUntil(() => portOpen(WS_PORT, 400), 10000, 300);
 } else {

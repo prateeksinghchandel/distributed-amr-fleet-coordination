@@ -63,6 +63,7 @@ class RosterEntry(BaseModel):
     id: str
     x: float
     y: float
+    homeBay: Optional[dict] = None
 
 
 class BidCosts(BaseModel):
@@ -153,6 +154,7 @@ class WorldStatePayload(BaseModel):
     chargingPads: list[dict] = Field(default_factory=list)
     deliveryDocks: list[dict] = Field(default_factory=list)
     roster: list[RosterEntry] = Field(default_factory=list)
+    standbySpots: list[dict] = Field(default_factory=list)
     auctionMode: Optional[str] = None
     # Authoritative task ledger + aggregate stats (dashboard consumes these
     # instead of inferring task state from telemetry).

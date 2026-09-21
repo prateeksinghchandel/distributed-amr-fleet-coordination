@@ -227,12 +227,36 @@ export class Renderer {
                 ctx.moveTo(ptr.x - cl, ptr.y); ctx.lineTo(ptr.x, ptr.y); ctx.lineTo(ptr.x, ptr.y - cl);
                 ctx.stroke();
 
-                // Lightning symbol & label
+                // Lightning symbol & label (with pad owner if assigned)
                 ctx.fillStyle = P.warning;
                 ctx.font = 'bold 11px monospace';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText(`⚡ ${pad.id}`, pbl.x + pw / 2, pbl.y + ph / 2);
+                const ownerLabel = pad.assignedRobotId ? ` (${pad.assignedRobotId})` : '';
+                ctx.fillText(`⚡ ${pad.id}${ownerLabel}`, pbl.x + pw / 2, pbl.y + ph / 2);
+            }
+        }
+
+        // 3. Standby Slots
+        if (warehouse.standbySpots && warehouse.standbySpots.length > 0) {
+            const P = this.palette;
+            for (const spot of warehouse.standbySpots) {
+                const screen = camera.worldToScreen(spot.x, spot.y, canvas.width, canvas.height);
+                const r = Math.max(8, 0.4 * camera.zoom);
+                ctx.strokeStyle = withAlpha(P.warning, 0.6);
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                ctx.arc(screen.x, screen.y, r, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                ctx.fillStyle = P.warning;
+                ctx.font = '9px monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                const label = spot.robotId ? `S${spot.slot}:${spot.robotId}` : `S${spot.slot}`;
+                ctx.fillText(label, screen.x, screen.y);
             }
         }
     }

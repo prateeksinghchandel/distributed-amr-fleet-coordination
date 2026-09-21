@@ -292,7 +292,10 @@ async def test_create_amr(tmp_path):
     pm, spawn = make_pm(tmp_path)
 
     entry = await pm.create_amr("AMR7", 3.5, 4.5)
-    assert entry == {"id": "AMR7", "x": 3.5, "y": 4.5}
+    assert entry["id"] == "AMR7"
+    assert entry["x"] == 3.5
+    assert entry["y"] == 4.5
+    assert "homeBay" in entry
     assert "AMR7" in pm.amrs
     assert "amr:AMR7" in pm.processes
     assert pm.amr_store.get("AMR7") == entry

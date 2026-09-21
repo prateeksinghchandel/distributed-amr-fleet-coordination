@@ -53,3 +53,6 @@ immediately so robots re-plan around them."""
 
 CONTROL_OBSTACLE_REMOVE = "control/world/obstacles/remove"
 """Dashboard → Coordinator: remove a runtime obstacle by its id."""
+
+CONTROL_ROSTER_UPDATE = "control/roster/update"
+"""Fleet Manager → Coordinator: dynamic roster update with full roster replacement."""

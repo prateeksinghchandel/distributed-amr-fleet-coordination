@@ -78,7 +78,11 @@ async def run(pm: ProcessManager, host: str, port: int) -> None:
         stop.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler, sig, None)
+        try:
+            loop.add_signal_handler(sig, _signal_handler, sig, None)
+        except NotImplementedError:
+            # Windows does not support asyncio.add_signal_handler()
+            signal.signal(sig, _signal_handler)
 
     try:
         await stop.wait()
