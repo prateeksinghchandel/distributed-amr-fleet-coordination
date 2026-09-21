@@ -18,7 +18,7 @@ from typing import Optional, Sequence
 from common.geometry import Rect
 from common.models import RobotStatus
 from robot.battery import (
-    BATTERY_FULL, BATTERY_WARN_THRESHOLD,
+    BATTERY_FULL, BATTERY_WARN_THRESHOLD, CHARGE_REQUEST_THRESHOLD,
     CHARGE_RATE_PER_SEC, IDLE_DRAIN_PER_SEC, TRAVEL_DRAIN_PER_METER,
 )
 from robot.planning.astar import AStarPlanner, PathNotFoundError
@@ -52,6 +52,7 @@ class RobotState:
     own_pad_id: Optional[str] = None
     charge_pad: Optional[dict] = None
     pads: list[dict] = field(default_factory=list)
+    yielded_pad: Optional[str] = None
     _action_timer: float = field(default=0.0, repr=False)
     _completed_timer: float = field(default=0.0, repr=False)
 
@@ -66,6 +67,7 @@ class RobotState:
             "currentTaskId": self.current_task_id,
             "blocked": self.blocked,
             "online": self.online,
+            "ownPadId": self.own_pad_id,
         }
 
 
@@ -104,6 +106,10 @@ def _pad_occupied_by(pad: dict, fleet: Sequence[dict], exclude_id: Optional[str]
         ry = float(r.get("y", 0.0))
         if math.dist((rx, ry), c) <= PAD_OCCUPANCY:
             return r
+    # Also check coordinator-broadcasted occupancy from world state
+    occupied_by = pad.get("occupiedBy")
+    if occupied_by and occupied_by != exclude_id:
+        return {"robotId": occupied_by}
     return None
 
 
@@ -186,46 +192,64 @@ class MotionController:
 
         # Autonomous Return-to-Charge Lifecycle & Turnover:
         if not s.current_task_id:
-            # Check pad-owner turnover / yield when needy robot (< 25%) is off-pad
+            own_pad = None
             if s.own_pad_id and s.pads:
                 own_pad = next((p for p in s.pads if p.get("id") == s.own_pad_id), None)
-                if own_pad:
-                    needy_off_pad = any(
-                        float(r.get("battery", 100.0)) < BATTERY_WARN_THRESHOLD
-                        and not any(_is_on_pad(float(r.get("x", 0.0)), float(r.get("y", 0.0)), p) for p in s.pads)
-                        for r in fleet
-                        if (r.get("robotId") or r.get("id")) != s.id and r.get("online", True)
-                    )
-                    if needy_off_pad:
-                        # Yield own pad to needy robot
-                        c = _pad_centroid(own_pad)
-                        if _is_on_pad(s.x, s.y, own_pad) or s.charge_pad == own_pad:
-                            vacate_target = s.standby_spot or (max(1.0, c[0] - 2.5), c[1])
-                            s.status = RobotStatus.IDLE
-                            s.charge_pad = None
-                            if math.dist((s.x, s.y), vacate_target) > 0.3 and not s.current_path:
-                                s.current_path = self.plan_route(vacate_target[0], vacate_target[1], obstacles, bounds)
-                                s.path_index = 0
-                                self._log(f"{s.id} yielding pad {s.own_pad_id} to needy robot — vacating to {vacate_target}")
-                    elif s.status != RobotStatus.CHARGING and (s.status == RobotStatus.IDLE or s.battery < BATTERY_FULL):
-                        # Trickle-park on own pad centre
-                        c = _pad_centroid(own_pad)
-                        if math.dist((s.x, s.y), c) > 0.3:
-                            s.status = RobotStatus.CHARGING
-                            s.charge_pad = own_pad
-                            s.current_path = self.plan_route(c[0], c[1], obstacles, bounds)
-                            s.path_index = 0
-                            self._log(f"{s.id} returning to own pad {s.own_pad_id} ({c[0]:.1f}, {c[1]:.1f})")
-                        else:
-                            s.status = RobotStatus.CHARGING
-                            s.charge_pad = own_pad
-                            s.current_path = []
-                            s.path_index = 0
 
-            # Standby (overflow) robot seek free pad or wait at standby slot
+            if own_pad is not None:
+                centroid = _pad_centroid(own_pad)
+                # A peer needs a free station when it has no pad of its own
+                # (ownPadId unset = overflow/standby robot), is below the charge
+                # request threshold and is currently off any pad. Pad owners
+                # returning to their own pad never trigger give-way.
+                needy_off_pad = any(
+                    not r.get("ownPadId")
+                    and float(r.get("battery", 100.0)) < CHARGE_REQUEST_THRESHOLD
+                    and not any(_is_on_pad(float(r.get("x", 0.0)), float(r.get("y", 0.0)), p) for p in s.pads)
+                    for r in fleet
+                    if (r.get("robotId") or r.get("id")) != s.id and r.get("online", True)
+                )
+                occupant = _pad_occupied_by(own_pad, fleet, exclude_id=s.id)
+                # An owner that already gave way stays clear as long as its pad is
+                # still needed (occupied by the standby robot, or a standby robot
+                # still needs a station), regardless of its own battery level.
+                already_yielded = s.yielded_pad == s.own_pad_id and s.own_pad_id is not None
+                should_yield_now = (occupant is not None) or (
+                    needy_off_pad and s.battery >= CHARGE_REQUEST_THRESHOLD and not already_yielded
+                )
+                stay_clear = already_yielded and (occupant is not None or needy_off_pad)
+                if should_yield_now or stay_clear:
+                    if s.yielded_pad != s.own_pad_id:
+                        s.yielded_pad = s.own_pad_id
+                    if s.status != RobotStatus.IDLE:
+                        s.status = RobotStatus.IDLE
+                    s.charge_pad = None
+                    vacate_target = s.standby_spot or (max(1.0, centroid[0] - 2.5), centroid[1])
+                    if math.dist((s.x, s.y), vacate_target) > 0.3 and not s.current_path:
+                        s.current_path = self.plan_route(vacate_target[0], vacate_target[1], obstacles, bounds)
+                        s.path_index = 0
+                        self._log(f"{s.id} giving way on pad {s.own_pad_id} — vacating to ({vacate_target[0]:.1f}, {vacate_target[1]:.1f})")
+                elif s.status != RobotStatus.CHARGING:
+                    # No contender and pad free — claim / trickle-park on own pad centre
+                    s.yielded_pad = None
+                    c = centroid
+                    if math.dist((s.x, s.y), c) > 0.3:
+                        s.status = RobotStatus.CHARGING
+                        s.charge_pad = own_pad
+                        s.current_path = self.plan_route(c[0], c[1], obstacles, bounds)
+                        s.path_index = 0
+                        self._log(f"{s.id} returning to own pad {s.own_pad_id} ({c[0]:.1f}, {c[1]:.1f})")
+                    else:
+                        s.status = RobotStatus.CHARGING
+                        s.charge_pad = own_pad
+                        s.current_path = []
+                        s.path_index = 0
+
+            # Standby (overflow) robot: seek a free pad only when it actually needs
+            # charging (< CHARGE_REQUEST_THRESHOLD), otherwise hold at standby slot.
             elif s.standby_spot is not None and s.own_pad_id is None and s.status != RobotStatus.CHARGING:
-                if s.battery < BATTERY_FULL:
-                    # Seek lowest-index free pad
+                if s.battery < CHARGE_REQUEST_THRESHOLD:
+                    # Needs charge — seek lowest-index free pad
                     free_pad = next((p for p in s.pads if _pad_occupied_by(p, fleet, exclude_id=s.id) is None), None)
                     if free_pad is not None:
                         c = _pad_centroid(free_pad)
@@ -233,15 +257,24 @@ class MotionController:
                         s.charge_pad = free_pad
                         s.current_path = self.plan_route(c[0], c[1], obstacles, bounds)
                         s.path_index = 0
-                        self._log(f"{s.id} seeking free pad {free_pad['id']} ({c[0]:.1f}, {c[1]:.1f})")
+                        self._log(f"{s.id} needs charge — seeking free pad {free_pad['id']} ({c[0]:.1f}, {c[1]:.1f})")
                     else:
-                        # All pads busy — wait at standby slot
+                        # All pads busy — owners will give way; wait at standby slot
                         c = s.standby_spot
                         if math.dist((s.x, s.y), c) > 0.3 and not s.current_path:
                             s.status = RobotStatus.IDLE
                             s.current_path = self.plan_route(c[0], c[1], obstacles, bounds)
                             s.path_index = 0
-                            self._log(f"{s.id} all pads busy — moving to standby slot ({c[0]:.1f}, {c[1]:.1f})")
+                            self._log(f"{s.id} needs charge — all pads busy, waiting at standby slot ({c[0]:.1f}, {c[1]:.1f})")
+                else:
+                    # Healthy — hold at standby slot, do not hoard pads
+                    c = s.standby_spot
+                    s.charge_pad = None
+                    if math.dist((s.x, s.y), c) > 0.3 and not s.current_path:
+                        s.status = RobotStatus.IDLE
+                        s.current_path = self.plan_route(c[0], c[1], obstacles, bounds)
+                        s.path_index = 0
+                        self._log(f"{s.id} holding standby slot ({c[0]:.1f}, {c[1]:.1f})")
 
             # Legacy fallback: home_charge_bay
             elif s.home_charge_bay and not s.own_pad_id and not s.standby_spot:

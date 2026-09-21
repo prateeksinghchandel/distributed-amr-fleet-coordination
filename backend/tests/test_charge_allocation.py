@@ -8,11 +8,16 @@ from fleet_manager.charge_allocation import (
     compute_standby_slots,
     allocate_charge_spots,
     assign_charge_spot,
+    promote_standby_to_pads,
     roster_token,
     parse_roster_token,
 )
 from fleet_manager.amr_store import AmrStore, SettingsStore
 from fleet_manager.process_manager import ProcessManager, _preset_roster
+
+
+async def _zenoh_up(_port: int) -> bool:
+    return True
 
 
 def test_allocate_under_capacity():
@@ -103,7 +108,7 @@ async def test_release_charge_spot(tmp_path):
 
     pm = ProcessManager(
         spawn=lambda *args, **kwargs: None,
-        zenoh_available=lambda port: True,
+        zenoh_available=_zenoh_up,
         amr_store=amr_store,
         settings=settings,
     )
@@ -144,7 +149,7 @@ def test_reconcile_legacy_amrs(tmp_path):
 
     pm = ProcessManager(
         spawn=lambda *args, **kwargs: None,
-        zenoh_available=lambda port: True,
+        zenoh_available=_zenoh_up,
         amr_store=amr_store,
         settings=settings,
     )
@@ -156,6 +161,94 @@ def test_reconcile_legacy_amrs(tmp_path):
     assert pm.amrs["AMR2"]["homeBay"]["kind"] == "pad"
     # Unique pads
     assert pm.amrs["AMR1"]["homeBay"]["padId"] != pm.amrs["AMR2"]["homeBay"]["padId"]
+
+
+def test_promote_standby_to_free_pads():
+    """promote_standby_to_pads upgrades standby robots to unowned pads, lowest first."""
+    layout = build_from_preset("DISTRIBUTION")  # 5 pads
+    pads = layout.charging_pads()
+    spots = {
+        "AMR1": {"kind": "pad", "slot": 0, "padId": pads[0]["id"]},
+        "AMR2": {"kind": "standby", "slot": 0, "padId": None},
+        "AMR3": {"kind": "pad", "slot": 2, "padId": pads[2]["id"]},
+        "AMR4": {"kind": "standby", "slot": 1, "padId": None},
+    }
+    promoted = promote_standby_to_pads(layout, spots)
+    # AMR2 (lowest id) gets the lowest unowned pad BAY-2, AMR4 gets BAY-4
+    assert promoted["AMR2"]["kind"] == "pad"
+    assert promoted["AMR2"]["padId"] == pads[1]["id"]
+    assert promoted["AMR4"]["kind"] == "pad"
+    assert promoted["AMR4"]["padId"] == pads[3]["id"]
+    assert "AMR1" not in promoted
+    assert "AMR3" not in promoted
+    # Each promoted robot spawns at the pad centre
+    assert promoted["AMR2"]["x"] == pytest.approx(pads[1]["spawnPoint"]["x"])
+    assert promoted["AMR2"]["y"] == pytest.approx(pads[1]["spawnPoint"]["y"])
+
+
+def test_reconcile_promotes_standby_robot_to_free_pad(tmp_path):
+    """ProcessManager reconcile promotes a persisted standby robot into a free pad."""
+    import json
+    amrs_file = tmp_path / "amrs.json"
+    settings_file = tmp_path / "settings.json"
+    # DISTRIBUTION has 5 pads; seed a stale ECOMMERCE-era roster where AMR3 is standby
+    layout = build_from_preset("DISTRIBUTION")
+    pads = layout.charging_pads()
+    stale = {
+        "amrs": [
+            {"id": "AMR1", "x": 1.0, "y": 1.0, "homeBay": {"kind": "pad", "slot": 0, "padId": pads[0]["id"]}},
+            {"id": "AMR2", "x": 2.0, "y": 2.0, "homeBay": {"kind": "pad", "slot": 1, "padId": pads[1]["id"]}},
+            {"id": "AMR3", "x": 3.0, "y": 3.0, "homeBay": {"kind": "standby", "slot": 0, "padId": None}},
+            {"id": "AMR4", "x": 4.0, "y": 4.0, "homeBay": {"kind": "pad", "slot": 3, "padId": pads[3]["id"]}},
+        ]
+    }
+    amrs_file.write_text(json.dumps(stale))
+    amr_store = AmrStore(amrs_file, preset="DISTRIBUTION", layout_roster=_preset_roster("DISTRIBUTION"))
+    settings = SettingsStore(settings_file, default_preset="DISTRIBUTION")
+    pm = ProcessManager(
+        spawn=lambda *args, **kwargs: None,
+        zenoh_available=_zenoh_up,
+        amr_store=amr_store,
+        settings=settings,
+    )
+    # AMR3 (stale standby) is promoted to the first unowned pad
+    assert pm.amrs["AMR3"]["homeBay"]["kind"] == "pad"
+    assert pm.amrs["AMR3"]["homeBay"]["padId"] == pads[2]["id"]
+    assert pm.amrs["AMR3"]["homeBay"]["slot"] == 2
+
+
+@pytest.mark.asyncio
+async def test_remove_owner_promotes_standby(tmp_path):
+    """Removing a pad owner promotes an existing standby robot into the freed pad."""
+    import json
+    amrs_file = tmp_path / "amrs.json"
+    settings_file = tmp_path / "settings.json"
+    # ECOMMERCE has 3 pads; 4 AMRs -> AMR4 on standby
+    layout = build_from_preset("ECOMMERCE")
+    pads = layout.charging_pads()
+    data = {
+        "amrs": [
+            {"id": "AMR1", "x": 1.0, "y": 1.0, "homeBay": {"kind": "pad", "slot": 0, "padId": pads[0]["id"]}},
+            {"id": "AMR2", "x": 2.0, "y": 2.0, "homeBay": {"kind": "pad", "slot": 1, "padId": pads[1]["id"]}},
+            {"id": "AMR3", "x": 3.0, "y": 3.0, "homeBay": {"kind": "pad", "slot": 2, "padId": pads[2]["id"]}},
+            {"id": "AMR4", "x": 4.0, "y": 4.0, "homeBay": {"kind": "standby", "slot": 0, "padId": None}},
+        ]
+    }
+    amrs_file.write_text(json.dumps(data))
+    amr_store = AmrStore(amrs_file, preset="ECOMMERCE", layout_roster=_preset_roster("ECOMMERCE"))
+    settings = SettingsStore(settings_file, default_preset="ECOMMERCE")
+    pm = ProcessManager(
+        spawn=lambda *args, **kwargs: None,
+        zenoh_available=_zenoh_up,
+        amr_store=amr_store,
+        settings=settings,
+    )
+    assert pm.amrs["AMR4"]["homeBay"]["kind"] == "standby"
+
+    # Remove AMR2 -> AMR4 is promoted into AMR2's freed pad
+    await pm.remove_amr("AMR2")
+    assert pm.amrs["AMR4"]["homeBay"]["kind"] == "pad"
+    assert pm.amrs["AMR4"]["homeBay"]["padId"] == pads[1]["id"]
 
 
 def test_roster_token_roundtrip():

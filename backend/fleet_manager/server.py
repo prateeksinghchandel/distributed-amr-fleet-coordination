@@ -94,9 +94,27 @@ async def run(pm: ProcessManager, host: str, port: int) -> None:
 
 
 def main() -> None:
+    from robot.communication import open_session as _open_session, ZenohBus as _ZenohBus
+
     args = parse_args()
     pm = ProcessManager()
+
+    # Create a Zenoh session so publish_roster_update can reach the coordinator
+    _zenoh_session = None
+    try:
+        _zenoh_session = _open_session(f"tcp/127.0.0.1:{config.ZENOH_TCP_PORT}")
+        _bus = _ZenohBus(_zenoh_session, "fleet-manager", pm.log)
+        pm.publish_cb = _bus.publish
+    except Exception as exc:
+        pm.log(f"Could not set up Zenoh publish_cb for roster updates: {exc}")
+
     try:
         asyncio.run(run(pm, args.host, args.port))
     except KeyboardInterrupt:
         pass
+    finally:
+        if _zenoh_session is not None:
+            try:
+                _zenoh_session.close()
+            except Exception:
+                pass

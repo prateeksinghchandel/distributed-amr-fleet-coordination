@@ -107,23 +107,32 @@ class RobotNode:
             for o in payload.get("obstacles", [])
         ]
         self.state.pads = payload.get("chargingPads", [])
-        # Spawn at roster position on first world state
-        if not self.spawned:
-            roster = payload.get("roster", [])
-            me = next((r for r in roster if r["id"] == self.robot_id), None)
-            if me:
-                self.state.x = float(me["x"])
-                self.state.y = float(me["y"])
-                hb = me.get("homeBay")
-                if hb and isinstance(hb, dict):
-                    kind = hb.get("kind")
-                    if kind == "pad" and hb.get("padId"):
-                        self.state.own_pad_id = hb["padId"]
-                        self.state.home_charge_bay = (float(me["x"]), float(me["y"]))
-                    elif kind == "standby":
-                        self.state.standby_spot = (float(hb.get("x", me["x"])), float(hb.get("y", me["y"])))
+        # Update roster data on every world state (handles dynamic adds/removes)
+        roster = payload.get("roster", [])
+        me = next((r for r in roster if r["id"] == self.robot_id), None)
+        if me:
+            hb = me.get("homeBay")
+            if hb and isinstance(hb, dict):
+                kind = hb.get("kind")
+                if kind == "pad" and hb.get("padId"):
+                    self.state.own_pad_id = hb["padId"]
+                    self.state.home_charge_bay = (float(hb["x"]), float(hb["y"]))
+                elif kind == "standby":
+                    self.state.standby_spot = (float(hb.get("x", me["x"])), float(hb.get("y", me["y"])))
                 else:
                     self.state.home_charge_bay = (float(me["x"]), float(me["y"]))
+            else:
+                self.state.home_charge_bay = (float(me["x"]), float(me["y"]))
+            # Sync charge_pad from pads when on own pad
+            if self.state.own_pad_id and not self.state.charge_pad:
+                for pad in self.state.pads:
+                    if pad.get("id") == self.state.own_pad_id:
+                        self.state.charge_pad = pad
+                        break
+            # Spawn at roster position on first world state only
+            if not self.spawned:
+                self.state.x = float(me["x"])
+                self.state.y = float(me["y"])
                 self.spawned = True
                 self.log.info(
                     f"Spawned at ({self.state.x:.1f}, {self.state.y:.1f}) "

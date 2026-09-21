@@ -97,7 +97,7 @@ def test_standby_robot_seeks_free_pad_and_vacates_at_full():
         "height": 2.0,
         "spawnPoint": {"x": 9.0, "y": 9.0},
     }
-    state = RobotState(id="AMR_SB", x=1.0, y=1.0, battery=60.0, max_speed=2.0)
+    state = RobotState(id="AMR_SB", x=1.0, y=1.0, battery=20.0, max_speed=2.0)
     state.standby_spot = (1.0, 1.0)
     state.own_pad_id = None
     state.pads = [pad]
@@ -120,7 +120,7 @@ def test_standby_robot_seeks_free_pad_and_vacates_at_full():
     state.x, state.y = 9.0, 9.0
     state.current_path = []
     # Step until battery is full and robot transitions to IDLE/vacates
-    for _ in range(60):
+    for _ in range(140):
         controller.update(0.1, obstacles=[], bounds={"width": 20, "height": 20}, fleet=fleet_free)
         if state.status == RobotStatus.IDLE and not state.charge_pad:
             break
@@ -165,6 +165,83 @@ def test_pad_owner_yields_pad_to_needy_robot():
     assert len(state.current_path) >= 1
     # Vacate target is standby spot
     assert state.current_path[-1] == pytest.approx((2.0, 2.0), abs=0.4)
+
+
+def test_healthy_standby_robot_does_not_hoard_free_pad():
+    """A standby robot above the charge threshold holds its slot instead of grabbing a free pad."""
+    pad = {
+        "id": "BAY-1",
+        "x": 8.0,
+        "y": 8.0,
+        "width": 2.0,
+        "height": 2.0,
+        "spawnPoint": {"x": 9.0, "y": 9.0},
+    }
+    state = RobotState(id="AMR_SB", x=1.0, y=1.0, battery=80.0, max_speed=2.0)
+    state.standby_spot = (1.0, 1.0)
+    state.own_pad_id = None
+    state.pads = [pad]
+
+    controller = MotionController(state, lambda _: None, resolution=0.25, safety_margin=0.05)
+
+    # Pad is free and battery is healthy (80% >= 25%) → robot stays at standby slot
+    fleet = [{"robotId": "AMR1", "x": 18.0, "y": 18.0, "battery": 80.0, "online": True}]
+    controller.update(0.1, obstacles=[], bounds={"width": 20, "height": 20}, fleet=fleet)
+    assert state.status == RobotStatus.IDLE
+    assert state.charge_pad is None
+
+
+def test_needy_pad_owner_does_not_give_way():
+    """An owner below the warn threshold keeps its pad and charges instead of yielding to a contender."""
+    pad = {
+        "id": "BAY-1",
+        "x": 8.0,
+        "y": 8.0,
+        "width": 2.0,
+        "height": 2.0,
+        "spawnPoint": {"x": 9.0, "y": 9.0},
+    }
+    state = RobotState(id="AMR1", x=9.0, y=9.0, battery=20.0, max_speed=2.0)
+    state.own_pad_id = "BAY-1"
+    state.standby_spot = (2.0, 2.0)
+    state.pads = [pad]
+    state.status = RobotStatus.CHARGING
+    state.charge_pad = pad
+
+    controller = MotionController(state, lambda _: None, resolution=0.25, safety_margin=0.05)
+
+    # Another robot is off-pad and needy, but we are below threshold ourselves
+    fleet_needy = [{"robotId": "AMR2", "x": 5.0, "y": 5.0, "battery": 20.0, "online": True}]
+    controller.update(0.1, obstacles=[], bounds={"width": 20, "height": 20}, fleet=fleet_needy)
+    # Owner keeps charging on its own pad
+    assert state.status == RobotStatus.CHARGING
+    assert state.charge_pad == pad
+
+
+def test_pad_owner_stays_away_while_its_pad_is_occupied():
+    """An owner that already gave way does not reclaim its pad while another robot is on it."""
+    pad = {
+        "id": "BAY-1",
+        "x": 8.0,
+        "y": 8.0,
+        "width": 2.0,
+        "height": 2.0,
+        "spawnPoint": {"x": 9.0, "y": 9.0},
+    }
+    state = RobotState(id="AMR1", x=6.5, y=9.0, battery=100.0, max_speed=2.0)
+    state.own_pad_id = "BAY-1"
+    state.charge_pad = None
+    state.status = RobotStatus.IDLE
+    state.pads = [pad]
+
+    controller = MotionController(state, lambda _: None, resolution=0.25, safety_margin=0.05)
+
+    # AMR2 (needy) is on our pad → owner must stay clear, not head back
+    fleet = [{"robotId": "AMR2", "x": 9.0, "y": 9.0, "battery": 20.0, "online": True}]
+    controller.update(0.1, obstacles=[], bounds={"width": 20, "height": 20}, fleet=fleet)
+    assert state.status == RobotStatus.IDLE
+    assert state.charge_pad is None
+    assert len(state.current_path) == 0 or state.current_path[-1] != pytest.approx((9.0, 9.0), abs=0.1)
 
 
 def test_resting_and_charging_at_pad_centroid_vs_corner():

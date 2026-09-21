@@ -214,6 +214,7 @@ class ProcessManager:
             hb = entry.get("homeBay")
             if hb and isinstance(hb, dict) and hb.get("kind"):
                 self.charge_spots[rid] = hb
+        self._promote_standby_to_pads(layout)
         for rid, entry in self.amrs.items():
             if rid not in self.charge_spots:
                 spot = assign_charge_spot(layout, self.charge_spots, rid)
@@ -225,6 +226,32 @@ class ProcessManager:
                     self.amr_store.update(rid, entry)
                 except Exception as exc:
                     self.log(f"Failed to update AMR store for {rid}: {exc}")
+
+    def _promote_standby_to_pads(self, layout) -> bool:
+        """Upgrade standby robots to unowned charging pads and persist the change.
+
+        Returns True when at least one standby robot was promoted. Existing
+        homeBay entries are refreshed so pad-free fleets always occupy their own
+        station once capacity allows (e.g. after a preset switch or a pad owner
+        removal).
+        """
+        changed = False
+        from .charge_allocation import promote_standby_to_pads
+        for rid, spot in promote_standby_to_pads(layout, self.charge_spots).items():
+            entry = self.amrs[rid]
+            entry["homeBay"] = spot
+            entry["x"] = float(spot["x"])
+            entry["y"] = float(spot["y"])
+            self.charge_spots[rid] = spot
+            changed = True
+            try:
+                self.amr_store.update(rid, entry)
+                self.log(f"{rid} promoted to charging pad {spot['padId']}")
+            except Exception as exc:
+                self.log(f"Failed to persist promotion for {rid}: {exc}")
+        if changed:
+            self.update_coordinator_cmd()
+        return changed
 
     def charge_roster(self) -> list[dict]:
         roster = []
@@ -251,8 +278,9 @@ class ProcessManager:
             bus = ZenohBus(session, "fleet-manager", self.log)
             bus.publish(topics.CONTROL_ROSTER_UPDATE, payload)
             session.close()
-        except Exception:
-            pass
+            self.log(f"Roster update published to coordinator ({len(self.charge_roster())} robots)")
+        except Exception as exc:
+            self.log(f"Direct Zenoh roster publish failed: {exc}")
 
     # ------------------------------------------------------------------
     # Process registry
@@ -508,12 +536,12 @@ class ProcessManager:
             proc.last_error = f"spawn failed: {exc}"
             raise ProcessError(f"{proc.name} {proc.last_error}") from exc
         proc.proc = child
-        proc.pid = getattr(child, "pid", None)
+        proc.pid = getattr(child, "pid", None) if child is not None else None
         proc.state = "STARTING"
         proc.started_at = time.time()
         proc.last_error = None
         proc.log_lines.clear()
-        proc.readers = [
+        proc.readers = [] if child is None else [
             asyncio.get_event_loop().create_task(
                 self._drain(proc.name, child.stdout, proc.log_lines.append)
             ),
@@ -599,6 +627,7 @@ class ProcessManager:
         if amr_id in self.amrs:
             raise ProcessError(f"AMR '{amr_id}' already exists")
         layout = self._preset_layout()
+        self._promote_standby_to_pads(layout)
         spot = assign_charge_spot(layout, self.charge_spots, amr_id)
         pos_x = spot["x"] if x is None else round(float(x), 2)
         pos_y = spot["y"] if y is None else round(float(y), 2)
@@ -620,6 +649,11 @@ class ProcessManager:
             raise
         self.update_coordinator_cmd()
         self.publish_roster_update()
+        try:
+            await self.start(self.amr_process_name(amr_id), wait=False)
+            self.log(f"{amr_id} added and started (dynamic roster join)")
+        except (DependencyError, ProcessError) as exc:
+            self.log(f"WARN: {amr_id} added but auto-start deferred: {exc}")
         return entry
 
     async def remove_amr(self, amr_id: str) -> dict:
@@ -627,12 +661,15 @@ class ProcessManager:
         if not proc:
             raise ProcessError(f"AMR '{amr_id}' not configured")
         if proc.state in ("STARTING", "RUNNING", "STOPPING"):
-            raise ProcessError(f"AMR '{amr_id}' is still running — stop it before removing")
+            self.log(f"{amr_id} is {proc.state} — stopping before removal")
+            await self.stop(self.amr_process_name(amr_id))
         self.amrs.pop(amr_id, None)
         self.charge_spots.pop(amr_id, None)
         self.processes.pop(self.amr_process_name(amr_id), None)
         if not self.amr_store.remove(amr_id):
             raise ProcessError(f"AMR '{amr_id}' not configured")
+        # Free pad from the removed owner: promote a standby robot into it
+        self._promote_standby_to_pads(self._preset_layout())
         self.update_coordinator_cmd()
         self.publish_roster_update()
         return {"ok": True, "id": amr_id}
@@ -643,7 +680,8 @@ class ProcessManager:
         if coord and coord.state in ("STARTING", "RUNNING", "STOPPING"):
             raise ProcessError("stop the coordinator before changing its configuration")
         self.settings.set(preset, tasks, auction_mode)
-        self.coordinator_process(self.settings.preset, self.settings.tasks, self.amr_store.list(),
+        self._reconcile_charge_spots()
+        self.coordinator_process(self.settings.preset, self.settings.tasks, self.charge_roster(),
                                  self.settings.auction_mode)
         return self.settings.to_dict()
 
@@ -678,17 +716,21 @@ class ProcessManager:
         return results
 
     def readiness(self) -> bool:
+        """Readiness reflects the coordination stack, not AMR lifecycle state.
+
+        AMRs are individually manageable (start/stop/remove live, without a
+        fleet restart), so a STOPPED or STARTING AMR must not flag the whole
+        fleet as unready — otherwise the dashboard unmounts to the startup
+        screen every time an AMR is added/stopped/removed.
+        """
         infra = (self.processes.get("zenohd") or ManagedProcess("zenohd", [], "")).info()
         bridge = (self.processes.get("bridge") or ManagedProcess("bridge", [], "")).info()
         coord = (self.processes.get("coordinator") or ManagedProcess("coordinator", [], "")).info()
-        if not (infra["state"] == "RUNNING" and bridge["state"] == "RUNNING" and coord["state"] == "RUNNING"):
-            return False
-        if self.amrs:
-            return all(
-                self.processes[self.amr_process_name(a)].state == "RUNNING"
-                for a in self.amrs
-            )
-        return True
+        return (
+            infra["state"] == "RUNNING"
+            and bridge["state"] == "RUNNING"
+            and coord["state"] == "RUNNING"
+        )
 
     # ------------------------------------------------------------------
     # Status snapshot for the dashboard

@@ -138,6 +138,39 @@ def assign_charge_spot(layout, existing_spots: dict[str, dict], amr_id: str) -> 
     }
 
 
+def promote_standby_to_pads(layout, existing_spots: dict[str, dict]) -> dict[str, dict]:
+    """Upgrade standby robots to unowned charging pads, lowest free pad first.
+
+    ``existing_spots`` maps robot id -> homeBay. Every robot currently parked at
+    a standby slot is promoted to the lowest-index unowned pad (in stable robot
+    id order) so that all AMRs up to the pad count receive their own station.
+    Returns the subset of spots that changed (robot id -> new pad homeBay).
+    """
+    pads = layout.charging_pads() if hasattr(layout, "charging_pads") else []
+    assigned_pad_ids = {
+        spot["padId"] for spot in existing_spots.values()
+        if spot and spot.get("kind") == "pad" and spot.get("padId")
+    }
+    promotions: dict[str, dict] = {}
+    for rid, spot in sorted(existing_spots.items(), key=lambda kv: kv[0]):
+        if not (spot and spot.get("kind") == "standby"):
+            continue
+        for idx, pad in enumerate(pads):
+            if pad["id"] in assigned_pad_ids:
+                continue
+            spawn = pad["spawnPoint"]
+            promotions[rid] = {
+                "kind": "pad",
+                "slot": idx,
+                "padId": pad["id"],
+                "x": float(spawn["x"]),
+                "y": float(spawn["y"]),
+            }
+            assigned_pad_ids.add(pad["id"])
+            break
+    return promotions
+
+
 def roster_token(entry: dict) -> str:
     """Format an entry into an 8-field roster token string.
 

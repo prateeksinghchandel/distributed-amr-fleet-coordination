@@ -18,6 +18,7 @@ from fleet_manager.process_manager import (
     ProcessError,
     ProcessManager,
 )
+from common import topics
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,7 @@ async def test_start_amr(tmp_path):
 
     args = [c["args"] for c in spawn.calls if c["name"] == "amr:AMR1"][0]
     joined = " ".join(args)
-    assert args[0].endswith("python")
+    assert "python" in args[0].split("/")[-1]
     assert "robot/robot_node.py" in joined
     assert "--id AMR1" in joined
     assert "--url tcp/127.0.0.1:7447" in joined
@@ -327,14 +328,18 @@ async def test_remove_amr(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_remove_running_amr_refused(tmp_path):
+async def test_remove_running_amr_stops_then_removes(tmp_path):
+    """Removing a RUNNING AMR gracefully stops its process and deletes it."""
     pm, spawn = make_pm(tmp_path)
     await pm.start("amr:AMR1")
     await wait_for(lambda: pm.processes["amr:AMR1"].state == "RUNNING")
 
-    with pytest.raises(ProcessError):
-        await pm.remove_amr("AMR1")
-    assert "AMR1" in pm.amrs
+    result = await pm.remove_amr("AMR1")
+    assert result["ok"] is True
+    assert "AMR1" not in pm.amrs
+    assert "amr:AMR1" not in pm.processes
+    assert spawn.by_name["amr:AMR1"].terminated is True
+    assert pm.amr_store.get("AMR1") is None
 
 
 @pytest.mark.asyncio
@@ -478,3 +483,75 @@ async def test_readiness_reflects_stack(tmp_path):
 
     await pm.start_all()
     await wait_for(lambda: pm.status()["ready"] is True)
+
+
+@pytest.mark.asyncio
+async def test_readiness_ignores_amr_lifecycle_state(tmp_path):
+    """Stopping (or adding) an AMR must not flag the fleet unready — otherwise
+    the dashboard would unmount to the startup screen on every AMR change."""
+    pm, spawn = make_pm(tmp_path)
+    await pm.start_all()
+    await wait_for(lambda: pm.status()["ready"] is True)
+
+    await pm.stop("amr:AMR2")
+    await wait_for(lambda: pm.processes["amr:AMR2"].state == "STOPPED")
+    assert pm.status()["ready"] is True
+
+    await pm.create_amr("AMR9", 1, 1)
+    assert pm.status()["ready"] is True
+
+# ---------------------------------------------------------------------------
+# Dynamic roster update tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_publish_roster_update_calls_callback(tmp_path):
+    """publish_roster_update invokes publish_cb with the correct payload."""
+    pm, spawn = make_pm(tmp_path)
+    calls = []
+    pm.publish_cb = lambda topic, payload: calls.append((topic, payload))
+
+    await pm.create_amr("AMR_EXTRA", 1, 1)
+    pm.publish_roster_update()
+
+    assert len(calls) >= 1
+    assert any(c[0] == topics.CONTROL_ROSTER_UPDATE for c in calls)
+    roster_call = next(c for c in calls if c[0] == topics.CONTROL_ROSTER_UPDATE)
+    assert "roster" in roster_call[1]
+    assert any(r["id"] == "AMR_EXTRA" for r in roster_call[1]["roster"])
+
+
+@pytest.mark.asyncio
+async def test_create_amr_publishes_roster_update(tmp_path):
+    """create_amr publishes a roster update so the coordinator picks up the new AMR without restart."""
+    pm, spawn = make_pm(tmp_path)
+    pm.publish_cb = lambda topic, payload: None
+
+    await pm.create_amr("AMR_NEW", 1, 1)
+    assert "AMR_NEW" in pm.amrs
+    assert "AMR_NEW" in pm.charge_spots
+    assert "AMR_NEW" in " ".join(pm.processes["coordinator"].cmd)
+
+
+@pytest.mark.asyncio
+async def test_remove_amr_publishes_roster_update(tmp_path):
+    """remove_amr publishes a roster update so the coordinator drops the AMR without restart."""
+    pm, spawn = make_pm(tmp_path)
+    await pm.create_amr("AMR_TMP", 1, 1)
+    assert "AMR_TMP" in pm.amrs
+
+    await pm.remove_amr("AMR_TMP")
+    assert "AMR_TMP" not in pm.amrs
+    assert "AMR_TMP" not in pm.charge_spots
+    coord_cmd = " ".join(pm.processes["coordinator"].cmd)
+    assert "AMR_TMP" not in coord_cmd
+
+
+@pytest.mark.asyncio
+async def test_remove_amr_without_publish_cb_does_not_crash(tmp_path):
+    """remove_amr should not raise even if publish_cb is None."""
+    pm, spawn = make_pm(tmp_path)
+    pm.publish_cb = None
+    await pm.create_amr("AMR_TMP", 1, 1)
+    await pm.remove_amr("AMR_TMP")
+    assert "AMR_TMP" not in pm.amrs

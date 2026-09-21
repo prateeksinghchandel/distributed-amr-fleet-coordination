@@ -17,6 +17,7 @@ Options:
 from __future__ import annotations
 import argparse
 import json
+import math
 import sys
 import time
 import threading
@@ -172,6 +173,11 @@ class ServerNode:
                 new_roster.append(parse_roster_entry(item))
             elif isinstance(item, dict):
                 new_roster.append(item)
+        old_ids = {r["id"] for r in self.roster}
+        new_ids = {r["id"] for r in new_roster}
+        removed = old_ids - new_ids
+        for rid in removed:
+            self.tasks.cancel_tasks_for_robot(rid)
         self.roster = new_roster
         self._rebuild_charge_allocation()
         self._publish_world()
@@ -362,10 +368,32 @@ class ServerNode:
             self._publish_world()
             self._last_world = now
 
+    def _pad_centroid(self, pad: dict) -> tuple[float, float]:
+        sp = pad.get("spawnPoint")
+        if sp and isinstance(sp, dict) and "x" in sp and "y" in sp:
+            return (float(sp["x"]), float(sp["y"]))
+        w = float(pad.get("width", 0.0))
+        h = float(pad.get("height", 0.0))
+        return (float(pad.get("x", 0.0)) + w / 2.0, float(pad.get("y", 0.0)) + h / 2.0)
+
+    def _pad_occupied_by_robot(self, pad: dict) -> Optional[str]:
+        """Check telemetry fleet for a robot currently within PAD_OCCUPANCY of pad centre."""
+        c = self._pad_centroid(pad)
+        for r in self.telemetry.fleet.values():
+            if not r.get("online", True):
+                continue
+            rx = float(r.get("x", 0.0))
+            ry = float(r.get("y", 0.0))
+            if math.dist((rx, ry), c) <= 0.6:
+                return r.get("robotId")
+        return None
+
     def _publish_world(self) -> None:
         pads = self.layout.charging_pads()
         for pad in pads:
             pad["assignedRobotId"] = self._pad_owners.get(pad["id"])
+            occupant = self._pad_occupied_by_robot(pad)
+            pad["occupiedBy"] = occupant
         self.bus.publish(topics.WORLD_STATE, {
             "width": self.layout.width,
             "height": self.layout.height,
