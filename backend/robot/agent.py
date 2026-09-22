@@ -54,6 +54,7 @@ BATTERY_WEIGHT = 0.05
 # (robot/battery.py BATTERY_WARN_THRESHOLD) and must mirror FleetAgent.js.
 BATTERY_WARN = 20.0
 BATTERY_LOW_PENALTY = 30.0
+NAV_WAIT_PENALTY = 4.0  # robots in a wait/escalation state bid worse (cheaper to route around)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +348,15 @@ class FleetAgent:
                     _dist(peer_x, peer_y, dx, dy) < CONGESTION_RADIUS):
                 congestion += CONGESTION_COST
 
+        # Navigation-state penalty: a robot currently waiting at a chokepoint,
+        # stuck, or overriding motion is a poor choice for a new task.
+        nav_penalty = 0.0
+        nav_state = (robot.get("nav") or {}).get("state")
+        if nav_state in ("chokepoint_wait", "chokepoint_backup", "deadlock",
+                         "deadlock_backup", "hard_stop", "replanning"):
+            nav_penalty = NAV_WAIT_PENALTY
+        nav_penalty = round(nav_penalty * 100) / 100
+
         # Battery cost
         battery = robot.get("battery", 100.0)
         battery_cost = (100 - battery) * BATTERY_WEIGHT
@@ -355,7 +365,7 @@ class FleetAgent:
         battery_cost = round(battery_cost * 100) / 100
 
         workload = 0.0
-        total_bid = round((travel + congestion + battery_cost + workload) * 100) / 100
+        total_bid = round((travel + congestion + battery_cost + workload + nav_penalty) * 100) / 100
 
         return {
             "eligible": True,
@@ -366,6 +376,7 @@ class FleetAgent:
                 "congestion": congestion,
                 "battery": battery_cost,
                 "workload": workload,
+                "nav": nav_penalty,
             },
         }
 
@@ -602,4 +613,8 @@ class FleetAgent:
             "currentTaskId": robot.get("currentTaskId"),
             "blocked": robot.get("blocked", False),
             "online": robot.get("online", True),
+            "radius": robot.get("radius", 0.4),
+            "speed": robot.get("speed", 0.0),
+            "nav": robot.get("nav") or {},
+            "metrics": robot.get("metrics") or {},
         })
