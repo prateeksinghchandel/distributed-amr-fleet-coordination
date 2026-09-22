@@ -23,6 +23,7 @@ from robot.battery import (
 )
 from robot.planning.astar import AStarPlanner, PathNotFoundError
 from robot.planning.waypoint_follower import WaypointFollower
+from robot.navigation.pipeline import AlgorithmicNavPipeline
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +56,37 @@ class RobotState:
     yielded_pad: Optional[str] = None
     _action_timer: float = field(default=0.0, repr=False)
     _completed_timer: float = field(default=0.0, repr=False)
+    # Navigation pipeline fields (defaults keep construction compatible).
+    vx: float = 0.0
+    vy: float = 0.0
+    nav_state: Optional[str] = None
+    nav_reason: Optional[str] = None
+    reservation: Optional[dict] = None
+    task_priority: int = 1
+    map: Optional[object] = None
+    metrics: dict = field(default_factory=lambda: {
+        "distance": 0.0,
+        "idle_time": 0.0,
+        "waiting_time": 0.0,
+        "replan_count": 0,
+        "interventions": 0,
+        "safety_stops": 0,
+        "deadlocks": 0,
+        "recovery_time": 0.0,
+        "near_collisions": 0,
+        "collisions": 0,
+    })
 
     def to_dict(self) -> dict:
+        nav = {
+            "state": self.nav_state,
+            "reason": self.nav_reason,
+            "velocity": [self.vx, self.vy],
+            "speed": self.speed,
+            "reservation": self.reservation,
+            "waitingTime": self.metrics.get("waiting_time", 0.0),
+            "replanCount": self.metrics.get("replan_count", 0),
+        }
         return {
             "robotId": self.id,
             "x": self.x,
@@ -68,6 +98,9 @@ class RobotState:
             "blocked": self.blocked,
             "online": self.online,
             "ownPadId": self.own_pad_id,
+            "nav": nav,
+            "metrics": dict(self.metrics),
+            "radius": self.radius,
         }
 
 
@@ -124,6 +157,9 @@ class MotionController:
         self.resolution = resolution
         self.safety_margin = safety_margin
         self.follower = WaypointFollower(lookahead=0.6, arrival_threshold=ARRIVE_THRESHOLD)
+        self.pipeline = AlgorithmicNavPipeline(state, log, resolution, safety_margin)
+        self._clock = 0.0
+        self._contact_peers: set[str] = set()
 
     def plan_route(self, goal_x: float, goal_y: float, obstacles: Sequence[object] = (),
                    bounds: Optional[dict] = None) -> list[tuple[float, float]]:
@@ -142,16 +178,19 @@ class MotionController:
             return [(self.state.x, self.state.y), (goal_x, goal_y)]
 
     def assign_task(self, task_id: str, pickup: dict, dropoff: dict,
-                    obstacles: Sequence[object] = (), bounds: Optional[dict] = None) -> None:
+                    obstacles: Sequence[object] = (), bounds: Optional[dict] = None,
+                    *, priority: int = 1) -> None:
         s = self.state
         s.current_task_id = task_id
         s.pickup = pickup
         s.dropoff = dropoff
+        s.task_priority = int(priority or 1)
         s.status = RobotStatus.MOVING_TO_PICKUP
         s.blocked = False
         s._completed_timer = 0.0
         s.current_path = self.plan_route(pickup["x"], pickup["y"], obstacles, bounds)
         s.path_index = 0
+        self.pipeline.set_goal(pickup["x"], pickup["y"])
         self._log(f"{s.id} assigned task {task_id} — planned {len(s.current_path)} waypoints to pickup")
 
     def cancel_task(self) -> None:
@@ -170,6 +209,14 @@ class MotionController:
         s = self.state
         if not s.online:
             return
+        self._clock += max(0.0, dt)
+
+        # Physical-contact collision counter (edge-triggered per peer). Two
+        # robots count as colliding when their bodies actually overlap (distance
+        # < sum of radii), which the safety layer normally prevents before it
+        # happens — so this metric surfaces genuine guard failures (e.g. stale
+        # telemetry) rather than normal hard-stops.
+        self._count_collisions(fleet)
 
         # Completed dwell: hold COMPLETED for one telemetry window so the
         # coordinator and dashboards can observe the completion — the robot
@@ -287,7 +334,10 @@ class MotionController:
                         self._log(f"{s.id} returning to charging bay ({s.home_charge_bay[0]:.1f}, {s.home_charge_bay[1]:.1f})")
 
         if s.status == RobotStatus.CHARGING:
-            arrived = self._follow_path(dt)
+            # Transiting to the charger is real navigation: route it through
+            # the pipeline (avoidance / chokepoint reservations / safety) so a
+            # returning robot never drives through another mover. Only once it
+            # is parked on/near the pad do we switch to stationary charging.
             centre = None
             if s.charge_pad:
                 centre = _pad_centroid(s.charge_pad)
@@ -295,7 +345,14 @@ class MotionController:
                 centre = s.home_charge_bay
 
             if centre:
+                # Keep navigating through the pipeline until it reports arrival
+                # at the charging point (or we are already parked on it). The
+                # pipeline carries the robot to the exact bay instead of
+                # stopping at the incoming waypoint, while still honouring
+                # avoidance / chokepoints / safety all the way in.
                 dist_to_centre = math.dist((s.x, s.y), centre)
+                arrived = self._nav_moving(dt, obstacles, bounds, fleet,
+                                           {"x": centre[0], "y": centre[1]})
                 if arrived or dist_to_centre <= 0.35:
                     s.speed = 0.0
                     if dist_to_centre <= PAD_OCCUPANCY:
@@ -320,10 +377,11 @@ class MotionController:
             # Idle standby drain
             s.battery = max(0.0, s.battery - IDLE_DRAIN_PER_SEC * dt)
             s.speed = 0.0
+            s.metrics["idle_time"] += max(0.0, dt)
             return
 
         if s.status == RobotStatus.MOVING_TO_PICKUP:
-            arrived = self._follow_path(dt)
+            arrived = self._nav_moving(dt, obstacles, bounds, fleet, s.pickup)
             if arrived:
                 s.status = RobotStatus.PICKING
                 s._action_timer = PICK_DURATION
@@ -337,12 +395,13 @@ class MotionController:
             s.speed = 0.0
             if s._action_timer <= 0 and s.dropoff:
                 s.status = RobotStatus.MOVING_TO_DROPOFF
+                self.pipeline.set_goal(s.dropoff["x"], s.dropoff["y"])
                 s.current_path = self.plan_route(s.dropoff["x"], s.dropoff["y"], obstacles, bounds)
                 s.path_index = 0
                 self._log(f"{s.id} picked up — planned {len(s.current_path)} waypoints to dropoff")
 
         elif s.status == RobotStatus.MOVING_TO_DROPOFF:
-            arrived = self._follow_path(dt)
+            arrived = self._nav_moving(dt, obstacles, bounds, fleet, s.dropoff)
             if arrived:
                 s.status = RobotStatus.DROPPING
                 s._action_timer = DROP_DURATION
@@ -358,6 +417,45 @@ class MotionController:
                 s.status = RobotStatus.COMPLETED
                 s._completed_timer = COMPLETED_HOLD
                 self._log(f"{s.id} task {s.current_task_id} COMPLETED")
+
+    def _count_collisions(self, fleet: Sequence[dict]) -> None:
+        """Increment the collisions metric on each fresh physical contact.
+
+        A collision is scored once per (self, peer) pair while the bodies
+        overlap; the pair is forgotten as soon as they separate so successive
+        contacts are counted independently. Offline peers never count.
+        """
+        s = self.state
+        radius = s.radius
+        active: set[str] = set()
+        for p in fleet:
+            rid = p.get("robotId") or p.get("id")
+            if not rid or rid == s.id or not p.get("online", True):
+                continue
+            px = float(p.get("x", 0.0))
+            py = float(p.get("y", 0.0))
+            pr = float(p.get("radius", 0.4))
+            if math.dist((s.x, s.y), (px, py)) < radius + pr:
+                active.add(rid)
+        for rid in active - self._contact_peers:
+            s.metrics["collisions"] += 1
+        self._contact_peers = active
+
+    def _nav_moving(self, dt: float, obstacles: list[Rect], bounds: Optional[dict],
+                    fleet: Sequence[dict], goal: Optional[dict]) -> bool:
+        """Run a MOVING state through the algorithmic navigation pipeline."""
+        s = self.state
+        if goal is None:
+            return True
+        result = self.pipeline.step(
+            dt, obstacles, bounds, fleet, self._clock,
+            goal_override=(goal["x"], goal["y"]),
+        )
+        s.nav_state = result["navState"]
+        s.nav_reason = result["navReason"]
+        s.reservation = result["reservation"]
+        s.map = self.pipeline.chokepoint.map
+        return result["arrived"]
 
     def _follow_path(self, dt: float) -> bool:
         s = self.state

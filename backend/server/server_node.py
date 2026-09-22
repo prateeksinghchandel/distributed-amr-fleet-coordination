@@ -407,6 +407,7 @@ class ServerNode:
             "taskStats": self.tasks.task_stats(),
             "robotStats": self.tasks.robot_stats(),
             "metrics": self.tasks.metrics_dict(),
+            "navStats": self.telemetry.nav_summary(),
         })
         self.log.info(
             f"World state published ({self.layout.width}×{self.layout.height}, "

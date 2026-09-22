@@ -647,6 +647,7 @@ class TaskManager:
                 t.assigned_robot_id == rid and t.status in ACTIVE_STATUSES
                 for t in self.tasks
             )
+            nav = robot.get("nav") or {}
             out.append({
                 "robotId": rid,
                 "status": robot.get("status", "IDLE"),
@@ -655,6 +656,9 @@ class TaskManager:
                 "online": robot.get("online", True),
                 "ledgerBusy": busy_ledger,
                 "available": self.is_robot_available(rid),
+                "navState": nav.get("state"),
+                "navReason": nav.get("reason"),
+                "metrics": robot.get("metrics") or {},
             })
         return out
 
