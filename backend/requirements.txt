@@ -4,3 +4,5 @@ numpy>=1.26.0
 aiohttp>=3.9.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+gymnasium>=1.0.0
+torch>=2.0.0

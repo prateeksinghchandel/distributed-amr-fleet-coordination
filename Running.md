@@ -89,3 +89,63 @@ npm run test:sim
 
 - **Default (`SERVER_AUCTION`):** The coordinator runs the auction and publishes `tasks/assigned`.
 - **Peer-to-Peer (`P2P_AUCTION`):** Set `auctionMode` to `"P2P_AUCTION"` via the Fleet Control strip or coordinator configuration. In P2P mode, robots bid directly among themselves, the winner self-commits on `auction/commit`, and the coordinator acts as a passive audit ledger.
+
+---
+
+## 7. RL Training Environment (Visual UI + Headless)
+
+The reinforcement-learning training stack runs standalone from the fleet (live AMR control remains fully algorithmic). Python holds all state; the dashboard is a viewer/controller.
+
+### 7a. Visual Training UI (2 Terminals)
+
+**Terminal 1: RL server**
+```bash
+cd dashboard
+npm run rl-server
+```
+Serves the training API + WebSocket on `http://127.0.0.1:8370`. While training, the policy auto-saves to `autosave.pt` every 5000 sim steps (`--save-every`).
+
+**Terminal 2: Web dashboard**
+```bash
+cd dashboard
+npm run dev
+```
+Open [http://localhost:5173](http://localhost:5173) and click **RL TRAINING** (header) to open the training studio — no fleet needed. The UI proxies `/rl/*` to the server.
+
+In the studio:
+- **TrainingControls:** START / PAUSE / RESUME, STEP n, STEP EPISODE, RESET EPISODE, RESET TRAINING (wipes weights — careful), and speed 0.25x–MAX.
+- **Scenario:** switch presets or curriculum levels 1–8. Weights persist across switches; only the rollout buffer resets, and auto-save continues.
+- **Checkpoints:** manual SAVE / LOAD / DELETE (names never overwrite, `_1` suffix on collision); the rolling `autosave.pt` file and its status update automatically.
+- **Evaluation:** run RL or algorithmic baseline seeds side-by-side.
+
+**RL server options** (`python -m rl --help`):
+```bash
+python -m rl --scenario dense_traffic --level 8 --n-envs 24 --safety guard \
+             --save-every 5000 --checkpoint-dir ./rl/checkpoints
+```
+- `--save-every N` — autosave `autosave.pt` every N sim steps while training (`0` disables; default 5000).
+- `--checkpoint-dir` — where `.pt` files go (default `backend/rl/checkpoints/`).
+- `--level N` / `--scenario NAME` — pick the starting curriculum level or named preset; `--seed`, `--device`.
+
+### 7b. Headless Training (fast, no UI)
+
+```bash
+cd dashboard
+npm run rl-server:headless        # dense_traffic + curriculum 8, 24 envs, 60k steps
+npm run rl:headless
+```
+Or directly:
+```bash
+cd backend
+python -m rl.headless --scenario dense_traffic --steps 20000 --n-envs 8 --save-every 5000
+```
+Headless saves `autosave.pt` periodically plus a final `headless-<scenario>.pt`.
+
+### 7c. Checkpoints & Tests
+
+- Model files live in `backend/rl/checkpoints/` by default. Every save/load/delete is a trainer command issued from the Checkpoints panel.
+- Backend RL tests (including autosave):
+```bash
+cd backend
+../.venv/bin/python -m pytest tests/rl/ -q
+```

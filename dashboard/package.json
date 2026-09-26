@@ -17,7 +17,10 @@
     "fleet": "bash scripts/start-fleet.sh",
     "fleet:stop": "bash scripts/start-fleet.sh --stop",
     "setup:zenoh": "node scripts/download-zenoh.mjs",
-    "fleet-manager": "node scripts/run-fleet-manager.mjs"
+    "fleet-manager": "node scripts/run-fleet-manager.mjs",
+    "rl-server": "node scripts/run-rl-server.mjs",
+    "rl-server:headless": "node scripts/run-rl-server.mjs --scenario dense_traffic --level 8 --n-envs 24",
+    "rl:headless": "node scripts/run-rl-server.mjs headless --scenario dense_traffic --level 8 --steps 60000 --n-envs 24 --save-every 5000"
   },
   "dependencies": {
     "@eclipse-zenoh/zenoh-ts": "^1.10.1",

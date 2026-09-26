@@ -5,7 +5,7 @@ import { useFleetManager } from '../hooks/useFleetManager.js';
 import ModeSelector from './ModeSelector.jsx';
 import FleetConfigEditor from './settings/FleetConfigEditor.jsx';
 
-export default function StartupScreen({ fleet, mode, onModeChange }) {
+export default function StartupScreen({ fleet, mode, onModeChange, onOpenRl }) {
     const { palette: P } = useTheme();
     const S = ui(P);
     const { status, error, managerAvailable, command, busy, lastCommandError } = useFleetManager();
@@ -129,8 +129,15 @@ export default function StartupScreen({ fleet, mode, onModeChange }) {
                     <FleetConfigEditor compact />
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'center', marginTop: 20 }}>
+                <div style={{ display: 'flex', justifyContent: 'center', marginTop: 20, flexDirection: 'column', gap: 6, alignItems: 'center' }}>
                     <ModeSelector mode={mode} onModeChange={onModeChange} />
+                    <button
+                        style={{ ...S.button(), fontSize: 11 }}
+                        onClick={onOpenRl}
+                        title="Independent visual RL training studio (works without the fleet stack)"
+                    >
+                        ⚙ RL TRAINING STUDIO
+                    </button>
                 </div>
             </div>
         </div>

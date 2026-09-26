@@ -12,7 +12,7 @@ const CONN_LABEL = {
     [CONNECTION_STATUS.DISCONNECTED]: { color: (P) => P.textDim, label: 'DISCONNECTED' },
 };
 
-export default function Header({ fleet, mode, onModeChange, onOpenSettings, onOpenInfrastructure }) {
+export default function Header({ fleet, mode, onModeChange, onOpenSettings, onOpenInfrastructure, onOpenRl }) {
     const { palette: P } = useTheme();
     const S = ui(P);
     const { busy, command, managerAvailable, lastCommandError: fmLastError } = useFleetManager();
@@ -140,6 +140,9 @@ export default function Header({ fleet, mode, onModeChange, onOpenSettings, onOp
             {!fleet.isConnected && (
                 <button style={S.button()} onClick={() => fleet.retryConnection()}>Reconnect</button>
             )}
+            <button style={S.button()} title="Visual RL training environment (collision-avoidance policy)" onClick={onOpenRl}>
+                RL TRAINING
+            </button>
             <button style={S.button()} title="Infrastructure processes & logs" onClick={onOpenInfrastructure}>
                 INFRA
             </button>

@@ -34,6 +34,14 @@ export default defineConfig({
         // Proxy Fleet Manager API (/api/* -> local Fleet Manager HTTP service)
         proxy: {
             '/api': 'http://127.0.0.1:8270',
+            // RL training backend (/rl/* -> aiohttp server). ws:true is
+            // required so the WebSocket event stream (see useRlConnection)
+            // is upgraded by the dev proxy too.
+            '/rl': {
+                target: 'http://127.0.0.1:8370',
+                changeOrigin: true,
+                ws: true,
+            },
         },
     },
 })
