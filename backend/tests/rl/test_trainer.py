@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 
 from rl.scenarios import scenario_config
@@ -101,7 +102,7 @@ def test_reset_episode_rebuilds_env(trainer) -> None:
     trainer.pause()
     s0 = trainer.total_steps
     env0 = trainer.vec_env.envs[0]
-    env0.rl_agents[0].state.x += 0.5  # diverge from a fresh reset
+    env0.rl_agents[0].state.x += 50.0  # far diverge from any fresh spawn point
     trainer.reset_episode()
     env1 = trainer.vec_env.envs[0]
     assert env1 is not env0
@@ -257,6 +258,28 @@ def test_metrics_brief_shape(trainer) -> None:
     for key in ("avg_reward", "avg_length", "success_rate", "collision_rate",
                 "avg_time", "avg_distance", "components"):
         assert key in m, key
+
+
+def test_multi_rl_agents_train(tmp_path) -> None:
+    """Three RL agents in one scene all learn through the shared policy."""
+    cfg = scenario_config("dense_traffic")
+    cfg.update({"n_robots": 3, "n_rl": 3, "max_steps": 200})
+    t = RLTrainer(cfg, n_envs=2, rollout_steps=48, minibatch=8,
+                  update_epochs=1, seed=1, speed=1.0,
+                  checkpoint_dir=str(tmp_path / "ck"))
+    try:
+        t._ensure_env()
+        scene = t.vec_env.envs[0].last_info["scene"]
+        assert scene["n_robots"] == 3
+        assert scene["n_rl"] == 3
+        t._collect_steps(40)
+        assert t.total_steps == 80          # n_envs=2 sim steps/iter
+        assert t.vec_env.step is not None
+        assert t.agent.updates >= 1         # rollout trained despite 3 agents
+        reward = t.vec_env.envs[0].last_info["reward"]
+        assert np.asarray(reward).ndim == 1 and len(reward) == 3
+    finally:
+        t.shutdown()
 
 
 def test_error_state_is_observable(trainer) -> None:

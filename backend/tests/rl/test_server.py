@@ -195,3 +195,57 @@ def report_until(predicate, timeout=6.0, interval=0.03) -> bool:
             return True
         time.sleep(interval)
     return predicate()
+
+
+@pytest.mark.asyncio
+async def test_league_status_and_commands(tmp_path) -> None:
+    from rl.league import LeagueTrainer
+
+    trainer = RLTrainer(small_cfg(), n_envs=2, rollout_steps=32, minibatch=8,
+                        update_epochs=2, seed=1, speed=0.0,
+                        checkpoint_dir=str(tmp_path / "ck"))
+    league = LeagueTrainer(trainer, pool_size=2)
+    app = build_app(trainer, league=league)
+    tc = TestClient(TestServer(app))
+    await tc.start_server()
+    try:
+        resp = await tc.get("/rl/status")
+        body = await resp.json()
+        assert body["league"]["generations"] == 0
+        assert body["league"]["pool"] == []
+
+        resp = await tc.post("/rl/command", json={"command": "league_start",
+                                                  "args": {"pool_every": 150,
+                                                           "vs_pool_episodes": 1,
+                                                           "report_every": 999}})
+        body = await resp.json()
+        assert body["ok"] is True
+        assert body["result"]["running"] is True
+        assert league.generations >= 1          # baseline member promoted
+
+        assert report_until(lambda: trainer.total_steps > 0, timeout=40)
+        assert report_until(lambda: league.generations >= 3, timeout=40)
+
+        resp = await tc.post("/rl/command", json={"command": "league_promote"})
+        assert (await resp.json())["ok"] is True
+
+        resp = await tc.post("/rl/command",
+                             json={"command": "league_vs_pool",
+                                   "args": {"episodes": 1}})
+        vs = (await resp.json())
+        assert vs["ok"] is True
+        assert vs["result"]["summary"]["opponents"] == len(league.pool)
+
+        resp = await tc.get("/rl/status")
+        body = await resp.json()
+        assert body["league"]["pool"], "pool must be populated"
+        assert body["league"]["history"], "vs-pool history must be recorded"
+        assert body["league"]["running"] is True
+
+        resp = await tc.post("/rl/command", json={"command": "league_stop"})
+        assert (await resp.json())["ok"] is True
+        assert league.running is False
+    finally:
+        await tc.close()
+        league.stop()
+        trainer.shutdown()

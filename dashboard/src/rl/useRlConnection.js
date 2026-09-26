@@ -17,6 +17,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 const API_BASE = '/rl';
 
+const leagueCommands = new Set([
+    'league_start', 'league_stop', 'league_promote', 'league_vs_pool',
+]);
+
 const wsUrl = () => {
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     return `${proto}://${window.location.host}${API_BASE}/ws`;
@@ -58,6 +62,9 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
     const [scenarios, setScenarios] = useState(null);
     const [lastAck, setLastAck] = useState(null);
     const [busy, setBusy] = useState(false);
+    const [league, setLeague] = useState(null);
+    const [leagueHistory, setLeagueHistory] = useState([]);
+    const [launcher, setLauncher] = useState(null); // {alive, pid, logTail, args} | null
 
     const wsRef = useRef(null);
     const aliveRef = useRef(true);
@@ -109,6 +116,49 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
         await Promise.all([refreshScenarios(), refreshCheckpoints(), refreshStatus()]);
     }, [refreshScenarios, refreshCheckpoints, refreshStatus]);
 
+    // The launcher middleware lives under /_studio/* on the Vite dev/preview
+    // server (NOT the /rl proxy that forwards to the Python server).
+    const launcherFetch = useCallback(async (path, options) => {
+        const res = await fetch(path, options);
+        let body = null;
+        try {
+            body = await res.json();
+        } catch {
+            body = null;
+        }
+        if (!res.ok) {
+            throw new Error((body && body.error) ||
+                `launcher request failed (${res.status})`);
+        }
+        return body;
+    }, []);
+
+    const refreshLauncher = useCallback(async () => {
+        try {
+            setLauncher(await launcherFetch('/_studio/rl-launcher'));
+        } catch { /* dev server launched without the launcher plugin */ }
+    }, [launcherFetch]);
+
+    const launchServer = useCallback(async (args = {}) => {
+        const body = await launcherFetch('/_studio/rl-launch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(args),
+        });
+        setLauncher((prev) => ({ ...prev, ...body, args }));
+        return body;
+    }, [launcherFetch]);
+
+    const stopServer = useCallback(async () => {
+        const body = await launcherFetch('/_studio/rl-stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+        });
+        setLauncher((prev) => ({ ...prev, ...body }));
+        return body;
+    }, [launcherFetch]);
+
     useEffect(() => {
         let cancelled = false;
         const connect = () => {
@@ -126,6 +176,7 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
                 retryRef.current = 0;
                 setConnected(true);
                 refreshAll();
+                refreshLauncher();
                 setPollTimer();
             };
 
@@ -191,6 +242,12 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
                 case 'checkpoint':
                     refreshCheckpoints();
                     break;
+                case 'league':
+                    setLeague(msg);
+                    if (msg.event === 'vs_pool') {
+                        setLeagueHistory((prev) => pushCap(prev, msg, 50));
+                    }
+                    break;
                 case 'log':
                     setLogs((prev) => pushCap(prev, msg, 300));
                     break;
@@ -211,7 +268,7 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
             cancelled = true;
             if (pollTimerRef.current) clearInterval(pollTimerRef.current);
         };
-    }, [refreshAll, refreshStatus, refreshCheckpoints, pollIntervalMs]);
+    }, [refreshAll, refreshStatus, refreshCheckpoints, refreshLauncher, pollIntervalMs]);
 
     const send = useCallback(async (command, args = {}) => {
         setBusy(true);
@@ -226,6 +283,9 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
             refreshStatus({ snapshot: true });
             if (body.ok && ['save_checkpoint', 'delete_checkpoint', 'load_checkpoint'].includes(command)) {
                 refreshCheckpoints();
+            }
+            if (body.ok && command in leagueCommands) {
+                setLeague(body.result || null);
             }
             return body;
         } catch (err) {
@@ -250,10 +310,16 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
         logs,
         checkpoints,
         scenarios,
+        league,
+        leagueHistory,
         lastAck,
         busy,
         error,
         clearError,
+        launcher,
+        launchServer,
+        stopServer,
+        refreshLauncher,
         send,
         refreshStatus,
         refreshCheckpoints,
@@ -261,6 +327,8 @@ export function useRlConnection({ pollIntervalMs = 3000 } = {}) {
     }), [
         connected, status, metrics, snapshot, lastStep, episodes, updates,
         evaluations, logs, checkpoints, scenarios, lastAck, busy, error,
-        clearError, send, refreshStatus, refreshCheckpoints, refreshScenarios,
+        league, leagueHistory, launcher,
+        clearError, send, launchServer, stopServer, refreshLauncher,
+        refreshStatus, refreshCheckpoints, refreshScenarios,
     ]);
 }

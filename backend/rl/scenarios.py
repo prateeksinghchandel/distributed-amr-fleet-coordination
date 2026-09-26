@@ -82,6 +82,8 @@ def _clamp_scenario(cfg: dict) -> dict:
     cfg["height"] = float(np.clip(float(cfg.get("height", 20.0)), 12.0, MAX_SIZE))
     cfg["n_robots"] = int(np.clip(int(cfg.get("n_robots", 1)), 1, MAX_ROBOTS))
     cfg["n_rl"] = int(np.clip(int(cfg.get("n_rl", 1)), 1, cfg["n_robots"]))
+    cfg["n_opponents"] = int(np.clip(int(cfg.get("n_opponents", 0)), 0,
+                                     max(0, cfg["n_robots"] - cfg["n_rl"])))
     cfg["obstacle_density"] = float(
         np.clip(float(cfg.get("obstacle_density", 0.05)), 0.0, MAX_DENSITY)
     )
@@ -214,6 +216,55 @@ def curriculum_config(level: int, overrides: Optional[dict] = None) -> dict:
     if overrides:
         base = {**base, **overrides}
     return _clamp_scenario(base)
+
+
+def resolve_scenario(scenario: Optional[str], level: Optional[int],
+                     overrides: Optional[dict] = None) -> tuple[dict, str]:
+    """Unify scenario/level precedence across CLI, server and trainer.
+
+    Rule (the least surprising choice, applied everywhere): when both a named
+    scenario and a curriculum ``level`` are provided, the level explicitly
+    wins and the caller is told so via the returned note. Returns
+    ``(config, note)``.
+    """
+    overrides = overrides or {}
+    if level is not None:
+        cfg = curriculum_config(int(level), overrides)
+        note = f"curriculum level {cfg['difficulty']} ('{cfg['name']}')"
+        if scenario:
+            note += (f" overrides scenario '{scenario}' "
+                     "(both provided; level wins)")
+        return cfg, note
+    if scenario is not None:
+        cfg = scenario_config(scenario, overrides)
+        return cfg, f"scenario '{cfg['name']}'"
+    cfg = scenario_config("obstacle_avoidance", overrides)
+    return cfg, "default scenario 'obstacle_avoidance'"
+
+
+class SceneSeedGen:
+    """Deterministic, effectively non-repeating stream of scene seeds.
+
+    The trainer owns one generator for its whole lifetime and shares it with
+    every ``VectorEnv`` it builds, so re-building the vectorised environments
+    (scenario switch, reset_episode, league promotion, opponent swap) continues
+    the same campaign sequence instead of restarting the RNG and replaying
+    scenes. The same master ``seed`` + configuration therefore reproduces the
+    same scene campaign; consecutive draws are distinct (MT19937 does not
+    repeat a 31-bit value within any realistic campaign length). Evaluation
+    bypasses this stream entirely because it passes fixed explicit seeds.
+    """
+
+    def __init__(self, master_seed: int = 0):
+        self._rng = np.random.RandomState(int(master_seed))
+        self.draws = 0
+
+    def next(self) -> int:
+        self.draws += 1
+        return int(self._rng.randint(0, 2 ** 31 - 1))
+
+    def take(self, n: int) -> list[int]:
+        return [self.next() for _ in range(n)]
 
 
 # ---------------------------------------------------------------------------

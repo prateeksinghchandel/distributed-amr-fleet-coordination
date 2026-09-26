@@ -25,7 +25,7 @@ function loadMode() {
     return 'NORMAL';
 }
 
-export default function Dashboard({ onOpenRl }) {
+export default function Dashboard({ onOpenRl, onOpenSelfplay }) {
     const { palette: P } = useTheme();
     const { status, managerAvailable } = useFleetManager();
     const [, setTick] = useState(0);
@@ -63,7 +63,7 @@ export default function Dashboard({ onOpenRl }) {
     const fleetRunning = Boolean(status && status.ready && managerAvailable);
 
     if (!fleetRunning) {
-        return <StartupScreen fleet={fleet} mode={mode} onModeChange={handleModeChange} onOpenRl={onOpenRl} />;
+        return <StartupScreen fleet={fleet} mode={mode} onModeChange={handleModeChange} onOpenRl={onOpenRl} onOpenSelfplay={onOpenSelfplay} />;
     }
 
     const openSettings = (tab = 'GENERAL') => {
@@ -92,6 +92,7 @@ export default function Dashboard({ onOpenRl }) {
                 onOpenSettings={() => openSettings()}
                 onOpenInfrastructure={() => openSettings('INFRASTRUCTURE')}
                 onOpenRl={onOpenRl}
+                onOpenSelfplay={onOpenSelfplay}
             />
 
             <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>

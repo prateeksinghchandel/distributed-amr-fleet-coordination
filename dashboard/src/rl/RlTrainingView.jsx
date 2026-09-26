@@ -10,6 +10,7 @@ import ChartsPanel from './panels/ChartsPanel.jsx';
 import DebugPanel from './panels/DebugPanel.jsx';
 import EvaluationPanel from './panels/EvaluationPanel.jsx';
 import CheckpointPanel from './panels/CheckpointPanel.jsx';
+import SelfplayPanel from './panels/SelfplayPanel.jsx';
 import LogPanel from './panels/LogPanel.jsx';
 
 const BOTTOM_TABS = [
@@ -17,13 +18,14 @@ const BOTTOM_TABS = [
     ['debug', 'Agent Debug'],
     ['evaluation', 'Evaluation'],
     ['checkpoints', 'Checkpoints'],
+    ['selfplay', 'Self-Play'],
     ['logs', 'Log'],
 ];
 
-export default function RlTrainingView({ rl, onBack }) {
+export default function RlTrainingView({ rl, onBack, initialTab }) {
     const { palette: P } = useTheme();
     const S = ui(P);
-    const [tab, setTab] = useState('charts');
+    const [tab, setTab] = useState(initialTab || 'charts');
     const [showLidar, setShowLidar] = useState(true);
 
     const status = rl.status || {};
@@ -182,6 +184,7 @@ export default function RlTrainingView({ rl, onBack }) {
                             {tab === 'debug' && <DebugPanel rl={rl} />}
                             {tab === 'evaluation' && <EvaluationPanel rl={rl} />}
                             {tab === 'checkpoints' && <CheckpointPanel rl={rl} />}
+                            {tab === 'selfplay' && <SelfplayPanel rl={rl} />}
                             {tab === 'logs' && <LogPanel rl={rl} />}
                         </div>
                     </div>

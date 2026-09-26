@@ -168,9 +168,10 @@ class _Agent:
     """Runtime bookkeeping for one robot in the environment."""
 
     __slots__ = ("state", "rl", "pipeline", "safety_guard", "path", "path_idx",
-                 "goal", "reached", "collided", "prev_goal_dist", "prev_steer",
+                 "goal", "reached", "collided", "done", "metrics",
+                 "prev_goal_dist", "prev_steer",
                  "stuck_steps", "last_obs", "last_action", "last_override",
-                 "trajectory", "oscillations")
+                 "trajectory", "oscillations", "policy")
 
     def __init__(self, spec, rl: bool):
         self.state = RobotState(
@@ -178,6 +179,7 @@ class _Agent:
             max_speed=spec.max_speed, radius=spec.radius,
         )
         self.rl = rl
+        self.policy = None
         self.pipeline = None if rl else AlgorithmicNavPipeline(
             self.state, lambda _m: None, resolution=0.25, safety_margin=0.1)
         self.safety_guard = AlgorithmicSafetyController(self.state, lambda _m: None)
@@ -186,6 +188,11 @@ class _Agent:
         self.goal = tuple(spec.goal)
         self.reached = False
         self.collided = False
+        self.done = False  # True once the terminal reward has been issued
+        self.metrics = {
+            "distance": 0.0, "waiting_time": 0.0, "path_deviation": 0.0,
+            "safety_overrides": 0, "oscillations": 0, "stuck_steps": 0,
+        }
         self.prev_goal_dist = math.hypot(self.goal[0] - spec.x, self.goal[1] - spec.y)
         self.prev_steer = 0.0
         self.stuck_steps = 0
@@ -203,13 +210,15 @@ class AMRCollisionEnv(gym.Env):
     reward_range = (float("-inf"), float("inf"))
 
     def __init__(self, scenario: Optional[dict] = None, *, seed: Optional[int] = None,
-                 dt: float = DT, safety: str = "guard"):
+                 dt: float = DT, safety: str = "guard",
+                 opponents: Optional[list] = None):
         super().__init__()
         from rl.scenarios import _clamp_scenario
         self.cfg = _clamp_scenario(scenario or {})
         self.seed_initial = int(seed) if seed is not None else 0
         self.dt = dt
         self.safety_mode = safety          # 'off' | 'guard' (peers) | 'strict'
+        self._opponents = list(opponents or [])  # frozen former-champ policies
         self._episode = 0
         self._rng = np.random.RandomState(self.seed_initial)
         self._time = 0.0
@@ -256,6 +265,12 @@ class AMRCollisionEnv(gym.Env):
                 ag.state.current_path = list(ag.path)
                 ag.state.path_index = 0
 
+        n_opponents = int(self.cfg.get("n_opponents", 0))
+        if n_opponents > 0 and self._opponents:
+            peers = [ag for ag in self.agents if not ag.rl]
+            for idx, ag in enumerate(peers[:n_opponents]):
+                ag.policy = self._opponents[idx % len(self._opponents)]
+
         self.rl_agents = [ag for ag in self.agents if ag.rl]
         self._episode += 1
         self._time = 0.0
@@ -288,11 +303,20 @@ class AMRCollisionEnv(gym.Env):
 
         # ---- 2. Apply RL actions with safety validation.
         for i, ag in enumerate(self.rl_agents):
+            if ag.collided or ag.reached:
+                continue  # finished robots stay parked for the rest of the scene
             self._apply_rl_action(ag, fleet, action[i])
 
         # ---- 3. Step algorithmic robots through the shared pipeline.
         for ag in self.agents:
             if ag.rl or ag.reached or ag.collided or not ag.state.online:
+                continue
+            if ag.policy is not None:
+                # Frozen opponent: act on its own full observation (same feed
+                # a learner sees) and drive it through the RL motion model so
+                # collisions, trajectories and safety all behave identically.
+                self._apply_rl_action(ag, fleet,
+                                      ag.policy.play_action(self._obs_for(ag)))
                 continue
             # Re-path if the stored scene path is empty (defensive).
             if ag.state.current_path and ag.path_idx >= len(ag.state.current_path) - 1:
@@ -304,22 +328,43 @@ class AMRCollisionEnv(gym.Env):
         # ---- 4. Resolve contacts / goal arrivals & collect observations.
         self._update_episode_status()
         self._count_near_collisions()
+        self._step_metrics()
         self._time += self.dt
         self.step_count += 1
 
         obs = self._collect_obs()
         rewards = np.zeros(len(self.rl_agents), dtype=np.float32)
         comps: dict[str, list] = {}
-        terminated = False
-        truncated = False
+        agent_terms: list[bool] = []
+        agent_truncs: list[bool] = []
 
         for i, ag in enumerate(self.rl_agents):
             r, rcomps, term, trunc = self._reward_for(ag, i)
             rewards[i] = r
+            agent_terms.append(bool(term))
+            agent_truncs.append(bool(trunc))
             for k, v in rcomps.items():
                 comps.setdefault(k, []).append(v)
-            terminated = terminated or term
-            truncated = truncated or trunc
+
+        timeout = self.step_count >= self.max_steps
+        if timeout:
+            agent_truncs = [True] * len(self.rl_agents)
+
+        # Termination semantics, made explicit:
+        #   * single-RL scenes behave exactly as before — the one learner's
+        #     termination/truncation ends the episode;
+        #   * multi-RL scenes share one scene: each RL agent terminates on its
+        #     own (goal / collision / its own stuck-truncation) and keeps
+        #     ``agent_terminated``/``agent_truncated`` flags, but the episode
+        #     only ends when EVERY RL agent has terminated (or the scene hits
+        #     its time limit). One agent finishing never truncates the other
+        #     agents' rollout chains.
+        if len(self.rl_agents) == 1:
+            terminated = agent_terms[0]
+            truncated = agent_truncs[0]
+        else:
+            terminated = all(agent_terms)
+            truncated = bool(timeout)
 
         if len(self.rl_agents) == 1:
             reward = float(rewards[0])
@@ -328,17 +373,12 @@ class AMRCollisionEnv(gym.Env):
             reward = rewards
             rcomps_single = comps
 
-        # Episode end conditions.
-        if self.step_count >= self.max_steps:
-            truncated = True
-        all_done = all(a.reached or a.collided for a in self.rl_agents)
-        if len(self.rl_agents) > 1 and all_done and not terminated:
-            pass
-
         info = {
             "step": self.step_count,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
+            "agent_terminated": agent_terms,
+            "agent_truncated": agent_truncs,
             "reward": reward,
             "reward_components": rcomps_single,
             "agents": self._agents_report(),
@@ -559,14 +599,19 @@ class AMRCollisionEnv(gym.Env):
         terminated = False
         truncated = False
 
-        if ag.collided:
-            comps["collision"] = (REWARD_COLLISION_ROBOT if ag.state.blocked
-                                  else REWARD_COLLISION_OBSTACLE)
-            terminated = True
-            total = sum(comps.values())
-            return total, comps, terminated, truncated
-
-        if ag.reached:
+        # Terminal reward fires exactly once, then the agent is parked: a
+        # finished robot yields zero reward (never a repeat +50/-40) but stays
+        # "terminated" so its GAE chain is closed and no bootstrap continues.
+        if ag.reached or ag.collided:
+            if ag.done:
+                return 0.0, comps, True, False
+            ag.done = True
+            if ag.collided:
+                comps["collision"] = (REWARD_COLLISION_ROBOT if ag.state.blocked
+                                      else REWARD_COLLISION_OBSTACLE)
+                terminated = True
+                total = sum(comps.values())
+                return total, comps, terminated, truncated
             comps["goal"] = REWARD_GOAL
             terminated = True
             total = sum(comps.values())
@@ -655,7 +700,27 @@ class AMRCollisionEnv(gym.Env):
             ag.prev_steer = 0.0
             ag.trajectory = [(ag.state.x, ag.state.y)]
             ag.last_override = {"overridden": False, "reason": None, "guard": "none"}
+            ag.done = False
+            ag.metrics = {
+                "distance": 0.0, "waiting_time": 0.0, "path_deviation": 0.0,
+                "safety_overrides": 0, "oscillations": 0, "stuck_steps": 0,
+            }
         self.episode_near_collisions = 0
+
+    def _step_metrics(self) -> None:
+        """Accumulate per-agent run metrics used by evaluation/reporting."""
+        for ag in self.agents:
+            s = ag.state
+            ag.metrics["distance"] += float(s.speed) * self.dt
+            ag.metrics["oscillations"] = ag.oscillations
+            ag.metrics["stuck_steps"] = ag.stuck_steps
+            if ag.last_override.get("overridden"):
+                ag.metrics["safety_overrides"] += 1
+            if ag.rl and s.speed < 0.08 and \
+                    math.hypot(ag.goal[0] - s.x, ag.goal[1] - s.y) > 0.8:
+                ag.metrics["waiting_time"] += self.dt
+            dev = _dist_to_segments(s.x, s.y, ag.path)
+            ag.metrics["path_deviation"] += float(min(dev, 4.0)) * self.dt
 
     def _count_near_collisions(self) -> None:
         """Count RL-agents near misses (close approach without contact)."""
@@ -716,6 +781,8 @@ class AMRCollisionEnv(gym.Env):
                 "radius": s.radius,
                 "reached": ag.reached,
                 "collided": ag.collided,
+                "done": bool(ag.done),
+                "metrics": dict(ag.metrics),
                 "goal": {"x": ag.goal[0], "y": ag.goal[1]},
                 "goal_dist": math.hypot(ag.goal[0] - s.x, ag.goal[1] - s.y),
                 "path": [[float(px), float(py)] for px, py in ag.path],

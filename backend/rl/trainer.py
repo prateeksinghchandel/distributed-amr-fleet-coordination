@@ -28,9 +28,10 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 
 from rl.env import ACTION_DIM, AMRCollisionEnv, DT, OBS_DIM
-from rl.rl_policy import PPOAgent, RolloutBuffer, VectorEnv
-from rl.scenarios import (CURRICULUM, SCENARIO_PRESETS, _clamp_scenario,
-                          evaluate_algorithmic, scenario_config,
+from rl.rl_policy import PPOAgent, PPOConfig, RolloutBuffer, VectorEnv
+from rl.scenarios import (CURRICULUM, SCENARIO_PRESETS, SceneSeedGen,
+                          _clamp_scenario, evaluate_algorithmic,
+                          resolve_scenario, scenario_config,
                           curriculum_config)
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
@@ -57,17 +58,20 @@ class RLTrainer:
                  gamma: float = 0.99, lam: float = 0.95, clip: float = 0.2,
                  ent_coef: float = 0.01, val_coef: float = 0.5,
                  update_epochs: int = 4, minibatch: int = 64,
+                 hidden: int = 128,
                  device: Optional[str] = None, speed: float = 1.0,
                  fast_snapshot_interval: int = 40,
                  checkpoint_dir: Path | str = CHECKPOINT_DIR,
                  autosave_every: int = 0,
-                 eval_seeds: Sequence[int] = (42, 43, 44, 45, 46)):
+                 eval_seeds: Sequence[int] = (42, 43, 44, 45, 46),
+                 opponents: Optional[Sequence] = None):
         self._lock = threading.RLock()
         self._state = TrainerState.IDLE
         self._state_detail = ""
         self._error: Optional[str] = None
         self._commands: queue.Queue = queue.Queue()
         self._wake = threading.Event()
+        self._settled = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -75,6 +79,9 @@ class RLTrainer:
         self.seed = int(seed)
         self.n_envs = int(n_envs)
         self.safety = safety
+        # ``rollout_steps`` means environment transitions collected per
+        # environment (not per agent row): the PPO update cadence is therefore
+        # independent of n_envs and n_rl.
         self.rollout_steps = int(rollout_steps)
         self.fast_snapshot_interval = int(fast_snapshot_interval)
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -83,20 +90,27 @@ class RLTrainer:
         self.autosave_every = max(0, int(autosave_every))
         self._last_autosave_steps = 0
         self.last_autosave = None
+        self.last_checkpoint = None
+        self.opponents = list(opponents or [])
 
         self.speed = float(speed)
         self.speed_steps_per_sec = 10.0   # sim steps per wall second at 1x
         self._last_chunk_time = 0.0
 
+        self.ppo = PPOConfig(lr=lr, gamma=gamma, lam=lam, clip=clip,
+                             ent_coef=ent_coef, val_coef=val_coef,
+                             update_epochs=update_epochs, minibatch=minibatch,
+                             hidden=hidden).validate()
         if device is None:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.agent = PPOAgent(OBS_DIM, ACTION_DIM, lr=lr, gamma=gamma, lam=lam,
-                              clip=clip, ent_coef=ent_coef, val_coef=val_coef,
-                              update_epochs=update_epochs, minibatch=minibatch,
-                              device=device)
+        self.agent = PPOAgent(OBS_DIM, ACTION_DIM, cfg=self.ppo, device=device)
         self.vec_env: Optional[VectorEnv] = None
         self.buffer = RolloutBuffer(OBS_DIM, ACTION_DIM)
+        self._rollout_env_steps = 0      # env-transitions in the current rollout
+        # Persistent campaign scene-seed stream: shared across env rebuilds.
+        self._seed_gen = SceneSeedGen(self.seed)
+        self.safety_override_count = 0
 
         self._obs: np.ndarray | None = None
         self.total_steps = 0
@@ -119,6 +133,7 @@ class RLTrainer:
         self._log_buffer: deque = deque(maxlen=400)
 
         self._step_request = 0
+        self._step_to_episode_end = False
         self._eval_job = None
 
         self._env_factory = self._make_env_factory()
@@ -159,6 +174,79 @@ class RLTrainer:
         self._emit("status", self.status())
         return {"ok": True, "state": self._state.value, "from": deets}
 
+    def wait_paused(self, timeout: float = 5.0) -> bool:
+        """Block until the training loop has fully parked in PAUSED (the
+        trainer thread finished any in-flight chunk and drained commands),
+        so the caller can safely run torch work without racing it."""
+        deadline = time.time() + timeout
+        with self._lock:
+            if not self._state == TrainerState.PAUSED or self._step_request > 0:
+                self._settled.clear()
+        while time.time() < deadline:
+            with self._lock:
+                parked = (
+                    self._state == TrainerState.PAUSED
+                    and self._step_request == 0
+                    and not self._step_to_episode_end
+                    and self._commands.empty()
+                )
+            if parked and self._settled.is_set():
+                break
+            self._settled.wait(0.05)
+        with self._lock:
+            return (self._state == TrainerState.PAUSED
+                    and self._step_request == 0
+                    and not self._step_to_episode_end)
+
+    def run_job(self, fn, timeout: Optional[float] = None):
+        """Execute ``fn`` on the trainer's loop thread and block for the result.
+
+        Torch's eager CPU runtime serialises poorly across threads after a
+        backprop has started (an idle autograd worker racing torch ops from
+        another thread can deadlock). Channeling every heavier torch call —
+        policy cloning, eval loops — through this single thread keeps all
+        autograd and inference on the ``rl-trainer`` thread. Falls back to
+        running inline when the loop thread is not alive.
+        """
+        if not callable(fn):
+            raise TypeError("run_job expects a callable")
+        with self._lock:
+            thread = self._thread
+            alive = thread is not None and thread.is_alive()
+        if not alive:
+            return fn()
+        done = threading.Event()
+        box: dict = {}
+
+        def _wrap() -> None:
+            try:
+                box["value"] = fn()
+            except BaseException as exc:  # surfaced to the caller below
+                box["error"] = exc
+            finally:
+                done.set()
+
+        with self._lock:
+            self._commands.put(("_exec_job", {"wrap": _wrap}))
+        self._wake.set()
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            if done.wait(0.2):
+                break
+            with self._lock:
+                err_state = self._state == TrainerState.ERROR
+                err_msg = self._state_detail
+            if err_state:
+                raise RuntimeError(f"trainer ERROR while running job: {err_msg}")
+            if deadline is not None and time.time() > deadline:
+                raise TimeoutError("trainer job timed out")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def _exec_job(self, *, wrap) -> None:
+        wrap()
+
     def resume(self, **_) -> dict:
         with self._lock:
             self._state = TrainerState.TRAINING
@@ -171,19 +259,26 @@ class RLTrainer:
     def step(self, count: int = 1, **_) -> dict:
         """Advance exactly ``count`` environment steps, then stay paused."""
         with self._lock:
+            if self._state == TrainerState.EVALUATING:
+                return {"ok": False, "error": "cannot step while evaluating"}
             self._state = TrainerState.PAUSED
             self._state_detail = "stepping"
             self._step_request = max(1, int(count))
+            self._step_to_episode_end = False
         self._wake.set()
-        return {"ok": True, "state": self._state.value, "steps": self._step_request}
+        return {"ok": True, "state": self._state.value,
+                "steps": self._step_request}
 
     def step_episode(self, **_) -> dict:
         """Run the current episode to completion (display env), pausing after."""
         with self._lock:
+            if self._state == TrainerState.EVALUATING:
+                return {"ok": False, "error": "cannot step while evaluating"}
             self._state = TrainerState.PAUSED
             self._state_detail = "stepping_episode"
             self._env_ep_finish = [0] * self.n_envs   # handshake: non-empty targets
-            self._step_request = 10 ** 9   # run until envs finish
+            self._step_request = 0
+            self._step_to_episode_end = True
         self._wake.set()
         # Handshake: ensure the per-env episode counters are materialised
         # before the paused thread tries to consume the request (it may be
@@ -197,7 +292,6 @@ class RLTrainer:
     def reset_episode(self, **_) -> dict:
         """Reset the environment(s) with fresh seeds; trained model is kept."""
         self._reset_envs()
-        self.buffer.reset()
         self._emit_snapshot()
         return {"ok": True, "state": self._state.value}
 
@@ -205,7 +299,8 @@ class RLTrainer:
         """Reset model weights, optimizer and all counters (keeps scenario)."""
         with self._lock:
             self.agent.reset_weights()
-            self.buffer.reset()
+            self._reset_rollout()
+            self._rollout_env_steps = 0
             self.total_steps = 0
             self.episode_count = 0
             for d in (self.episode_rewards, self.episode_lengths,
@@ -232,7 +327,23 @@ class RLTrainer:
         while path.exists():
             path = self.checkpoint_dir / f"{safe}_{n}.pt"
             n += 1
-        self.agent.save(str(path))
+        meta = {
+            "scenario": self.scenario_cfg["name"],
+            "difficulty": self.scenario_cfg["difficulty"],
+            "level": self.scenario_cfg.get("difficulty"),
+            "n_envs": self.n_envs,
+            "n_rl": self.scenario_cfg.get("n_rl", 1),
+            "n_opponents": len(self.opponents)
+            if self.scenario_cfg.get("n_opponents", 0) > 0 else 0,
+            "steps": int(self.total_steps),
+            "episodes": int(self.episode_count),
+            "safety": self.safety,
+            "seed": int(self.seed),
+            "rollout_steps": int(self.rollout_steps),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.agent.save(str(path), meta=meta)
+        self.last_checkpoint = {"name": path.name, "steps": int(self.total_steps)}
         self._log(f"checkpoint saved: {path.name} (steps={self.total_steps})")
         self._emit("checkpoint", {"saved": path.name})
         return {"ok": True, "name": path.name, "path": str(path)}
@@ -282,28 +393,27 @@ class RLTrainer:
     def change_scenario(self, scenario: Optional[str] = None, *,
                         level: Optional[int] = None,
                         overrides: Optional[dict] = None, **_) -> dict:
-        """Switch scenario / curriculum level and rebuild the environment."""
-        cfg = self.scenario_cfg
+        """Switch scenario / curriculum level and rebuild the environment.
+
+        When both a named scenario and a curriculum ``level`` are given the
+        level explicitly wins (see ``resolve_scenario``) — matching CLI/UI
+        precedence so behaviour is identical everywhere.
+        """
         try:
-            if scenario and scenario in SCENARIO_PRESETS:
-                cfg = scenario_config(scenario, overrides)
-            elif level:
-                cfg = curriculum_config(int(level), overrides)
-            elif overrides:
-                cfg = _clamp_scenario({**cfg, **overrides})
-            else:
+            cfg, note = resolve_scenario(scenario, level, overrides)
+            if not (scenario or level or overrides):
                 return {"ok": False, "error": "no scenario/level provided"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         with self._lock:
             self.scenario_cfg = cfg
-        self._reset_envs()
-        self.buffer.reset()
+        self._reset_rollout()
         self._emit_snapshot()
         self._emit("metrics", self.metrics_brief())
         self._emit("status", self.status())
+        self._log(f"scenario changed: {note}")
         return {"ok": True, "scenario": self.scenario_cfg["name"],
-                "difficulty": self.scenario_cfg["difficulty"]}
+                "difficulty": self.scenario_cfg["difficulty"], "note": note}
 
     def evaluate(self, controller: str = "rl", *, checkpoint: Optional[str] = None,
                  seed: Optional[int] = None, num_episodes: Optional[int] = None,
@@ -353,18 +463,34 @@ class RLTrainer:
                 "detail": self._state_detail,
                 "error": self._error,
                 "scenario": self.scenario_cfg,
+                "seed": self.seed,
+                "scene_seed_draws": self._seed_gen.draws,
                 "safety": self.safety,
+                "state_detail": self._state_detail,
                 "speed": self.speed,
                 "steps_per_second": (self.speed_steps_per_sec if self.speed > 0
                                      else "max"),
                 "total_steps": self.total_steps,
                 "episodes": self.episode_count,
+                "updates": self.agent.updates,
+                "env_step": self.vec_env.envs[0].step_count
+                if self.vec_env else 0,
                 "n_envs": self.n_envs,
+                "n_rl": self.scenario_cfg.get("n_rl", 1),
+                "n_opponents": len(self.opponents)
+                if self.scenario_cfg.get("n_opponents", 0) > 0 else 0,
+                "opponents_live": [int(getattr(a, "step_count", 0))
+                                   for a in (self.vec_env.envs[0].rl_agents
+                                             if self.vec_env else [])],
+                "safety_override_count": self.safety_override_count,
                 "rollout_steps": self.rollout_steps,
+                "rollout_env_steps": self._rollout_env_steps,
                 "agent": self.agent.summary(),
+                "ppo": self.ppo.to_dict(),
                 "checkpoint_dir": str(self.checkpoint_dir),
                 "autosave_every": self.autosave_every,
                 "last_autosave": self.last_autosave,
+                "last_checkpoint": self.last_checkpoint,
             }
 
     def metrics_brief(self) -> dict:
@@ -429,9 +555,26 @@ class RLTrainer:
 
     def _make_env_factory(self):
         def factory(seed: int) -> AMRCollisionEnv:
-            return AMRCollisionEnv(self.scenario_cfg, seed=seed, dt=DT,
-                                   safety=self.safety)
+            _ = seed  # scene seed now comes from _seed_gen; kept for compat
+            return AMRCollisionEnv(self.scenario_cfg, dt=DT,
+                                   safety=self.safety,
+                                   opponents=self.opponents
+                                   if self.scenario_cfg.get("n_opponents", 0) > 0
+                                   else None)
         return factory
+
+    def set_opponents(self, opponents: Optional[Sequence]) -> dict:
+        """Replace the frozen opponent pool and rebuild the environments.
+
+        Clears the pool when ``opponents`` is empty or None (disables
+        self-play in the next env rebuild) — this matches the league's pool
+        lifecycle, where passing no agents means "no opponents from now on".
+        """
+        with self._lock:
+            self.opponents = list(opponents or [])
+        self._reset_envs()
+        self._emit("status", self.status())
+        return {"ok": True, "opponents": len(self.opponents)}
 
     def _ensure_thread(self) -> None:
         with self._lock:
@@ -444,19 +587,28 @@ class RLTrainer:
     def _ensure_env(self) -> None:
         if self.vec_env is None:
             self.vec_env = VectorEnv(self._env_factory, self.n_envs,
-                                     base_seed=self.seed)
+                                     base_seed=self.seed,
+                                     seed_source=self._seed_gen.next)
             self._obs = self.vec_env.reset_all()
-            self.buffer.reset()
+            self._reset_rollout()
 
     def _reset_envs(self) -> None:
+        # base_seed stays constant: VectorEnv's scene seeds now come from the
+        # persistent _seed_gen, so rebuilds continue the scene campaign instead
+        # of replaying (`base_seed + episode_count` did exactly that).
         if self.vec_env is not None:
             self.vec_env.close()
         self.vec_env = VectorEnv(self._env_factory, self.n_envs,
-                                 base_seed=self.seed + self.episode_count)
+                                 base_seed=self.seed,
+                                 seed_source=self._seed_gen.next)
         self._env_ep_finish = [0] * self.n_envs
         self._obs = self.vec_env.reset_all()
-        self.buffer.reset()
+        self._reset_rollout()
         self._ensure_ep_tracking()
+
+    def _reset_rollout(self) -> None:
+        self.buffer.reset()
+        self._rollout_env_steps = 0
 
     def _ensure_ep_tracking(self) -> None:
         for i in range(self.n_envs):
@@ -502,16 +654,25 @@ class RLTrainer:
                 self._wake.wait(0.3)
                 continue
             if st == TrainerState.PAUSED:
-                if self._step_request > 0:
+                with self._lock:
+                    to_ep_end = self._step_to_episode_end
                     steps = self._step_request
-                    if steps >= 10 ** 8:
+                if to_ep_end:
+                    with self._lock:
+                        self._step_to_episode_end = False
+                    self._run_to_episode_end()
+                    self._emit_snapshot()
+                    self._emit("step", self._step_info())
+                    with self._lock:
+                        self._state = TrainerState.PAUSED
+                        self._state_detail = "paused"
+                    self._emit("status", self.status())
+                elif steps > 0:
+                    with self._lock:
                         self._step_request = 0
-                        self._run_to_episode_end()
-                    else:
-                        self._step_request = 0
-                        self._collect_steps(steps)
-                        self._emit_snapshot()
-                        self._emit("step", self._step_info())
+                    self._collect_steps(steps)
+                    self._emit_snapshot()
+                    self._emit("step", self._step_info())
                     with self._lock:
                         self._state = TrainerState.PAUSED
                         self._state_detail = "paused"
@@ -519,6 +680,7 @@ class RLTrainer:
                 else:
                     self._wake.wait(0.2)
                     self._drain_commands()
+                    self._settled.set()
                 continue
             if st == TrainerState.EVALUATING:
                 self._run_eval_step()
@@ -557,31 +719,65 @@ class RLTrainer:
         self._emit("status", self.status())
         self._emit("error", {"message": message})
 
+    def _as_agent_obs(self, obs):
+        """Normalise vectorised obs to ``(n_envs, n_rl, obs_dim)``.
+
+        Single-agent environments historically carried per-env obs of shape
+        ``(obs_dim,)`` (stacked to ``(n_envs, obs_dim)``); multi-RL scenes
+        stack per-agent rows ``(n_rl, obs_dim)`` per env. This helper makes
+        both flow through the same per-agent loop below.
+        """
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim == 2:
+            return obs[:, None, :]
+        return obs
+
     def _collect_steps(self, count: int) -> None:
         if self.vec_env is None or self._obs is None:
             self._ensure_env()
-        obs = self._obs
+        obs = self._as_agent_obs(self._obs)
+        n_rl = obs.shape[1]
         for _ in range(count):
-            actions = np.zeros((self.n_envs, ACTION_DIM), dtype=np.float32)
-            logps = np.zeros((self.n_envs,), dtype=np.float32)
-            values = np.zeros((self.n_envs,), dtype=np.float32)
+            actions = np.zeros((self.n_envs, n_rl, ACTION_DIM),
+                               dtype=np.float32)
+            logps = np.zeros((self.n_envs, n_rl), dtype=np.float32)
+            values = np.zeros((self.n_envs, n_rl), dtype=np.float32)
             for i in range(self.n_envs):
                 a, lp, v = self.agent.select_action(obs[i])
                 actions[i] = a
                 logps[i] = lp
                 values[i] = v
             next_obs, rewards, infos = self.vec_env.step(actions)
-            last_values = [self.agent.value_of(next_obs[i])
-                           for i in range(self.n_envs)]
+            rewards = np.asarray(rewards, dtype=np.float32).reshape(
+                self.n_envs, n_rl)
+            next_obs_a = self._as_agent_obs(next_obs)
+            last_values = np.concatenate([
+                self.agent.value_of(next_obs_a[i]) for i in range(self.n_envs)])
             for i in range(self.n_envs):
-                done = bool(infos[i].get("terminated") or infos[i].get("truncated"))
-                self.buffer.push(obs[i], actions[i], float(logps[i]),
-                                 float(values[i]), float(rewards[i]), done)
-                self._update_ep_tracking(i, rewards[i], infos[i])
+                info = infos[i]
+                terms = info.get("agent_terminated") or []
+                truncs = info.get("agent_truncated") or []
+                # Per-agent termination: each RL robot closes its own GAE chain
+                # on its own goal/collision/truncation; in shared multi-RL
+                # scenes one agent finishing must never truncate (zero out) the
+                # bootstrap of an agent that is still driving.
+                for k in range(n_rl):
+                    done = bool(terms[k]) if k < len(terms) else \
+                        bool(info.get("terminated"))
+                    done = done or (bool(truncs[k]) if k < len(truncs)
+                                    else bool(info.get("truncated")))
+                    self.buffer.push(obs[i][k], actions[i][k],
+                                     float(logps[i][k]), float(values[i][k]),
+                                     float(rewards[i][k]), done)
+                self._update_ep_tracking(i, float(np.sum(rewards[i])), info)
+                for a in info.get("agents", []):
+                    if a.get("override", {}).get("overridden"):
+                        self.safety_override_count += 1
+            self._rollout_env_steps += self.n_envs
             # batch unroll / update
             self._maybe_update(last_values)
-            obs = next_obs
-            self._obs = obs
+            obs = next_obs_a
+            self._obs = next_obs
             self.total_steps += self.n_envs
 
     def _update_ep_tracking(self, i: int, reward: float, info: dict) -> None:
@@ -590,7 +786,12 @@ class RLTrainer:
         tr["reward"] += float(reward)
         tr["length"] += 1
         for k, vals in (info.get("reward_components") or {}).items():
-            v = vals if isinstance(vals, (int, float)) else (vals[0] if vals else 0.0)
+            if isinstance(vals, (int, float)):
+                v = float(vals)
+            elif isinstance(vals, (list, tuple)) and len(vals):
+                v = float(np.mean([float(x) for x in vals]))
+            else:
+                v = 0.0
             tr["components"][k] = tr["components"].get(k, 0.0) + float(v)
         if info.get("terminated") or info.get("truncated"):
             self._finish_episode(i, info)
@@ -634,9 +835,11 @@ class RLTrainer:
             self._emit("metrics", self.metrics_brief())
 
     def _maybe_update(self, last_values) -> None:
-        if len(self.buffer) >= self.rollout_steps:
+        # Rollout length is counted in environment transitions, not agent rows:
+        # the update cadence is independent of n_envs and n_rl.
+        if self._rollout_env_steps >= self.rollout_steps:
             result = self.agent.train(self.buffer, last_values)
-            self.buffer.reset()
+            self._reset_rollout()
             self.metrics_history.append({
                 "total_steps": self.total_steps,
                 "episodes": self.episode_count,
@@ -672,13 +875,24 @@ class RLTrainer:
             return
         try:
             path = self.checkpoint_dir / "autosave.pt"
-            self.agent.save(str(path))
+            meta = {
+                "scenario": self.scenario_cfg["name"],
+                "difficulty": self.scenario_cfg["difficulty"],
+                "steps": int(self.total_steps),
+                "episodes": int(self.episode_count),
+                "safety": self.safety,
+                "seed": int(self.seed),
+                "rollout_steps": int(self.rollout_steps),
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.agent.save(str(path), meta=meta)
             self._last_autosave_steps = self.total_steps
             self.last_autosave = {
                 "name": "autosave.pt",
                 "steps": self.total_steps,
                 "time": time.time(),
             }
+            self.last_checkpoint = dict(self.last_autosave)
             self._log(f"autosaved {path.name} (steps={self.total_steps}, "
                       f"updates={self.agent.updates})")
             self._emit("checkpoint", {"autosaved": path.name,
@@ -735,25 +949,33 @@ class RLTrainer:
         if job["seed"] is not None:
             seeds = [int(job["seed"])] * n          # deterministic per episode
         seeds = seeds[:n]
-        if job["scenario"]:
-            cfg = scenario_config(job["scenario"], job["overrides"])
-        elif job["level"]:
-            cfg = curriculum_config(int(job["level"]), job["overrides"])
-        else:
-            cfg = self.scenario_cfg
+        # Scenario/level precedence matches CLI/UI: level wins when both given.
+        try:
+            if job["scenario"] or job["level"] or job["overrides"]:
+                cfg, _note = resolve_scenario(job["scenario"], job["level"],
+                                              job["overrides"])
+            else:
+                cfg = self.scenario_cfg
+        except Exception as exc:
+            self._transition_error(f"evaluation failed: {exc}")
+            return
         try:
             if controller == "algorithmic":
                 results = [evaluate_algorithmic(cfg, seed=s) for s in seeds]
             else:
+                policy = PPOAgent(OBS_DIM, ACTION_DIM, cfg=self.ppo,
+                                  device=self.agent.device)
                 if job["checkpoint"]:
                     p = self.checkpoint_dir / job["checkpoint"]
-                    if p.exists():
-                        self.agent.load(str(p))
-                obs, info = self._eval_env_reset(cfg, seeds[0])
-                results = []
-                for s in seeds:
-                    res = self._eval_one_rl(cfg, s)
-                    results.append(res)
+                    if not p.exists():
+                        raise FileNotFoundError(
+                            f"checkpoint not found: {job['checkpoint']}")
+                    # Load into the isolated copy — the live training policy
+                    # is never touched by an evaluation.
+                    policy.load(str(p))
+                else:
+                    policy.net.load_state_dict(self.agent.net.state_dict())
+                results = [self._eval_one_rl(cfg, s, policy) for s in seeds]
             summary = self._summarize_eval(controller, seeds, results)
             self.last_evaluation = {
                 "type": "evaluation",
@@ -776,47 +998,70 @@ class RLTrainer:
             self._eval_job = None
         self._emit("status", self.status())
 
-    def _eval_env_reset(self, cfg, seed):
-        e = AMRCollisionEnv(cfg, seed=seed, dt=DT, safety=self.safety)
-        return e.reset(options={"seed": seed})
+    def _eval_one_rl(self, cfg: dict, seed: int, agent: PPOAgent) -> dict:
+        """Run one deterministic episode of ``agent`` on a fresh environment.
 
-    def _eval_one_rl(self, cfg: dict, seed: int) -> dict:
-        env = AMRCollisionEnv(cfg, seed=seed, dt=DT, safety=self.safety)
+        Explicit seeds → reproducible evaluation. Every RL robot in the scene
+        is measured (multi-RL) and reported individually via per-agent metrics;
+        the summary aggregates across robots. The policy passed in is an
+        isolated copy, so this never mutates a live training policy.
+        """
+        env = AMRCollisionEnv(cfg, seed=seed, dt=DT, safety=self.safety,
+                              opponents=self.opponents
+                              if cfg.get("n_opponents", 0) > 0 else None)
         obs, _info = env.reset(options={"seed": seed})
+        obs = self._as_agent_obs(obs)          # (n_rl, obs_dim) rows
+        n_rl = obs.shape[1]
         steps = 0
-        dist = 0.0
-        success = False
+        dists = np.zeros(n_rl)
         collisions = 0
         safety_overrides = 0
         max_steps = cfg["max_steps"]
         while steps < max_steps:
-            action, _lp, _v = self.agent.select_action(obs, deterministic=True)
-            obs, _r, term, trunc, info = env.step(action)
+            actions = np.zeros((n_rl, ACTION_DIM), dtype=np.float32)
+            for k in range(n_rl):
+                a, _lp, _v = agent.select_action(obs[k], deterministic=True)
+                actions[k] = a
+            obs, _r, _term, _trunc, info = env.step(actions)
             steps += 1
             for a in info.get("agents", []):
                 if a.get("collided"):
                     collisions += 1
                 if a.get("override", {}).get("overridden"):
                     safety_overrides += 1
-            dist += float(np.hypot(env.rl_agents[0].state.vx,
-                                   env.rl_agents[0].state.vy)) * DT
-            if term or trunc:
-                success = bool(info.get("success"))
+            for k in range(n_rl):
+                s = env.rl_agents[k].state
+                dists[k] += float(np.hypot(s.vx, s.vy)) * DT
+            if _term or _trunc:
                 break
+        per_agent = []
+        for k in range(n_rl):
+            ag = env.rl_agents[k]
+            m = ag.metrics
+            per_agent.append({
+                "id": ag.state.id,
+                "distance": round(float(dists[k]), 2),
+                "time": round(steps * DT, 2),
+                "waiting_time": round(float(m["waiting_time"]), 2),
+                "path_deviation": round(float(m["path_deviation"]), 2),
+                "safety_overrides": int(m["safety_overrides"]),
+                "stuck_steps": int(m["stuck_steps"]),
+            })
         return {
             "seed": seed,
-            "success": success,
+            "success": bool(info.get("success")),
             "steps": steps,
             "time": round(steps * DT, 2),
-            "distance": round(dist, 2),
+            "distance": round(float(np.sum(dists)), 2),
             "collisions": int(collisions),
             "safety_overrides": int(safety_overrides),
-            "model": self.agent.summary(),
+            "agent_count": n_rl,
+            "agents": per_agent,
         }
 
     def _summarize_eval(self, controller, seeds, results) -> dict:
         n = max(1, len(results))
-        return {
+        summary = {
             "controller": controller,
             "n": len(results),
             "success_rate": round(100.0 * sum(1 for r in results
@@ -825,11 +1070,41 @@ class RLTrainer:
             "avg_distance": round(float(np.mean([r.get("distance", 0)
                                                  for r in results])), 2),
             "total_collisions": int(sum(r.get("collisions", 0) for r in results)),
+            "avg_safety_overrides": round(
+                float(np.mean([r.get("safety_overrides", 0) for r in results])), 2)
+                if results else 0.0,
+            "agent_count": max((r.get("agent_count", 1) for r in results),
+                               default=1),
         }
+        per = {}
+        for r in results:
+            for a in r.get("agents", []):
+                per.setdefault(a["id"], []).append(a)
+        if per:
+            summary["per_agent"] = {}
+            for aid, rows in per.items():
+                m = max(1, len(rows))
+                summary["per_agent"][aid] = {
+                    "avg_time": round(float(np.mean([x["time"] for x in rows])), 2),
+                    "avg_distance": round(float(np.mean([x["distance"]
+                                                         for x in rows])), 2),
+                    "avg_waiting_time": round(float(np.mean([x["waiting_time"]
+                                                             for x in rows])), 2),
+                    "avg_path_deviation": round(float(np.mean([x["path_deviation"]
+                                                               for x in rows])), 2),
+                    "avg_safety_overrides": round(float(np.mean(
+                        [x["safety_overrides"] for x in rows])), 2),
+                }
+        return summary
 
     # ------------------------------------------------------------------
     # Events / snapshots
     # ------------------------------------------------------------------
+
+    def emit_event(self, kind: str, payload: dict) -> None:
+        """Broadcast an application-level event (e.g. league status) to every
+        attached WebSocket bridge."""
+        self._emit(kind, payload)
 
     def _emit(self, kind: str, payload: dict) -> None:
         payload = dict(payload)
@@ -842,6 +1117,16 @@ class RLTrainer:
             except Exception:
                 pass
 
+    @staticmethod
+    def _jsonable_reward(value):
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (list, tuple)):
+            return [float(v) for v in value]
+        return value
+
     def _emit_snapshot(self) -> None:
         if self.vec_env is None:
             return
@@ -853,9 +1138,10 @@ class RLTrainer:
             return
         snap["status"] = self.status()
         snap["reward_components"] = {
-            k: round(v, 3) for k, v in
-            (env.last_info.get("reward_components") or {}).items()}
-        snap["reward"] = env.last_info.get("reward")
+            k: round(float(np.mean(v)), 3) if isinstance(v, (list, tuple))
+            else round(v, 3)
+            for k, v in (env.last_info.get("reward_components") or {}).items()}
+        snap["reward"] = self._jsonable_reward(env.last_info.get("reward"))
         snap["terminated"] = env.last_info.get("terminated", False)
         snap["truncated"] = env.last_info.get("truncated", False)
         self.last_snapshot = snap
@@ -864,6 +1150,7 @@ class RLTrainer:
     def _step_info(self) -> dict:
         env = self.vec_env.envs[0]
         self._ensure_ep_tracking()
+        rcomps = env.last_info.get("reward_components") or {}
         return {
             "type": "step",
             "step": env.step_count,
@@ -872,9 +1159,10 @@ class RLTrainer:
             "total_steps": self.total_steps,
             "observation": env.render_state()["observation"],
             "action": env.render_state()["action"],
-            "reward": env.last_info.get("reward"),
-            "reward_components": (env.last_info.get("reward_components")
-                                  or {}),
+            "reward": self._jsonable_reward(env.last_info.get("reward")),
+            "reward_components": {
+                k: round(float(np.mean(v)), 3) if isinstance(v, (list, tuple))
+                else round(v, 3) for k, v in rcomps.items()},
         }
 
     def _transition(self, new_state: TrainerState, detail: str = "") -> None:

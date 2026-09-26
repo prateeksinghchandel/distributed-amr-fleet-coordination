@@ -89,7 +89,11 @@ export default function MetricsPanel({ rl }) {
             {snap.reward != null && (
                 <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', fontSize: 11 }}>
                     <span style={S.dim}>Step {snap.step}/{snap.max_steps} (t={fmt(snap.time)}s)</span>
-                    <span style={{ color: P.accent, fontWeight: 'bold' }}>reward {fmt(snap.reward)}</span>
+                    <span style={{ color: P.accent, fontWeight: 'bold' }}>
+                        reward {Array.isArray(snap.reward)
+                            ? `[${snap.reward.map((r) => fmt(r)).join(', ')}]` /* per RL agent */
+                            : fmt(snap.reward)}
+                    </span>
                 </div>
             )}
         </div>

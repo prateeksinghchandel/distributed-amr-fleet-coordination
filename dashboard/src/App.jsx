@@ -8,27 +8,41 @@ const STORAGE_VIEW = 'amr_app_view';
 
 function loadView() {
     try {
-        return localStorage.getItem(STORAGE_VIEW) === 'rl' ? 'rl' : 'fleet';
+        const v = localStorage.getItem(STORAGE_VIEW) || '';
+        if (v === 'rl' || v === 'rl-selfplay') return v;
     } catch {
-        return 'fleet';
+        /* private mode */
     }
+    return 'fleet';
 }
 
 function AppRouter() {
     const [view, setView] = useState(loadView);
     const rl = useRlConnection();
 
-    const switchView = (next) => {
-        setView(next);
+    const switchView = (next, tab) => {
+        const key = next === 'rl' && tab === 'selfplay' ? 'rl-selfplay' : next;
+        setView(key);
         try {
-            localStorage.setItem(STORAGE_VIEW, next);
+            localStorage.setItem(STORAGE_VIEW, key);
         } catch { /* private mode */ }
     };
 
-    if (view === 'rl') {
-        return <RlTrainingView rl={rl} onBack={() => switchView('fleet')} />;
+    if (view === 'rl' || view === 'rl-selfplay') {
+        return (
+            <RlTrainingView
+                rl={rl}
+                initialTab={view === 'rl-selfplay' ? 'selfplay' : undefined}
+                onBack={() => switchView('fleet')}
+            />
+        );
     }
-    return <Dashboard onOpenRl={() => switchView('rl')} />;
+    return (
+        <Dashboard
+            onOpenRl={() => switchView('rl')}
+            onOpenSelfplay={() => switchView('rl', 'selfplay')}
+        />
+    );
 }
 
 export default function App() {

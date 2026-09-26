@@ -17,6 +17,7 @@ Design choices:
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from typing import Optional, Sequence
 
 import numpy as np
@@ -25,6 +26,62 @@ import torch.nn as nn
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+@dataclass
+class PPOConfig:
+    """Explicit, validated PPO hyperparameters.
+
+    This is the canonical configuration object: the trainer, headless runner
+    and server CLI all funnel their PPO settings through it, it is embedded in
+    every checkpoint, and it is surfaced in status/UI so a run's active values
+    are never implicit.
+    """
+
+    lr: float = 3e-4
+    gamma: float = 0.99
+    lam: float = 0.95
+    clip: float = 0.2
+    ent_coef: float = 0.01
+    val_coef: float = 0.5
+    update_epochs: int = 4
+    minibatch: int = 64
+    hidden: int = 128
+
+    def validate(self) -> "PPOConfig":
+        if not (0.0 < self.lr < 1.0):
+            raise ValueError(f"lr must be in (0, 1), got {self.lr}")
+        if not (0.0 < self.gamma < 1.0):
+            raise ValueError(f"gamma must be in (0, 1), got {self.gamma}")
+        if not (0.0 < self.lam <= 1.0):
+            raise ValueError(f"lam must be in (0, 1], got {self.lam}")
+        if not (0.0 < self.clip <= 1.0):
+            raise ValueError(f"clip must be in (0, 1], got {self.clip}")
+        if self.ent_coef < 0.0:
+            raise ValueError(f"ent_coef must be >= 0, got {self.ent_coef}")
+        if self.val_coef < 0.0:
+            raise ValueError(f"val_coef must be >= 0, got {self.val_coef}")
+        if self.update_epochs < 1:
+            raise ValueError(f"update_epochs must be >= 1, got {self.update_epochs}")
+        if self.minibatch < 1:
+            raise ValueError(f"minibatch must be >= 1, got {self.minibatch}")
+        if self.hidden < 16:
+            raise ValueError(f"hidden must be >= 16, got {self.hidden}")
+        return self
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "PPOConfig":
+        cfg = cls()
+        if data:
+            for k, v in data.items():
+                if k in ("lr", "gamma", "lam", "clip", "ent_coef", "val_coef"):
+                    setattr(cfg, k, float(v))
+                elif k in ("update_epochs", "minibatch", "hidden"):
+                    setattr(cfg, k, int(v))
+        return cfg.validate()
 
 
 class ActorCritic(nn.Module):
@@ -148,39 +205,59 @@ class PPOAgent:
     """PPO actor-critic agent with save/load checkpoint support."""
 
     def __init__(self, obs_dim: int, action_dim: int, *,
-                 device: str = DEVICE, lr: float = 3e-4, gamma: float = 0.99,
-                 lam: float = 0.95, clip: float = 0.2, ent_coef: float = 0.01,
-                 val_coef: float = 0.5, update_epochs: int = 4,
-                 minibatch: int = 64, hidden: int = 128):
+                 device: str = DEVICE, cfg: Optional[PPOConfig] = None,
+                 lr: Optional[float] = None, gamma: Optional[float] = None,
+                 lam: Optional[float] = None, clip: Optional[float] = None,
+                 ent_coef: Optional[float] = None, val_coef: Optional[float] = None,
+                 update_epochs: Optional[int] = None,
+                 minibatch: Optional[int] = None, hidden: Optional[int] = None):
+        if cfg is None:
+            cfg = PPOConfig()
+        # Backwards-compatible inline overrides win over the config object.
+        override = dict(lr=lr, gamma=gamma, lam=lam, clip=clip,
+                        ent_coef=ent_coef, val_coef=val_coef,
+                        update_epochs=update_epochs, minibatch=minibatch,
+                        hidden=hidden)
+        for k, v in override.items():
+            if v is not None:
+                setattr(cfg, k, v)
+        self.cfg = cfg.validate()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.device = device
-        self.lr = lr
-        self.gamma = gamma
-        self.lam = lam
-        self.clip = clip
-        self.ent_coef = ent_coef
-        self.val_coef = val_coef
-        self.update_epochs = update_epochs
-        self.minibatch = minibatch
-        self.net = ActorCritic(obs_dim, action_dim, hidden=hidden).to(device)
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.lr = cfg.lr
+        self.gamma = cfg.gamma
+        self.lam = cfg.lam
+        self.clip = cfg.clip
+        self.ent_coef = cfg.ent_coef
+        self.val_coef = cfg.val_coef
+        self.update_epochs = cfg.update_epochs
+        self.minibatch = cfg.minibatch
+        self.net = ActorCritic(obs_dim, action_dim, hidden=cfg.hidden).to(device)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
         self.updates = 0
+        self.meta: Optional[dict] = None
 
     def select_action(self, obs: np.ndarray, deterministic: bool = False):
+        """Sample actions for one or more agents (rows of ``obs``).
+
+        Returns action ``(B, action_dim)``, logp ``(B,)`` and value ``(B,)``
+        where ``B`` is the batch/agent count.
+        """
         obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32),
                                 device=self.device)
         with torch.no_grad():
             action, logp, value = self.net.act(obs_t, deterministic=deterministic)
         return (action.cpu().numpy(), logp.cpu().numpy(),
-                value.cpu().numpy().item())
+                value.cpu().numpy())
 
-    def value_of(self, obs: np.ndarray) -> float:
+    def value_of(self, obs: np.ndarray) -> np.ndarray:
+        """Critic values for one or more agents (one per obs row)."""
         with torch.no_grad():
             obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32),
                                     device=self.device)
             _, val = self.net(obs_t)
-            return float(val.squeeze(-1).cpu().numpy().item())
+            return np.asarray(val.squeeze(-1).cpu().numpy(), dtype=np.float32)
 
     def train(self, buffer: RolloutBuffer, last_value: float) -> dict:
         obs, actions, old_logp, gae, returns = buffer.compute_gae(
@@ -223,24 +300,30 @@ class PPOAgent:
             "samples": n,
         }
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, meta: Optional[dict] = None) -> None:
         torch.save({
             "obs_dim": self.obs_dim,
             "action_dim": self.action_dim,
             "device": self.device,
+            "ppo": self.cfg.to_dict(),       # training configuration
+            "meta": meta,                    # caller-supplied run metadata
             "net_state": self.net.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "updates": self.updates,
         }, path)
 
-    def load(self, path: str) -> None:
+    def load(self, path: str) -> dict:
         data = torch.load(path, map_location=self.device)
         if data.get("obs_dim") != self.obs_dim or \
            data.get("action_dim") != self.action_dim:
             raise ValueError("checkpoint obs/action dims do not match env")
+        if data.get("ppo"):
+            self.cfg = PPOConfig.from_dict(data["ppo"])
+        self.meta = data.get("meta")
         self.net.load_state_dict(data["net_state"])
         self.optimizer.load_state_dict(data["optimizer_state"])
         self.updates = int(data.get("updates", 0))
+        return data
 
     def reset_weights(self) -> None:
         for m in self.net.modules():
@@ -264,6 +347,44 @@ class PPOAgent:
             "log_std": float(np.exp(self.net.log_std.detach().cpu().numpy()).mean()),
         }
 
+    def clone_for_play(self, deterministic: bool = True) -> "PPOAgent":
+        """Return a frozen copy of this policy for use as an opponent.
+
+        The clone shares no parameters (fresh ``net`` + copied state_dict), has
+        no optimizer, is in eval mode, and is never trained — it exists to run
+        former champs as stationary peers inside training scenes.
+        """
+        clone = PPOAgent(self.obs_dim, self.action_dim, device=self.device)
+        clone.net.load_state_dict(self.net.state_dict())
+        clone.net.eval()
+        clone.play_deterministic = bool(deterministic)
+        return clone
+
+    @property
+    def play_deterministic(self) -> bool:
+        return getattr(self, "_play_deterministic", True)
+
+    @play_deterministic.setter
+    def play_deterministic(self, value: bool) -> None:
+        self._play_deterministic = bool(value)
+
+    def play_action(self, obs: np.ndarray) -> np.ndarray:
+        """Action for an opponent, sampled from its frozen policy."""
+        action, _, _ = self.select_action(obs, deterministic=self.play_deterministic)
+        return np.asarray(action, dtype=np.float32)
+
+
+def load_policy(path: str, device: Optional[str] = None) -> PPOAgent:
+    """Build a PPOAgent from a saved checkpoint (weights + dims only)."""
+    data = torch.load(path, map_location=(device or DEVICE))
+    agent = PPOAgent(int(data["obs_dim"]), int(data["action_dim"]),
+                     device=device or DEVICE)
+    agent.net.load_state_dict(data["net_state"])
+    agent.net.eval()
+    agent.updates = int(data.get("updates", 0))
+    agent.play_deterministic = True
+    return agent
+
 
 class VectorEnv:
     """Vectorised wrapper around multiple identical ``AMRCollisionEnv``s.
@@ -271,23 +392,34 @@ class VectorEnv:
     Episodes that finish are automatically re-seeded and reset (Stable-Baselines
     convention): parallel PPO gathers whole episodes without manual plumbing.
     The first environment is the visual "reference" env used for snapshots.
+
+    Scene seeds come from ``seed_source`` (a callable returning the next scene
+    seed) — normally a trainer-owned ``SceneSeedGen`` that survives env
+    rebuilds, so the campaign's scene sequence never restarts. When no seed
+    source is supplied a private RNG is used (back-compat for direct use).
     """
 
-    def __init__(self, env_factory, n_envs: int, base_seed: int = 0):
+    def __init__(self, env_factory, n_envs: int, base_seed: int = 0,
+                 seed_source=None):
         self.envs = [env_factory(seed=base_seed + i) for i in range(n_envs)]
         self.n_envs = n_envs
+        self._seed_source = seed_source if callable(seed_source) else None
         self._rs = np.random.RandomState(base_seed + n_envs * 997)
+
+    def _next_seed(self) -> int:
+        if self._seed_source is not None:
+            return int(self._seed_source())
+        return int(self._rs.randint(0, 2 ** 31 - 1))
 
     def reset_all(self) -> np.ndarray:
         obs = []
         for e in self.envs:
-            o, _ = e.reset(options={"seed": int(self._rs.randint(0, 2 ** 31 - 1))})
+            o, _ = e.reset(options={"seed": self._next_seed()})
             obs.append(o)
         return np.asarray(obs, dtype=np.float32)
 
     def reset_env(self, idx: int) -> np.ndarray:
-        o, _ = self.envs[idx].reset(
-            options={"seed": int(self._rs.randint(0, 2 ** 31 - 1))})
+        o, _ = self.envs[idx].reset(options={"seed": self._next_seed()})
         return np.asarray(o, dtype=np.float32)
 
     def step(self, actions: np.ndarray):
@@ -298,10 +430,13 @@ class VectorEnv:
             if term or trunc:
                 o = self.reset_env(i)
             obs_list.append(np.asarray(o, dtype=np.float32))
-            rew_list.append(float(r))
+            rew_list.append(r)
             note_list.append((bool(term), bool(trunc)))
             info_list.append(info)
-        return np.asarray(obs_list), np.asarray(rew_list), info_list
+        # Single-RL scenes give one scalar per env; multi-RL scenes give one
+        # reward per agent, so keep the returned array shaped (n_envs, ...).
+        return np.asarray(obs_list), np.asarray(rew_list, dtype=np.float32), \
+            info_list
 
     def close(self) -> None:
         for e in self.envs:

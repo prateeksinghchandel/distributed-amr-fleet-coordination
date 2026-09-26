@@ -51,6 +51,15 @@ ALLOWED_COMMANDS = {
     "start", "pause", "resume", "step", "step_episode",
     "reset_episode", "reset_training", "save_checkpoint", "load_checkpoint",
     "delete_checkpoint", "set_speed", "change_scenario", "evaluate", "stop",
+    # self-play league
+    "league_start", "league_stop", "league_promote", "league_vs_pool",
+}
+
+LEAGUE_COMMANDS = {
+    "league_start": "start",
+    "league_stop": "stop",
+    "league_promote": "promote",
+    "league_vs_pool": "champion_vs_pool",
 }
 
 SPEC_INFO = {
@@ -69,8 +78,9 @@ def _e(event) -> str:  # normalize exceptions into a str
 class TrainingApp:
     """Cors-enabled aiohttp app holding one RLTrainer + websocket clients."""
 
-    def __init__(self, trainer: RLTrainer):
+    def __init__(self, trainer: RLTrainer, league: Optional["LeagueTrainer"] = None):
         self.trainer = trainer
+        self.league = league
         self._ws_bridges: dict[web.WebSocketResponse, Callable] = {}
 
     # ---------------------------------------------------------------- REST
@@ -83,6 +93,8 @@ class TrainingApp:
                 status[k] = v
         if self.trainer.last_evaluation:
             status["evaluation"] = self.trainer.last_evaluation
+        if self.league is not None:
+            status["league"] = self.league.status()
         return web.json_response(status)
 
     async def get_scenarios(self, request: web.Request) -> web.Response:
@@ -117,7 +129,14 @@ class TrainingApp:
             return web.json_response({**base, "ok": False,
                                       "error": f"unknown command '{command}'"},
                                      status=400)
-        handler = getattr(self.trainer, command, None)
+        if command in LEAGUE_COMMANDS:
+            if self.league is None:
+                return web.json_response({**base, "ok": False,
+                                          "error": "league not enabled"},
+                                         status=400)
+            handler = getattr(self.league, LEAGUE_COMMANDS[command], None)
+        else:
+            handler = getattr(self.trainer, command, None)
         if handler is None:
             return web.json_response({**base, "ok": False,
                                       "error": "no handler"},
@@ -150,11 +169,14 @@ class TrainingApp:
         self.trainer.attach_listener(bridge)
 
         try:
-            # Initial burst: current status + metrics + snapshot.
+            # Initial burst: current status + metrics + snapshot + league.
             for item in (self.trainer.status(), self.trainer.metrics_brief(),
                          self.trainer.last_snapshot):
                 if item is not None:
                     await ws.send_str(json.dumps(item, default=str))
+            if self.league is not None:
+                await ws.send_str(json.dumps(
+                    self.league.status() | {"type": "league"}, default=str))
         except Exception:
             pass
 
@@ -225,8 +247,9 @@ async def _try_send(ws: web.WebSocketResponse, payload: dict) -> None:
 # --------------------------------------------------------------------- app
 
 
-def build_app(trainer: Optional[RLTrainer] = None, **trainer_kwargs) -> web.Application:
-    app = TrainingApp(trainer or RLTrainer(**trainer_kwargs))
+def build_app(trainer: Optional[RLTrainer] = None, league: Optional["LeagueTrainer"] = None,
+              **trainer_kwargs) -> web.Application:
+    app = TrainingApp(trainer or RLTrainer(**trainer_kwargs), league=league)
     application = web.Application(middlewares=[_cors_middleware])
     application.router.add_get("/rl/status", app.get_status)
     application.router.add_get("/rl/scenarios", app.get_scenarios)
@@ -261,6 +284,13 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=5000,
                         help="autosave the policy to autosave.pt every N sim "
                              "steps while training (0 disables)")
+    parser.add_argument("--league", action="store_true",
+                        help="enable self-play: champion vs a pool of frozen "
+                             "former champions")
+    parser.add_argument("--pool-size", type=int, default=4)
+    parser.add_argument("--pool-every", type=int, default=3000,
+                        help="promote the champion into the pool every N sim steps")
+    parser.add_argument("--vs-pool-episodes", type=int, default=3)
     args = parser.parse_args()
 
     from rl.scenarios import scenario_config, curriculum_config
@@ -275,6 +305,12 @@ def main() -> None:
 
     trainer = RLTrainer(cfg, **kwargs)
     app = build_app(trainer)
+
+    if args.league:
+        from rl.league import LeagueTrainer
+        league = LeagueTrainer(trainer, pool_size=args.pool_size,
+                               checkpoint_dir=trainer.checkpoint_dir)
+        app = build_app(trainer, league=league)
 
     async def _serve():
         runner = web.AppRunner(app)
