@@ -75,24 +75,36 @@ class Scene:
         return [Rect(o["x"], o["y"], o["width"], o["height"]) for o in self.obstacles]
 
 
+def _finite_clamp(value, default: float, lo: float, hi: float) -> float:
+    """Clamp ``value`` into ``[lo, hi]``; non-finite/invalid inputs fall back to
+    ``default``. Unlike ``np.clip``, a NaN cannot propagate through this."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        f = default
+    if not math.isfinite(f):
+        f = default
+    return float(max(lo, min(hi, f)))
+
+
 def _clamp_scenario(cfg: dict) -> dict:
     """Sanitize user-supplied scenario config to safe limits."""
     cfg = dict(cfg)
-    cfg["width"] = float(np.clip(float(cfg.get("width", 30.0)), 12.0, MAX_SIZE))
-    cfg["height"] = float(np.clip(float(cfg.get("height", 20.0)), 12.0, MAX_SIZE))
-    cfg["n_robots"] = int(np.clip(int(cfg.get("n_robots", 1)), 1, MAX_ROBOTS))
-    cfg["n_rl"] = int(np.clip(int(cfg.get("n_rl", 1)), 1, cfg["n_robots"]))
-    cfg["n_opponents"] = int(np.clip(int(cfg.get("n_opponents", 0)), 0,
-                                     max(0, cfg["n_robots"] - cfg["n_rl"])))
-    cfg["obstacle_density"] = float(
-        np.clip(float(cfg.get("obstacle_density", 0.05)), 0.0, MAX_DENSITY)
-    )
-    cfg["max_steps"] = int(np.clip(int(cfg.get("max_steps", 600)), 20, 100000))
+    cfg["width"] = _finite_clamp(cfg.get("width", 30.0), 30.0, 12.0, MAX_SIZE)
+    cfg["height"] = _finite_clamp(cfg.get("height", 20.0), 20.0, 12.0, MAX_SIZE)
+    cfg["n_robots"] = int(_finite_clamp(cfg.get("n_robots", 1), 1, 1, MAX_ROBOTS))
+    cfg["n_rl"] = int(_finite_clamp(cfg.get("n_rl", 1), 1, 1, cfg["n_robots"]))
+    cfg["n_opponents"] = int(_finite_clamp(cfg.get("n_opponents", 0), 0, 0,
+                                           max(0, cfg["n_robots"] - cfg["n_rl"])))
+    cfg["obstacle_density"] = _finite_clamp(
+        cfg.get("obstacle_density", 0.05), 0.05, 0.0, MAX_DENSITY)
+    cfg["max_steps"] = int(_finite_clamp(cfg.get("max_steps", 600), 600,
+                                         20, 100000))
     cfg["dynamic_obstacles"] = bool(cfg.get("dynamic_obstacles", False))
     cfg["obstacle_mode"] = str(cfg.get("obstacle_mode", "random")) or "random"
     cfg["spawn_mode"] = str(cfg.get("spawn_mode", "random")) or "random"
     cfg["goal_mode"] = str(cfg.get("goal_mode", "random")) or "random"
-    cfg["difficulty"] = int(np.clip(int(cfg.get("difficulty", 1)), 1, 8))
+    cfg["difficulty"] = int(_finite_clamp(cfg.get("difficulty", 1), 1, 1, 8))
     return cfg
 
 

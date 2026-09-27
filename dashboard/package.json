@@ -20,8 +20,8 @@
     "fleet-manager": "node scripts/run-fleet-manager.mjs",
     "rl-server": "node scripts/run-rl-server.mjs",
     "rl-server:league": "node scripts/run-rl-server.mjs --league --pool-size 4 --pool-every 3000",
-    "rl-server:headless": "node scripts/run-rl-server.mjs --scenario dense_traffic --level 8 --n-envs 24",
-    "rl:headless": "node scripts/run-rl-server.mjs headless --scenario dense_traffic --level 8 --steps 60000 --n-envs 24 --save-every 5000"
+    "rl-server:headless": "node scripts/run-rl-server.mjs --scenario dense_traffic --n-envs 24",
+    "rl:headless": "node scripts/run-rl-server.mjs headless --scenario dense_traffic --steps 60000 --n-envs 24 --save-every 5000"
   },
   "dependencies": {
     "@eclipse-zenoh/zenoh-ts": "^1.10.1",

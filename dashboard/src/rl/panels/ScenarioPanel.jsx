@@ -66,10 +66,21 @@ export default function ScenarioPanel({ rl }) {
         for (const [k, v] of Object.entries(overrides)) {
             const sv = String(v).trim();
             if (sv === '') continue;
-            if (k === 'dynamic_obstacles') o[k] = sv === 'true';
-            else if (k === 'n_robots' || k === 'n_rl' || k === 'max_steps' || k === 'seed') o[k] = parseInt(sv, 10);
-            else if (k === 'width' || k === 'height' || k === 'obstacle_density') o[k] = parseFloat(sv);
-            else o[k] = sv;
+            if (k === 'dynamic_obstacles') { o[k] = sv === 'true'; continue; }
+            if (k === 'n_robots' || k === 'n_rl' || k === 'n_opponents' ||
+                k === 'max_steps' || k === 'seed') {
+                const n = parseInt(sv, 10);
+                if (Number.isNaN(n)) continue;
+                o[k] = n;
+                continue;
+            }
+            if (k === 'width' || k === 'height' || k === 'obstacle_density') {
+                const n = parseFloat(sv);
+                if (Number.isNaN(n)) continue;
+                o[k] = n;
+                continue;
+            }
+            o[k] = sv;
         }
         return o;
     };
@@ -81,6 +92,7 @@ export default function ScenarioPanel({ rl }) {
         ['height', 'Height (m)'],
         ['n_robots', 'Robots'],
         ['n_rl', 'RL agents'],
+        ['n_opponents', 'Opponents (needs frozen pool)'],
         ['obstacle_density', 'Obstacle density'],
         ['max_steps', 'Max steps'],
         ['seed', 'Seed (resets scene)'],

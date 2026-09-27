@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from rl.scenarios import (CURRICULUM, SCENARIO_PRESETS, _clamp_scenario,
-                          build_scene, evaluate_algorithmic, scenario_config,
-                          curriculum_config)
+                          build_scene, evaluate_algorithmic, resolve_scenario,
+                          scenario_config, curriculum_config, SceneSeedGen)
 from rl.env import DT
 
 
@@ -68,3 +68,39 @@ def test_clamp_scenario_defaults() -> None:
     assert cfg["n_rl"] >= 1
     assert cfg["obstacle_mode"] in ("none", "random", "quadrant", "corridor")
     assert cfg["max_steps"] == 500
+
+
+def test_resolve_scenario_level_wins_over_named_preset() -> None:
+    cfg, note = resolve_scenario("simple", 4, None)
+    assert cfg["name"] == CURRICULUM[4]["name"]
+    assert cfg["difficulty"] == 4
+    assert "level wins" in note
+
+
+def test_resolve_scenario_scenario_only() -> None:
+    cfg, note = resolve_scenario("dense_traffic", None, None)
+    assert cfg["name"] == "dense_traffic"
+    assert "level wins" not in note
+
+
+def test_resolve_scenario_default_when_both_missing() -> None:
+    cfg, note = resolve_scenario(None, None, None)
+    assert cfg["name"] == "obstacle_avoidance"
+
+
+def test_resolve_scenario_overrides_applied() -> None:
+    cfg, _note = resolve_scenario("simple", None, {"max_steps": 77})
+    assert cfg["max_steps"] == 77
+
+
+def test_scene_seed_gen_campaign_is_monotonic() -> None:
+    gen = SceneSeedGen(42)
+    a = [gen.next() for _ in range(50)]
+    b = [gen.next() for _ in range(50)]
+    assert len(set(a + b)) == 100          # no repeated draws in a campaign
+    assert gen.draws == 100
+
+
+def test_scene_seed_gen_is_reproducible() -> None:
+    assert SceneSeedGen(7).take(10) == SceneSeedGen(7).take(10)
+    assert SceneSeedGen(7).take(10) != SceneSeedGen(8).take(10)

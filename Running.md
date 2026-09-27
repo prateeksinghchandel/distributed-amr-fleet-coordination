@@ -129,7 +129,11 @@ python -m rl --scenario dense_traffic --level 8 --n-envs 24 --safety guard \
 ```
 - `--save-every N` — autosave `autosave.pt` every N sim steps while training (`0` disables; default 5000).
 - `--checkpoint-dir` — where `.pt` files go (default `backend/rl/checkpoints/`).
-- `--level N` / `--scenario NAME` — pick the starting curriculum level or named preset; `--seed`, `--device`.
+- `--level N` / `--scenario NAME` — pick the starting curriculum level or named preset; when **both** are given the level explicitly wins (same rule in the UI, so behaviour is identical everywhere). `--seed`, `--device`, `--max-steps N` also available.
+- PPO hyperparameters are first-class CLI flags and saved inside every checkpoint so a run's active values are never implicit: `--lr --gamma --lam --clip --ent-coef --val-coef --update-epochs --minibatch --hidden`.
+- `autosave.pt` is a single rolling file written on trainer PPO updates at `--save-every` granularity (checkpoints list stays clean); a suffixed manual save is a separate command.
+- `rollout-steps` counts **environment transitions per environment** (not per agent row), so the PPO update cadence is independent of `n_envs` and `n_rl`.
+- Self-play wiring: pass `--opponents <ckpt.pt names>` (or use the league/`set_opponents` flow) to attach frozen peer policies; `n_opponents` in a scenario only takes effect when a pool is live.
 
 ### 7b. Headless Training (fast, no UI)
 

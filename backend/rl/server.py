@@ -44,7 +44,8 @@ async def _cors_middleware(request, handler):
     return resp
 
 from rl.trainer import RLTrainer
-from rl.env import LIDAR_RAYS, LIDAR_RANGE, MAX_PEERS, OBS_DIM, ACTION_DIM
+from rl.env import (LIDAR_RAYS, LIDAR_RANGE, MAX_PEERS, OBS_DIM, ACTION_DIM,
+                    OBS_VERSION, OBS_PEERS_START, DEFAULT_REWARD)
 from rl.scenarios import CURRICULUM, SCENARIO_PRESETS
 
 ALLOWED_COMMANDS = {
@@ -65,9 +66,21 @@ LEAGUE_COMMANDS = {
 SPEC_INFO = {
     "obs_dim": OBS_DIM,
     "action_dim": ACTION_DIM,
+    "obs_version": OBS_VERSION,
     "lidar_rays": LIDAR_RAYS,
     "lidar_range": LIDAR_RANGE,
     "max_peers": MAX_PEERS,
+    "obs_layout": {
+        "lidar": [0, LIDAR_RAYS],
+        "goal_dist": LIDAR_RAYS,
+        "goal_dir": [LIDAR_RAYS + 1, LIDAR_RAYS + 3],
+        "ego_vel": [LIDAR_RAYS + 3, LIDAR_RAYS + 5],
+        "nearest_lidar": LIDAR_RAYS + 5,
+        "desired_heading": [LIDAR_RAYS + 6, LIDAR_RAYS + 8],
+        "path": [OBS_PEERS_START - 3, OBS_PEERS_START],
+        "peers": [OBS_PEERS_START, OBS_PEERS_START + MAX_PEERS * 4],
+    },
+    "reward": DEFAULT_REWARD.to_dict(),
 }
 
 
@@ -268,18 +281,57 @@ RL_HOST = "127.0.0.1"
 RL_PORT = 8370
 
 
+def _load_opponents(ckpt_dir, names: list[str]):
+    """Load frozen checkpoint policies to act as practice opponents."""
+    from pathlib import Path
+    from rl.rl_policy import PPOAgent
+    from rl.env import OBS_DIM, ACTION_DIM
+    agents = []
+    for name in names:
+        p = Path(ckpt_dir) / name
+        if not p.exists():
+            raise FileNotFoundError(f"opponent checkpoint not found: {name}")
+        agent = PPOAgent(OBS_DIM, ACTION_DIM, device="cpu")
+        agent.load(str(p))
+        agents.append(agent)
+    return agents
+
+
+def trainer_ckpt_dir(args) -> str:
+    from pathlib import Path
+    if args.checkpoint_dir:
+        return str(Path(args.checkpoint_dir))
+    return str(Path(__file__).resolve().parents[1] / "rl" / "checkpoints")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="RL training server")
     parser.add_argument("--host", default=RL_HOST)
     parser.add_argument("--port", type=int, default=RL_PORT)
     parser.add_argument("--scenario", default="obstacle_avoidance")
     parser.add_argument("--level", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="override per-episode max sim steps")
     parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--safety", default="guard",
                         choices=("off", "guard", "strict"))
     parser.add_argument("--device", default=None)
     parser.add_argument("--rollout-steps", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lam", type=float, default=0.95)
+    parser.add_argument("--clip", type=float, default=0.2)
+    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--val-coef", type=float, default=0.5)
+    parser.add_argument("--update-epochs", type=int, default=4)
+    parser.add_argument("--minibatch", type=int, default=64)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--opponents", nargs="*", default=None,
+                        help="frozen checkpoint names to practice against")
+    parser.add_argument("--reward-json", default=None,
+                        help="reward-config overrides as a JSON object, e.g. "
+                             '{\\"clearance\\": 5, \\"path_return\\": 1.2}')
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--save-every", type=int, default=5000,
                         help="autosave the policy to autosave.pt every N sim "
@@ -293,17 +345,31 @@ def main() -> None:
     parser.add_argument("--vs-pool-episodes", type=int, default=3)
     args = parser.parse_args()
 
-    from rl.scenarios import scenario_config, curriculum_config
-    cfg = curriculum_config(args.level) if args.level else \
-        scenario_config(args.scenario)
+    from rl.scenarios import resolve_scenario
+    cfg, note = resolve_scenario(
+        args.scenario, args.level,
+        {"max_steps": args.max_steps} if args.max_steps else None)
 
     kwargs = dict(n_envs=args.n_envs, seed=args.seed, safety=args.safety,
                   rollout_steps=args.rollout_steps, device=args.device,
-                  autosave_every=args.save_every)
+                  autosave_every=args.save_every,
+                  lr=args.lr, gamma=args.gamma, lam=args.lam, clip=args.clip,
+                  ent_coef=args.ent_coef, val_coef=args.val_coef,
+                  update_epochs=args.update_epochs, minibatch=args.minibatch,
+                  hidden=args.hidden)
     if args.checkpoint_dir:
         kwargs["checkpoint_dir"] = args.checkpoint_dir
+    if args.opponents:
+        opponents = _load_opponents(trainer_ckpt_dir(args), args.opponents)
+        cfg["n_opponents"] = min(len(opponents),
+                                 max(0, cfg.get("n_robots", 1) - 1))
+        kwargs["opponents"] = opponents
+    if args.reward_json:
+        import json
+        kwargs["reward"] = json.loads(args.reward_json)
 
     trainer = RLTrainer(cfg, **kwargs)
+    trainer._log(f"startup: {note}")
     app = build_app(trainer)
 
     if args.league:

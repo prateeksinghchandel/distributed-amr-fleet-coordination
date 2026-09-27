@@ -27,7 +27,7 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-from rl.env import ACTION_DIM, AMRCollisionEnv, DT, OBS_DIM
+from rl.env import (ACTION_DIM, AMRCollisionEnv, DT, OBS_DIM, RewardConfig)
 from rl.rl_policy import PPOAgent, PPOConfig, RolloutBuffer, VectorEnv
 from rl.scenarios import (CURRICULUM, SCENARIO_PRESETS, SceneSeedGen,
                           _clamp_scenario, evaluate_algorithmic,
@@ -35,6 +35,12 @@ from rl.scenarios import (CURRICULUM, SCENARIO_PRESETS, SceneSeedGen,
                           curriculum_config)
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+
+# Canonical reward-component key set (env, status, metrics and snapshots share
+# this so the dashboard never drifts from what the environment actually emits).
+REWARD_COMPONENTS = ("progress", "goal", "collision", "near_collision",
+                     "clearance", "amr_clearance", "path_deviation",
+                     "path_return", "stopping", "oscillation", "time")
 
 
 class TrainerState(str, Enum):
@@ -64,7 +70,8 @@ class RLTrainer:
                  checkpoint_dir: Path | str = CHECKPOINT_DIR,
                  autosave_every: int = 0,
                  eval_seeds: Sequence[int] = (42, 43, 44, 45, 46),
-                 opponents: Optional[Sequence] = None):
+                 opponents: Optional[Sequence] = None,
+                 reward: Optional[dict] = None):
         self._lock = threading.RLock()
         self._state = TrainerState.IDLE
         self._state_detail = ""
@@ -92,6 +99,7 @@ class RLTrainer:
         self.last_autosave = None
         self.last_checkpoint = None
         self.opponents = list(opponents or [])
+        self.reward = RewardConfig.from_dict(reward)
 
         self.speed = float(speed)
         self.speed_steps_per_sec = 10.0   # sim steps per wall second at 1x
@@ -111,6 +119,7 @@ class RLTrainer:
         # Persistent campaign scene-seed stream: shared across env rebuilds.
         self._seed_gen = SceneSeedGen(self.seed)
         self.safety_override_count = 0
+        self.nan_recoveries = 0
 
         self._obs: np.ndarray | None = None
         self.total_steps = 0
@@ -340,6 +349,8 @@ class RLTrainer:
             "safety": self.safety,
             "seed": int(self.seed),
             "rollout_steps": int(self.rollout_steps),
+            "reward": self.reward.to_dict(),
+            "obs_dim": OBS_DIM,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self.agent.save(str(path), meta=meta)
@@ -363,9 +374,23 @@ class RLTrainer:
         if p is None or not p.exists():
             return {"ok": False, "error": f"checkpoint not found: {name}"}
         try:
-            self.agent.load(str(p))
+            data = self.agent.load(str(p))
         except Exception as exc:
             return {"ok": False, "error": f"load failed: {exc}"}
+        meta = data.get("meta") or {}
+        if meta.get("reward"):
+            # Reproduce the experiment the checkpoint was trained under:
+            # restore its reward configuration and rebuild the environments
+            # with it (old checkpoints without a reward entry keep the current
+            # config).
+            try:
+                restored = RewardConfig.from_dict(meta["reward"])
+            except Exception as exc:
+                return {"ok": False,
+                        "error": f"checkpoint reward config invalid: {exc}"}
+            if restored.to_dict() != self.reward.to_dict():
+                self.reward = restored
+                self._reset_envs()
         self._log(f"checkpoint loaded: {p.name} (updates={self.agent.updates})")
         self._emit("checkpoint", {"loaded": p.name})
         self._emit("status", self.status())
@@ -407,7 +432,7 @@ class RLTrainer:
             return {"ok": False, "error": str(exc)}
         with self._lock:
             self.scenario_cfg = cfg
-        self._reset_rollout()
+        self._reset_envs()
         self._emit_snapshot()
         self._emit("metrics", self.metrics_brief())
         self._emit("status", self.status())
@@ -483,10 +508,13 @@ class RLTrainer:
                                    for a in (self.vec_env.envs[0].rl_agents
                                              if self.vec_env else [])],
                 "safety_override_count": self.safety_override_count,
+                "nan_recoveries": self.nan_recoveries,
                 "rollout_steps": self.rollout_steps,
                 "rollout_env_steps": self._rollout_env_steps,
                 "agent": self.agent.summary(),
                 "ppo": self.ppo.to_dict(),
+                "reward": self.reward.to_dict(),
+                "reward_components": list(REWARD_COMPONENTS),
                 "checkpoint_dir": str(self.checkpoint_dir),
                 "autosave_every": self.autosave_every,
                 "last_autosave": self.last_autosave,
@@ -520,12 +548,18 @@ class RLTrainer:
                 if goal_times else 0.0,
                 "avg_distance": round(float(np.mean(rolling)), 2)
                 if rolling else 0.0,
-                "components": {k: round(float(np.mean([c[k] for c in
+                "override_rate": round(100.0 * self.safety_override_count /
+                                       max(1, self.total_steps), 3),
+                "live_min_clearance": round(float(
+                    self.vec_env.envs[0].rl_agents[0].metrics["min_clearance"]), 3)
+                if self.vec_env else 0.0,
+                "clearance_steps": int(
+                    self.vec_env.envs[0].rl_agents[0].metrics["clearance_steps"])
+                if self.vec_env else 0,
+"components": {k: round(float(np.mean([c[k] for c in
                                    self.component_history])), 3)
-                               for k in ("progress", "goal", "collision",
-                                         "danger", "stopping", "path_deviation",
-                                         "oscillation")
-                               if self.component_history},
+                           for k in REWARD_COMPONENTS
+                           if self.component_history},
             }
 
     def list_checkpoints(self) -> list[dict]:
@@ -560,7 +594,8 @@ class RLTrainer:
                                    safety=self.safety,
                                    opponents=self.opponents
                                    if self.scenario_cfg.get("n_opponents", 0) > 0
-                                   else None)
+                                   else None,
+                                   reward=self.reward.to_dict())
         return factory
 
     def set_opponents(self, opponents: Optional[Sequence]) -> dict:
@@ -569,9 +604,19 @@ class RLTrainer:
         Clears the pool when ``opponents`` is empty or None (disables
         self-play in the next env rebuild) — this matches the league's pool
         lifecycle, where passing no agents means "no opponents from now on".
+        While a non-empty pool is live and the scene has room for peers
+        (``n_robots > n_rl``), ``n_opponents`` in the active scenario config is
+        raised to that room so training scenes actually attach the frozen
+        policies (a positive ``n_opponents`` alone is inert without a pool).
         """
         with self._lock:
             self.opponents = list(opponents or [])
+            room = (max(0, int(self.scenario_cfg.get("n_robots", 1))
+                        - int(self.scenario_cfg.get("n_rl", 1))))
+            if self.opponents and room > 0:
+                self.scenario_cfg["n_opponents"] = min(len(self.opponents), room)
+            elif not self.opponents:
+                self.scenario_cfg["n_opponents"] = 0
         self._reset_envs()
         self._emit("status", self.status())
         return {"ok": True, "opponents": len(self.opponents)}
@@ -617,10 +662,7 @@ class RLTrainer:
                                         "success": False, "collision": False,
                                         "seed": self.scenario_cfg.get("seed", 0),
                                         "components": {
-                                            k: 0.0 for k in
-                                            ("progress", "goal", "collision",
-                                             "danger", "stopping",
-                                             "path_deviation", "oscillation")}}
+                                            k: 0.0 for k in REWARD_COMPONENTS}}
 
     def _run(self) -> None:
         self._log(f"trainer thread started (n_envs={self.n_envs}, "
@@ -728,8 +770,10 @@ class RLTrainer:
         both flow through the same per-agent loop below.
         """
         obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim == 1:
+            return obs[None, :]         # single-RL env: (1, obs_dim) row
         if obs.ndim == 2:
-            return obs[:, None, :]
+            return obs[:, None, :]      # vector of single-RL envs
         return obs
 
     def _collect_steps(self, count: int) -> None:
@@ -748,6 +792,16 @@ class RLTrainer:
                 logps[i] = lp
                 values[i] = v
             next_obs, rewards, infos = self.vec_env.step(actions)
+            next_obs = np.asarray(next_obs, dtype=np.float32)
+            for i in range(self.n_envs):
+                o = next_obs[i]
+                if not np.isfinite(o).all():
+                    scene = ((infos[i] or {}).get("scene") or {})
+                    self._log(f"non-finite obs in env {i} "
+                              f"(scene={scene.get('name')}, "
+                              f"seed={scene.get('seed')}); resetting env")
+                    next_obs[i] = self.vec_env.reset_env(i)
+                    rewards[i] = 0.0
             rewards = np.asarray(rewards, dtype=np.float32).reshape(
                 self.n_envs, n_rl)
             next_obs_a = self._as_agent_obs(next_obs)
@@ -840,6 +894,19 @@ class RLTrainer:
         if self._rollout_env_steps >= self.rollout_steps:
             result = self.agent.train(self.buffer, last_values)
             self._reset_rollout()
+            if result.get("nan_weights"):
+                source = self._recover_weights()
+                self.nan_recoveries += 1
+                result["nan_recovery"] = True
+                result["restored_from"] = source
+                result["nan_recovery_number"] = self.nan_recoveries
+                self._log(f"NaN in policy weights after update "
+                          f"{result.get('updates')}; recovered from {source} "
+                          f"(recovery #{self.nan_recoveries})")
+                self._emit("error", {
+                    "message": f"Training self-healed: NaN weights restored "
+                               f"from {source} (recovery #{self.nan_recoveries})",
+                })
             self.metrics_history.append({
                 "total_steps": self.total_steps,
                 "episodes": self.episode_count,
@@ -849,8 +916,7 @@ class RLTrainer:
                             "avg_length", "avg_time")},
                 "components": {k: round(float(np.mean([
                     c[k] for c in self.component_history])), 3)
-                    for k in ("progress", "goal", "collision", "danger",
-                              "stopping", "path_deviation", "oscillation")
+                    for k in REWARD_COMPONENTS
                     if self.component_history},
             })
             self.metrics_history = self.metrics_history[-500:]
@@ -883,6 +949,8 @@ class RLTrainer:
                 "safety": self.safety,
                 "seed": int(self.seed),
                 "rollout_steps": int(self.rollout_steps),
+                "reward": self.reward.to_dict(),
+                "obs_dim": OBS_DIM,
                 "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.agent.save(str(path), meta=meta)
@@ -899,6 +967,36 @@ class RLTrainer:
                                       "steps": self.total_steps})
         except Exception as exc:
             self._log(f"autosave failed: {exc}")
+
+    def _recover_weights(self) -> str:
+        """Restore the best available weights after a NaN-poisoned update.
+
+        Preference order: rolling ``autosave.pt`` (cleanest continuity of the
+        current run), then the newest stored checkpoint, then a fresh weight
+        reset. Restores the agent so training simply continues — ``load()``
+        also rebuilds the optimizer state, so the update cadence is seamless.
+        """
+        candidates = []
+        autosave = self.checkpoint_dir / "autosave.pt"
+        if autosave.exists():
+            candidates.append(("autosave.pt", str(autosave)))
+        for p in sorted(self.checkpoint_dir.glob("*.pt"),
+                        key=lambda p: p.stat().st_mtime, reverse=True):
+            candidates.append((f"checkpoint:{p.name}", str(p)))
+        seen = set()
+        for source, path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                self.agent.load(path)
+                self._emit("checkpoint", {"restored": path})
+                return source
+            except Exception as exc:
+                self._log(f"weight recovery failed from {source}: {exc}")
+        self.agent.reset_weights()
+        self._log("weight recovery: no valid checkpoint, reset weights")
+        return "reset_weights"
 
     def _run_training_iteration(self) -> None:
         """Run one pace-limited chunk of env steps; snapshot in visual mode."""
@@ -1008,16 +1106,22 @@ class RLTrainer:
         """
         env = AMRCollisionEnv(cfg, seed=seed, dt=DT, safety=self.safety,
                               opponents=self.opponents
-                              if cfg.get("n_opponents", 0) > 0 else None)
+                              if cfg.get("n_opponents", 0) > 0 else None,
+                              reward=self.reward.to_dict())
         obs, _info = env.reset(options={"seed": seed})
-        obs = self._as_agent_obs(obs)          # (n_rl, obs_dim) rows
-        n_rl = obs.shape[1]
+        n_rl = len(env.rl_agents)              # authoritative agent count
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]                 # single-RL env row
         steps = 0
         dists = np.zeros(n_rl)
         collisions = 0
         safety_overrides = 0
         max_steps = cfg["max_steps"]
         while steps < max_steps:
+            obs = np.asarray(obs, dtype=np.float32)
+            if obs.ndim == 1:
+                obs = obs[None, :]             # single-RL env row
             actions = np.zeros((n_rl, ACTION_DIM), dtype=np.float32)
             for k in range(n_rl):
                 a, _lp, _v = agent.select_action(obs[k], deterministic=True)
@@ -1046,6 +1150,9 @@ class RLTrainer:
                 "path_deviation": round(float(m["path_deviation"]), 2),
                 "safety_overrides": int(m["safety_overrides"]),
                 "stuck_steps": int(m["stuck_steps"]),
+                "min_clearance": round(float(m["min_clearance"]), 3),
+                "mean_clearance": round(float(m["mean_clearance"]), 3),
+                "path_return_steps": int(m["path_return_steps"]),
             })
         return {
             "seed": seed,
@@ -1094,7 +1201,14 @@ class RLTrainer:
                                                                for x in rows])), 2),
                     "avg_safety_overrides": round(float(np.mean(
                         [x["safety_overrides"] for x in rows])), 2),
+                    "avg_min_clearance": round(float(np.mean(
+                        [x["min_clearance"] for x in rows])), 3),
+                    "avg_mean_clearance": round(float(np.mean(
+                        [x["mean_clearance"] for x in rows])), 3),
+                    "avg_path_return_steps": round(float(np.mean(
+                        [x["path_return_steps"] for x in rows])), 2),
                 }
+        summary["reward"] = self.reward.to_dict()
         return summary
 
     # ------------------------------------------------------------------

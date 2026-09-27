@@ -10,6 +10,8 @@ import { getGridSpacing, formatWorldCoord } from '../rendering/coordinates.js';
 import { withAlpha } from '../theme/palette.js';
 
 const LIDAR_RAYS = 36;
+const LIDAR_RANGE = 8.0;
+const CLEARANCE_LIMIT = 1.0;
 
 export function drawRlSnapshot(ctx, snap, camera, canvasW, canvasH, P) {
     ctx.clearRect(0, 0, canvasW, canvasH);
@@ -20,6 +22,7 @@ export function drawRlSnapshot(ctx, snap, camera, canvasW, canvasH, P) {
     drawObstacles(ctx, snap, camera, canvasW, canvasH, P);
     drawDetectionRange(ctx, snap, camera, canvasW, canvasH, P);
     drawGlobalPaths(ctx, snap, camera, canvasW, canvasH, P);
+    drawPathFeatures(ctx, snap, camera, canvasW, canvasH, P);
     drawTrajectories(ctx, snap, camera, canvasW, canvasH, P);
     drawLidar(ctx, snap, camera, canvasW, canvasH, P);
     drawGoals(ctx, snap, camera, canvasW, canvasH, P);
@@ -138,6 +141,83 @@ function drawGlobalPaths(ctx, snap, camera, w, h, P) {
         ctx.stroke();
         ctx.setLineDash([]);
     }
+}
+
+function drawPathFeatures(ctx, snap, camera, w, h, P) {
+    const rl = rlRobot(snap);
+    if (!rl) return;
+    const s = worldToScreen(camera, rl.x, rl.y, w, h);
+
+    // Tie-line + dot to the nearest point of the global path.
+    if (snap.path && Array.isArray(snap.path.nearest)) {
+        const n = worldToScreen(camera, snap.path.nearest[0], snap.path.nearest[1], w, h);
+        ctx.strokeStyle = withAlpha(P.info, 0.5);
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(s.x, s.y);
+        ctx.lineTo(n.x, n.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = P.info;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Desired-heading arrow (relative-to-heading delta from the snapshot).
+    if (snap.path && snap.path.desired_heading != null) {
+        const ang = rl.heading + snap.path.desired_heading;
+        const len = Math.max(16, rl.radius * camera.zoom * 1.7);
+        const ex = s.x + Math.cos(ang) * len;
+        const ey = s.y + Math.sin(ang) * len;
+        drawArrow(ctx, s.x, s.y, ex, ey, P.accent);
+    }
+
+    // Minimum physical clearance ring (obstacle / AMR, metres*zoom).
+    if (snap.clearances && snap.clearances.min != null &&
+            snap.clearances.min < LIDAR_RANGE) {
+        const radius = snap.clearances.min * camera.zoom;
+        ctx.strokeStyle = snap.clearances.min < CLEARANCE_LIMIT
+            ? P.warning : withAlpha(P.info, 0.35);
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+
+    // Override flash: safety layer vetoed the RL action this step.
+    if (snap.safety && snap.safety.overridden) {
+        const flashR = Math.max(10, rl.radius * camera.zoom * 1.8);
+        ctx.strokeStyle = P.danger;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, flashR, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+}
+
+function drawArrow(ctx, x0, y0, x1, y1, color) {
+    const ang = Math.atan2(y1 - y0, x1 - x0);
+    const span = Math.hypot(x1 - x0, y1 - y0);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    const ah = Math.min(7, span * 0.3);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - Math.cos(ang - 0.45) * ah, y1 - Math.sin(ang - 0.45) * ah);
+    ctx.lineTo(x1 - Math.cos(ang + 0.45) * ah, y1 - Math.sin(ang + 0.45) * ah);
+    ctx.closePath();
+    ctx.fill();
 }
 
 function drawTrajectories(ctx, snap, camera, w, h, P) {

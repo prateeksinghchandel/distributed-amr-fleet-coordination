@@ -4,6 +4,32 @@ import { ui } from '../../theme/ui.js';
 import { withAlpha } from '../../theme/palette.js';
 
 const SPEEDS = [0.25, 0.5, 1, 2, 5, 10];
+
+function Row({ label, text }) {
+    return (
+        <div style={{ display: 'flex', gap: 6 }}>
+            <span style={{ width: 84, color: 'inherit', opacity: 0.7 }}>{label}</span>
+            <span style={{ flex: 1, wordBreak: 'break-word' }}>{text}</span>
+        </div>
+    );
+}
+
+function formatPpo(ppo) {
+    if (!ppo) return '—';
+    return `lr=${ppo.lr} γ=${ppo.gamma} λ=${ppo.lam} clip=${ppo.clip} ent=${ppo.ent_coef} val=${ppo.val_coef} epochs=${ppo.update_epochs} mb=${ppo.minibatch} h=${ppo.hidden}`;
+}
+
+function formatAgent(agent) {
+    if (!agent) return '—';
+    if (typeof agent === 'string') return agent;
+    const parts = [];
+    if (agent.obs_dim != null && agent.action_dim != null) parts.push(`obs ${agent.obs_dim} → act ${agent.action_dim}`);
+    if (agent.updates != null) parts.push(`${agent.updates} updates`);
+    if (agent.params != null) parts.push(`${agent.params.toLocaleString()} params`);
+    if (agent.log_std != null) parts.push(`log_std ${Number(agent.log_std).toFixed(2)}`);
+    if (agent.device) parts.push(agent.device);
+    return parts.join(' · ') || 'policy';
+}
 const STATE_COLOR = {
     IDLE: null,
     TRAINING: '#00ff88',
@@ -121,6 +147,19 @@ export default function TrainingControls({ rl, onAction }) {
                 <span style={{ ...S.dim, fontSize: 11, alignSelf: 'center' }}>
                     {status.steps_per_second === 'max' ? 'as fast as possible, sparser snapshots' : `≈ ${status.steps_per_second} steps/s`}
                 </span>
+            </div>
+
+            <div style={{ ...S.micro, color: P.textDim, lineHeight: 1.6, marginTop: 6, marginBottom: 4 }}>
+                <Row label="policy" text={formatAgent(status.agent)} />
+                <Row label="environment"
+                    text={`${status.n_envs} parallel scene${status.n_envs === 1 ? '' : 's'} · ${status.n_rl} RL agent(s) per scene`} />
+                {status.n_opponents > 0 && <Row label="opponents" text={`${status.n_opponents} frozen peer(s) attached`} />}
+                <Row label="ppo" text={formatPpo(status.ppo)} />
+                <Row label="rollout" text={`${status.rollout_steps} env steps/env (${status.rollout_env_steps ?? 0} collected)`} />
+                <Row label="progress" text={`${Math.round(
+                    ((status.total_steps || 0) / Math.max(1, status.total_steps || 1)) * 100)}% · updates=${status.updates ?? 0} · env_step=${status.env_step ?? 0}`} />
+                <Row label="seed" text={`campaign seed ${status.seed ?? 0} · scene draws ${status.scene_seed_draws ?? 0}`} />
+                {status.safety_override_count > 0 && <Row label="safety" text={`${status.safety_override_count} overrides applied`} />}
             </div>
 
             {status.error && (

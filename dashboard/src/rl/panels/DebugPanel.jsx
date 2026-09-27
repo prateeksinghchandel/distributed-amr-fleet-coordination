@@ -1,7 +1,7 @@
 import React from 'react';
 import { useTheme } from '../../theme/ThemeContext.jsx';
 import { withAlpha } from '../../theme/palette.js';
-import { fmt } from '../format.js';
+import { fmt, fmtInt } from '../format.js';
 
 const LIDAR_RAYS = 36;
 const MAX_PEERS = 6;
@@ -11,6 +11,7 @@ const STEER_LIMIT = 0.9;
 const MAX_ANGULAR = 1.8;
 const DT = 0.1;
 const REVERSE_SCALE = 0.3;
+const CLEARANCE_LIMIT = 1.0;
 
 export default function DebugPanel({ rl }) {
     const { palette: P } = useTheme();
@@ -18,6 +19,12 @@ export default function DebugPanel({ rl }) {
     const obs = snap && snap.observation;
     const action = snap && snap.action;
     const safety = snap && snap.safety;
+    const obsLayout = rl.scenarios && rl.scenarios.spec &&
+        rl.scenarios.spec.obs_layout;
+    // Peer slots start after lidar + goal + ego + heading + local path traits;
+    // fall back to the pre-obs_version=2 offsets for older servers.
+    const OBS_PEERS_START = obsLayout && Array.isArray(obsLayout.peers)
+        ? obsLayout.peers[0] : 44;
 
     if (!snap || !obs) {
         return (
@@ -49,10 +56,10 @@ export default function DebugPanel({ rl }) {
             </tbody>
         </table>;
 
-    // Valid peer slots from observation [44:68].
+    // Valid peer slots from the obs_layout peers range (fallback 44-based).
     const peerSlots = [];
     for (let i = 0; i < MAX_PEERS; i++) {
-        const base = 44 + i * 4;
+        const base = OBS_PEERS_START + i * 4;
         const dx = obs[base], dy = obs[base + 1], vx = obs[base + 2], vy = obs[base + 3];
         const empty = Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6;
         peerSlots.push({ dx, dy, vx, vy, empty });
@@ -80,12 +87,16 @@ export default function DebugPanel({ rl }) {
                         ['linear v', `${fmt(linear)} m/s`],
                         ['steer', fmt(steer)],
                         ['heading rate', `${fmt(headingRate, 1)} rad/s`],
-                    ])}
+                        (snap.action_executed ? ['executed vx/vy',
+                            `${fmt(snap.action_executed[0])} / ${fmt(snap.action_executed[1])} m/s`,
+                            safety.overridden ? P.warning : undefined] : null),
+                    ].filter(Boolean))}
                     <div style={{ fontSize: 10, color: P.textMuted, marginTop: 6, marginBottom: 2 }}>Safety layer</div>
                     {rows([
                         ['override', safety.overridden ? 'ACTIVE' : (rl.status && rl.status.safety === 'off' ? 'off (disabled)' : 'passive')],
                         ['guard', safety.guard || 'none'],
                         ['reason', safety.reason || '—'],
+                        ['overrides (env)', rlRobot ? fmtInt(rlRobot.metrics && rlRobot.metrics.safety_overrides) : '—'],
                     ].map(([l, v]) => [l, v, l === 'override' && String(v).includes('ACTIVE') ? P.warning : undefined]))}
                 </div>
 
@@ -94,11 +105,19 @@ export default function DebugPanel({ rl }) {
                     {rows([
                         ['goal dist', `${fmt(goalDistObs)} m`, goalDistObs < 1 ? P.success : undefined],
                         ['nearest lidar', `${fmt(nearestLidar)} m`, nearestLidar < 0.7 ? P.danger : nearestLidar < 1.5 ? P.warning : P.success],
+                        (snap.path && snap.path.cross_track != null
+                            ? ['cross-track', `${fmt(snap.path.cross_track)} m`,
+                                Math.abs(snap.path.cross_track) > 1.0 ? P.warning : undefined] : null),
+                        (snap.path && snap.path.desired_heading != null
+                            ? ['desired heading', `${fmt(snap.path.desired_heading)} rad`] : null),
+                        (snap.clearances
+                            ? ['clearance (obs/AMR)', `${fmt(snap.clearances.min)} m`,
+                                snap.clearances.min < 0.65 ? P.danger : snap.clearances.min < CLEARANCE_LIMIT ? P.warning : P.success] : null),
                         ['ego vx', `${fmt(rlRobot ? rlRobot.vx : 0)} m/s`],
                         ['ego vy', `${fmt(rlRobot ? rlRobot.vy : 0)} m/s`],
                         ['nav state', rlRobot ? (rlRobot.nav_state || '—') : '—'],
                         ['nav reason', rlRobot ? (rlRobot.nav_reason || '—') : '—'],
-                    ])}
+                    ].filter(Boolean))}
                 </div>
             </div>
 
@@ -142,7 +161,7 @@ export default function DebugPanel({ rl }) {
 
             <div style={{ marginTop: 8 }}>
                 <div style={{ fontSize: 10, color: P.textMuted, marginBottom: 2 }}>
-                    Nearby robots ({MAX_PEERS} slots, range {PEER_OBS_RANGE} m) — normalized observation [44:68]
+                    Nearby robots ({MAX_PEERS} slots, range {PEER_OBS_RANGE} m) — normalized observation [{OBS_PEERS_START}:{OBS_PEERS_START + MAX_PEERS * 4}]
                 </div>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
                     <tbody>

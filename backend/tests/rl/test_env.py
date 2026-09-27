@@ -7,11 +7,14 @@ shapes, reward plumbing, termination rules and determinism are pinned here.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
-from rl.env import (ACTION_DIM, AMRCollisionEnv, DT, LIDAR_RAYS, MAX_PEERS,
-                    OBS_DIM)
+from rl.env import (ACTION_DIM, AMRCollisionEnv, CROSS_TRACK_SCALE, DT,
+                    LIDAR_RAYS, LIDAR_RANGE, MAX_PEERS, NEAR_COLLISION_DIST,
+                    OBS_DIM, OBS_PATH_FEATS, OBS_PEERS_START, _path_local)
 from rl.scenarios import scenario_config
 
 
@@ -46,7 +49,15 @@ def test_observation_layout_lidar_and_peers() -> None:
     rays = obs[:LIDAR_RAYS]
     assert len(rays) == LIDAR_RAYS
     assert (rays >= 0.0).all() and (rays <= 1.0).all()  # normalized
-    assert len(obs) == LIDAR_RAYS + 8 + 4 * MAX_PEERS
+    assert len(obs) == LIDAR_RAYS + 8 + OBS_PATH_FEATS + 4 * MAX_PEERS
+    assert OBS_PEERS_START == LIDAR_RAYS + 8 + OBS_PATH_FEATS
+    # path traits: signed cross-track (v2 feature at +0) + return-bearing sin/cos
+    path_feats = obs[44:47]
+    assert len(path_feats) == OBS_PATH_FEATS
+    assert np.all(np.isfinite(path_feats))
+    assert (path_feats >= -1.0).all() and (path_feats <= 1.0).all()
+    # peer slots are the last 4*MAX_PEERS entries (tail preserved for v1 tooling)
+    assert len(obs[OBS_PEERS_START:]) == 4 * MAX_PEERS
 
 
 def test_action_bounds_and_step_returns() -> None:
@@ -59,8 +70,9 @@ def test_action_bounds_and_step_returns() -> None:
     assert isinstance(terminated, bool)
     assert isinstance(truncated, bool)
     assert "reward_components" in info
-    for key in ("progress", "goal", "collision", "danger", "stopping",
-                "path_deviation", "oscillation"):
+    for key in ("progress", "goal", "collision", "near_collision", "clearance",
+                "amr_clearance", "path_deviation", "path_return", "stopping",
+                "oscillation", "time"):
         assert key in info["reward_components"], key
 
 
@@ -74,12 +86,15 @@ def test_same_seed_is_deterministic() -> None:
     assert np.array_equal(o1[:4], o2[:4]) or np.allclose(o1, o2)
     for _ in range(20):
         a = np.array([0.3, 0.1], dtype=np.float32)
-        n1, r1, t1, u1, _ = e1.step(a)
-        n2, r2, t2, u2, _ = e2.step(a)
+        n1, r1, t1, u1, i1 = e1.step(a)
+        n2, r2, t2, u2, i2 = e2.step(a)
         assert np.allclose(n1, n2), "divergence at step"
         assert r1 == r2
         assert t1 == t2
         assert u1 == u2
+        for k, v in i1["reward_components"].items():
+            v2 = i2["reward_components"][k]
+            assert float(v) == float(v2), f"component {k} diverged"
 
 
 def test_different_scene_seed_is_different() -> None:
@@ -194,8 +209,12 @@ def test_render_state_snapshot_contract() -> None:
         env.step(np.array([0.5, 0.0], dtype=np.float32))
     snap = env.render_state()
     for key in ("step", "time", "max_steps", "dt", "scene", "robots",
-                "observation", "action"):
+                "observation", "action", "action_executed", "safety",
+                "path", "clearances", "reward_cfg"):
         assert key in snap, key
+    assert snap["dt"] == DT
+    assert "cross_track" in snap["path"]
+    assert "obstacle" in snap["clearances"] and "amr" in snap["clearances"]
     assert len(snap["robots"]) == 1
     robot = snap["robots"][0]
     for key in ("id", "x", "y", "heading", "goal", "rl", "reached",
@@ -216,3 +235,120 @@ def test_path_is_present_and_reach_target() -> None:
     assert abs(path[0][1] - r["y"]) < 1e-6
     assert abs(path[-1][0] - r["goal"]["x"]) < 1.0
     assert abs(path[-1][1] - r["goal"]["y"]) < 1.0
+
+def test_per_agent_termination_flags_are_emitted() -> None:
+    env = make_env("simple", seed=4, max_steps=120)
+    env.reset()
+    action = np.zeros((1, ACTION_DIM), dtype=np.float32)
+    for _ in range(3):
+        _, _r, term, trunc, info = env.step(action)
+        assert len(info["agent_terminated"]) == 1
+        assert len(info["agent_truncated"]) == 1
+        assert term == info["agent_terminated"][0]   # single-RL parity
+        assert trunc == info["agent_truncated"][0]
+
+
+def test_reward_fires_once_then_parks() -> None:
+    env = make_env("simple", seed=4, max_steps=120)
+    env.reset()
+    ag = env.rl_agents[0]
+    ag.state.x, ag.state.y = ag.goal          # teleport to the goal
+    env._update_episode_status()              # marks reached from position
+    action = np.zeros((1, ACTION_DIM), dtype=np.float32)
+    r1, comps, term1, _t1 = env._reward_for(ag, 0)
+    assert term1 and comps["goal"] > 0
+    assert r1 > 0
+    r2, comps2, term2, _t2 = env._reward_for(ag, 0)
+    assert term2 and r2 == 0.0                # terminal reward never repeats
+    assert comps2["goal"] == 0.0 and comps2["collision"] == 0.0
+
+
+def test_multi_rl_one_agent_done_keeps_episode_running() -> None:
+    env = make_env("two_robot", seed=6, max_steps=200, n_rl=2, n_opponents=0)
+    env.reset(options={"seed": 6})
+    ag0 = env.rl_agents[0]
+    ag0.state.x, ag0.state.y = ag0.goal       # only agent 0 finishes
+    action = np.zeros((2, ACTION_DIM), dtype=np.float32)
+    for _ in range(5):
+        _, _r, term, trunc, info = env.step(action)
+        assert info["agent_terminated"][0] is True
+        assert info["agent_terminated"][1] is False
+        assert term is False and trunc is False       # scene still running
+        assert not info["success"]
+    assert env.rl_agents[1].done is False             # peer kept going
+
+
+def test_max_steps_truncation_flips_all_agent_flags() -> None:
+    env = make_env("simple", seed=2, max_steps=40)
+    env.reset()
+    action = np.zeros((1, ACTION_DIM), dtype=np.float32)
+    last: dict | None = None
+    for _ in range(41):           # env clamps max_steps; one step past limit
+        last = env.step(action)[-1]
+    assert last is not None
+    assert last["truncated"] is True or last["terminated"] is True
+    assert all(last["agent_truncated"])
+
+
+# ---------------------------------------------------------- obs path traits
+
+def test_path_traits_signed_cross_track() -> None:
+    env = make_env("simple", seed=5)
+    env.reset(options={"seed": 5})
+    ag = env.rl_agents[0]
+    sx, sy = ag.state.x, ag.state.y
+    gx, gy = ag.goal
+    dx, dy = gx - sx, gy - sy
+    L = float(np.hypot(dx, dy))
+    dx, dy = dx / L, dy / L
+    px, py = -dy, dx                  # left of direction of travel
+
+    on = env._obs_for(ag).copy()
+    assert abs(on[44]) < 1e-3, "start is on the path -> cross-track ~ 0"
+    # obs[45:47] = sin/cos of the bearing to the nearest path point in the
+    # robot's frame; verify directly against the geometry helper.
+    _d, near, _sc = _path_local(ag.state.x, ag.state.y, ag.path)
+    bearing = math.atan2(near[1] - ag.state.y, near[0] - ag.state.x) - ag.state.heading
+    assert on[45] == pytest.approx(math.sin(bearing), abs=1e-3)
+    assert on[46] == pytest.approx(math.cos(bearing), abs=1e-3)
+
+    # two metres LEFT of the path, at a point 5 m along
+    ag.state.x = sx + dx * 5.0 + px * 2.0
+    ag.state.y = sy + dy * 5.0 + py * 2.0
+    left = env._obs_for(ag)
+    assert left[44] > 0.1 and left[44] <= 1.0
+    assert not np.allclose(left[44], on[44])
+
+    # two metres RIGHT => cross-track sign flips
+    ag.state.x = sx + dx * 5.0 - px * 2.0
+    ag.state.y = sy + dy * 5.0 - py * 2.0
+    right = env._obs_for(ag)
+    assert right[44] < -0.1
+    assert right[44] * left[44] < 0.0, "left/right should have opposite signs"
+
+    # four metres LEFT saturates the scaled cross-track at +/-1
+    ag.state.x = sx + dx * 5.0 + px * 4.0
+    ag.state.y = sy + dy * 5.0 + py * 4.0
+    far = env._obs_for(ag)
+    assert far[44] == pytest.approx(1.0)
+
+
+def test_obs_near_lidar_drops_when_obstacle_approaches() -> None:
+    env = make_env("simple", seed=5)
+    env.reset(options={"seed": 5})
+    ag = env.rl_agents[0]
+    base = env._obs_for(ag).copy()
+    from common.geometry import Rect
+    env.obstacle_rects.append(Rect(ag.state.x + 0.8, ag.state.y - 0.3,
+                                   0.4, 0.6))
+    near = env._obs_for(ag)
+    assert float(np.min(near[:LIDAR_RAYS])) < float(np.min(base[:LIDAR_RAYS]))
+    assert near[41] < base[41]           # nearest-lidar slot (index 41)
+
+
+def test_path_traits_deterministic_across_reinit() -> None:
+    e1 = make_env("simple", seed=3)
+    e2 = make_env("simple", seed=3)
+    o1, _ = e1.reset(options={"seed": 3})
+    o2, _ = e2.reset(options={"seed": 3})
+    assert np.array_equal(o1[44:47], o2[44:47])

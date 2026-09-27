@@ -48,6 +48,48 @@ def test_initial_state_and_snapshot(trainer) -> None:
     assert "robots" in trainer.last_snapshot
 
 
+def test_reward_config_in_status_and_checkpoint_meta(tmp_path) -> None:
+    t = RLTrainer(small_cfg(), n_envs=2, rollout_steps=32, minibatch=8,
+                  update_epochs=2, seed=1, speed=1.0,
+                  checkpoint_dir=str(tmp_path / "ck"),
+                  reward={"clearance": 5.0, "path_return": 1.2})
+    try:
+        reward_in_status = t.status()["reward"]
+        assert reward_in_status["clearance"] == 5.0
+        assert reward_in_status["path_return"] == 1.2
+        assert set(t.status()["reward_components"]) == {
+            "progress", "goal", "collision", "near_collision", "clearance",
+            "amr_clearance", "path_deviation", "path_return", "stopping",
+            "oscillation", "time"}
+        saved = t.save_checkpoint("reward_cfg")
+        import torch
+        data = torch.load(saved["path"], map_location="cpu")
+        meta = data["meta"]
+        assert meta["reward"]["clearance"] == 5.0
+        assert meta["obs_dim"] == data["obs_dim"]
+    finally:
+        t.shutdown()
+
+
+def test_load_checkpoint_restores_reward(tmp_path) -> None:
+    a = RLTrainer(small_cfg(), n_envs=2, rollout_steps=32, minibatch=8,
+                  update_epochs=2, seed=1, speed=1.0,
+                  checkpoint_dir=str(tmp_path / "a"),
+                  reward={"clearance": 5.0})
+    saved = a.save_checkpoint("src")
+    a.shutdown()
+    b = RLTrainer(small_cfg(), n_envs=2, rollout_steps=32, minibatch=8,
+                  update_epochs=2, seed=1, speed=1.0,
+                  checkpoint_dir=str(tmp_path / "b"))
+    try:
+        assert b.status()["reward"]["clearance"] == 3.0   # default before load
+        res = b.load_checkpoint(name="src", path=saved["path"])
+        assert res["ok"]
+        assert b.status()["reward"]["clearance"] == 5.0   # restored from meta
+    finally:
+        b.shutdown()
+
+
 def test_start_pause_resume(trainer) -> None:
     trainer.start()
     assert wait_until(lambda: trainer.state() == TrainerState.TRAINING)

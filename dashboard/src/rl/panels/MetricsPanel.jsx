@@ -7,10 +7,14 @@ const COMPONENT_NAMES = {
     progress: 'Progress',
     goal: 'Goal',
     collision: 'Collision',
-    danger: 'Danger',
-    stopping: 'Stopping',
+    near_collision: 'Near miss',
+    clearance: 'Clearance',
+    amr_clearance: 'AMR clearance',
     path_deviation: 'Path dev.',
+    path_return: 'Path return',
+    stopping: 'Stopping',
     oscillation: 'Oscillation',
+    time: 'Time',
 };
 
 export default function MetricsPanel({ rl }) {
@@ -30,6 +34,9 @@ export default function MetricsPanel({ rl }) {
         ['Avg goal time', m.avg_goal_time != null ? `${fmt(m.avg_goal_time)}s` : '—'],
         ['Avg distance', m.avg_distance != null ? `${fmt(m.avg_distance)}m` : '—'],
         ['Avg length', fmtInt(m.avg_length)],
+        ['Min clearance', m.live_min_clearance != null ? `${fmt(m.live_min_clearance)}m` : '—'],
+        ['Clearance steps', fmtInt(m.clearance_steps)],
+        ['Override rate', m.override_rate != null ? `${fmt(m.override_rate, 1)}%` : '—'],
     ];
 
     const comps = snap.reward_components || m.components || {};

@@ -25,7 +25,32 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
+import math
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _finite(value, default: float = 0.0) -> float:
+    """Coerce ``value`` to a finite float, else ``default`` (NaN/inf/±-proof)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _finite_tensor(t: torch.Tensor, nan: float = 0.0) -> torch.Tensor:
+    """Replace NaN/inf in a tensor with fixed finite substitutes."""
+    return torch.nan_to_num(t, nan=nan, posinf=0.0, neginf=0.0)
+
+
+def _finite_obs(obs) -> np.ndarray:
+    """Finite, [-1, 1]-bounded obs as float32 (absorb transient env NaN)."""
+    arr = np.asarray(obs, dtype=np.float32)
+    if not np.isfinite(arr).all():
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+        arr = np.clip(arr, -1.0, 1.0)
+    return arr
 
 
 @dataclass
@@ -106,6 +131,12 @@ class ActorCritic(nn.Module):
     def dist(self, obs: torch.Tensor):
         mu, _val = self.forward(obs)
         std = torch.nn.functional.softplus(self.log_std) + 1e-3
+        # Poison-proof: NaN/±inf params must never reach Normal()'s validator
+        # (that is the exact 'loc satisfies Real()' crash class) — sanitise the
+        # distribution moments so inference degrades gracefully and the update
+        # that follows can recover clean weights.
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1.0, neginf=-1.0)
+        std = torch.nan_to_num(std, nan=1e-2, posinf=1e2, neginf=1e-2)
         base = Normal(mu, std)
         return TransformedDistribution(base, [TanhTransform(cache_size=1)])
 
@@ -151,9 +182,10 @@ class RolloutBuffer:
     def push(self, obs, action, logp, value, reward, done) -> None:
         self.obs.append(np.asarray(obs, dtype=np.float32))
         self.actions.append(np.asarray(action, dtype=np.float32))
-        self.logp.append(float(logp))
-        self.values.append(float(value))
-        self.rewards.append(float(reward))
+        # Sanitize scalars so one corrupt transition can't poison the buffer.
+        self.logp.append(_finite(logp))
+        self.values.append(_finite(value))
+        self.rewards.append(_finite(reward))
         self.dones.append(bool(done))
 
     def __len__(self) -> int:
@@ -177,6 +209,13 @@ class RolloutBuffer:
         (used to bootstrap the tail of each env's truncated trajectory).
         """
         obs, actions, logp, values, rewards, dones = self._tensors(agent.device)
+        # Belts-and-braces: buffer rows were sanitised on push, but keep the
+        # update immune even if something bypassed that.
+        obs = _finite_tensor(obs)
+        actions = _finite_tensor(actions)
+        logp = _finite_tensor(logp)
+        values = _finite_tensor(values)
+        rewards = _finite_tensor(rewards)
         n = len(self)
         n_envs = max(1, len(last_values))
         if n == 0:
@@ -189,6 +228,7 @@ class RolloutBuffer:
         dons = dones.view(rows, n_envs)
         last_values_t = torch.as_tensor(
             [float(v) for v in last_values], dtype=torch.float32, device=agent.device)
+        last_values_t = _finite_tensor(last_values_t)
         gae = torch.zeros_like(rews)
         acc = torch.zeros(n_envs, device=agent.device)
         for t in reversed(range(rows)):
@@ -198,6 +238,8 @@ class RolloutBuffer:
             gae[t] = acc
         returns = (vals + gae).reshape(-1)
         gae = gae.reshape(-1)
+        returns = _finite_tensor(returns)
+        gae = _finite_tensor(gae)
         return obs, actions, logp, gae, returns
 
 
@@ -236,6 +278,7 @@ class PPOAgent:
         self.net = ActorCritic(obs_dim, action_dim, hidden=cfg.hidden).to(device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
         self.updates = 0
+        self.skipped_minibatches = 0
         self.meta: Optional[dict] = None
 
     def select_action(self, obs: np.ndarray, deterministic: bool = False):
@@ -244,8 +287,7 @@ class PPOAgent:
         Returns action ``(B, action_dim)``, logp ``(B,)`` and value ``(B,)``
         where ``B`` is the batch/agent count.
         """
-        obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32),
-                                device=self.device)
+        obs_t = torch.as_tensor(_finite_obs(obs), device=self.device)
         with torch.no_grad():
             action, logp, value = self.net.act(obs_t, deterministic=deterministic)
         return (action.cpu().numpy(), logp.cpu().numpy(),
@@ -254,8 +296,7 @@ class PPOAgent:
     def value_of(self, obs: np.ndarray) -> np.ndarray:
         """Critic values for one or more agents (one per obs row)."""
         with torch.no_grad():
-            obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32),
-                                    device=self.device)
+            obs_t = torch.as_tensor(_finite_obs(obs), device=self.device)
             _, val = self.net(obs_t)
             return np.asarray(val.squeeze(-1).cpu().numpy(), dtype=np.float32)
 
@@ -267,23 +308,32 @@ class PPOAgent:
             return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
                     "updates": self.updates, "samples": n}
         adv = (gae - gae.mean()) / (gae.std() + 1e-8)
+        adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
         idx = np.arange(n)
         pi_losses = []
         v_losses = []
         entropies = []
+        skipped = 0
         for _ in range(self.update_epochs):
             np.random.shuffle(idx)
             for start in range(0, n, self.minibatch):
                 b = idx[start:start + self.minibatch]
                 b = torch.as_tensor(b, device=self.device)
                 logp, entropy, value = self.net.evaluate(obs[b], actions[b])
-                ratio = torch.exp(logp - old_logp[b])
+                ratio = torch.nan_to_num(
+                    torch.exp(logp - old_logp[b]), nan=0.0, posinf=10.0, neginf=0.0)
                 surr1 = ratio * adv[b]
                 surr2 = torch.clamp(ratio, 1.0 - self.clip, 1.0 + self.clip) * adv[b]
                 pi_loss = -torch.min(surr1, surr2).mean()
                 v_loss = torch.nn.functional.mse_loss(value, returns[b])
                 ent = entropy.mean()
                 loss = pi_loss + self.val_coef * v_loss - self.ent_coef * ent
+                if not torch.isfinite(loss).all():
+                    # One corrupt minibatch must never NaN the whole policy:
+                    # skip the step and keep training on the clean ones.
+                    self.skipped_minibatches += 1
+                    skipped += 1
+                    continue
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
@@ -292,12 +342,17 @@ class PPOAgent:
                 v_losses.append(float(v_loss.detach()))
                 entropies.append(float(ent.detach()))
         self.updates += 1
+        nan_weights = not all(p.isfinite().all().item()
+                              for p in self.net.parameters())
         return {
-            "policy_loss": float(np.mean(pi_losses)),
-            "value_loss": float(np.mean(v_losses)),
-            "entropy": float(np.mean(entropies)),
+            "policy_loss": float(np.mean(pi_losses)) if pi_losses else 0.0,
+            "value_loss": float(np.mean(v_losses)) if v_losses else 0.0,
+            "entropy": float(np.mean(entropies)) if entropies else 0.0,
             "updates": self.updates,
             "samples": n,
+            "skipped_minibatches": skipped,
+            "nan_minibatches_total": self.skipped_minibatches,
+            "nan_weights": bool(nan_weights),
         }
 
     def save(self, path: str, meta: Optional[dict] = None) -> None:
@@ -344,7 +399,11 @@ class PPOAgent:
             "device": self.device,
             "updates": self.updates,
             "params": sum(p.numel() for p in self.net.parameters()),
-            "log_std": float(np.exp(self.net.log_std.detach().cpu().numpy()).mean()),
+            "log_std": _finite(float(np.exp(
+                self.net.log_std.detach().cpu().numpy()).mean()), 1.0),
+            "skipped_minibatches": self.skipped_minibatches,
+            "weights_finite": bool(all(p.isfinite().all().item()
+                                       for p in self.net.parameters())),
         }
 
     def clone_for_play(self, deterministic: bool = True) -> "PPOAgent":

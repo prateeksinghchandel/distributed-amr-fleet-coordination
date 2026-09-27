@@ -23,13 +23,14 @@ seeded and deterministic — identical seed + actions => identical trajectory.
 
 Observation space (fixed-size vector, float32 in [-1, 1])::
 
-    [0:36]      lidar ray distances / LIDAR_RANGE          (0..1)
-    [36]        goal distance / LIDAR_RANGE                (0..1)
-    [37:39]     goal direction sin/cos (robot frame)
-    [39:41]     ego velocity (vx, vy) / max_speed
-    [41]        nearest lidar distance / LIDAR_RANGE        (0..1)
-    [42:44]     desired (path) heading sin/cos (robot frame)
-    [44:68]     up to MAX_PEERS=6 peer slots [dx, dy, vx, vy] / obs range
+    [OBS_PEERS_START - 6 : OBS_PEERS_START - 3]  =  [40:44]  desired (path) heading sin/cos
+    [44]        signed cross-track error / CROSS_TRACK_SCALE     (+left / -right)
+    [45:47]     bearing (sin, cos) to the nearest point on the
+                global path (robot frame)  -- "return toward path" cue
+    [47:71]     up to MAX_PEERS=6 peer slots [dx, dy, vx, vy] / obs range
+
+(in full: [0:36] lidar; [36] goal dist; [37:39] goal dir; [39:41] ego vel;
+[41] nearest lidar; [42:44] desired heading; [44:47] path traits; [47:71] peers)
 
 Action space (Box(-1,1)^2)::
 
@@ -43,15 +44,23 @@ Reward components (returned separately in ``info`` for visualization)::
     progress        goal-distance improvement
     goal            reaching the goal region
     collision       static-obstacle / robot-robot contact
-    danger          proximity to obstacles or peers
+    near_collision  continuous penalty while clearance < NEAR_COLLISION_DIST
+    clearance       continuous obstacle/dynamic clearance shaping (quadratic)
+    amr_clearance   continuous AMR-to-AMR clearance shaping (quadratic)
+    path_deviation  perpendicular distance from the global path (capped)
+    path_return     positive shaping while converging back onto the path
     stopping        standing still while far from the goal
-    path_deviation  perpendicular distance from the global path
     oscillation     rapid steering sign flips while moving
+    time            per-second elapsed penalty
+
+All per-step weights live in ``RewardConfig`` (surface: status / checkpoints /
+evaluation output), so the campaign can tune them without code changes.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import asdict, dataclass
 from typing import Optional, Sequence
 
 import gymnasium as gym
@@ -59,6 +68,31 @@ import numpy as np
 from gymnasium import spaces
 
 from common.geometry import Rect
+
+# ---------------------------------------------------------------------------
+# Finite-value helpers
+# ---------------------------------------------------------------------------
+# A NaN reaching the policy net at any point (bad config, GPU numerical edge)
+# crashes training with `Normal(loc)` validation errors and permanently poisons
+# the weights. These helpers guarantee obs/reward/action values are always
+# finite: non-finite inputs fall back to a safe default instead of propagating
+# (note that `np.clip` happily propagates NaN).
+
+
+def _finite_num(value, default: float = 0.0) -> float:
+    """Coerce ``value`` to a finite float or return ``default``."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _sanitize_obs(obs: np.ndarray) -> np.ndarray:
+    """Force an observation vector to the documented [-1, 1] finite range."""
+    obs = np.asarray(obs, dtype=np.float32)
+    obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+    return np.clip(obs, -1.0, 1.0).astype(np.float32)
 from robot.navigation.interfaces import NavContext
 from robot.navigation.safety import AlgorithmicSafetyController
 from robot.navigation.pipeline import AlgorithmicNavPipeline
@@ -94,14 +128,86 @@ REWARD_GOAL = 50.0
 REWARD_COLLISION_ROBOT = -40.0
 REWARD_COLLISION_OBSTACLE = -50.0
 REWARD_PROGRESS = 10.0
-REWARD_DANGER = 2.0
-REWARD_DANGER_DIST = 0.6
 REWARD_STOP = 0.06
-REWARD_DEVIATION = 0.25
 REWARD_OSCILLATION = 0.3
 
-OBS_DIM = LIDAR_RAYS + 1 + 2 + 2 + 1 + 2 + MAX_PEERS * 4
+# --- observation layout (v2: +3 local path traits inserted before the peers) --
+OBS_PATH_FEATS = 3                    # signed cross-track + return-bearing sin/cos
+CROSS_TRACK_SCALE = 4.0               # metres of off-path at obs == -1/+1
+OBS_VERSION = 2
+OBS_PEERS_START = LIDAR_RAYS + 1 + 2 + 2 + 1 + 2 + OBS_PATH_FEATS   # 47
+OBS_DIM = OBS_PEERS_START + MAX_PEERS * 4                           # 71
 ACTION_DIM = 2
+
+
+@dataclass
+class RewardConfig:
+    """Explicit, validated reward weights for local collision avoidance.
+
+    This is the canonical reward configuration: the trainer, headless runner,
+    server CLI, checkpoints, status and evaluation output all funnel their
+    reward terms through it, so the active campaign weights are never implicit.
+    Each weight is a *magnitude* (>= 0); the sign convention lives below.
+
+    Per-step components (summed each step, reported in ``info``):
+        progress      +w·goal-progress (±2 cap)                 against time wasted
+        near_collision -w·(1 - c/NCD) while clearance < NCD     urgent avoidance
+        clearance     -w·(1 - c/L)²  while obstacle clearance < L
+        amr_clearance -w·(1 - c/L)²  while AMR clearance < L
+        path_deviation -w·min(cross, limit)                      off-route cost
+        path_return   +w·min(gain, cap) while converging onto the route
+        stopping      -w  when parked far from the goal
+        oscillation   -w  on steering sign flips while moving
+        time          -w·dt  per elapsed second
+    Terminal components:
+        goal          +w  on arrival
+        collision     -w  on contact (separate robot / obstacle magnitudes)
+    """
+
+    progress: float = REWARD_PROGRESS
+    goal: float = REWARD_GOAL
+    collision_robot: float = abs(REWARD_COLLISION_ROBOT)
+    collision_obstacle: float = abs(REWARD_COLLISION_OBSTACLE)
+    near_collision: float = 4.0
+    clearance: float = 3.0
+    clearance_limit: float = 1.0
+    amr_clearance: float = 3.0
+    amr_clearance_limit: float = 1.2
+    path_deviation: float = 0.8
+    path_deviation_limit: float = 3.0
+    path_return: float = 0.8
+    path_return_threshold: float = 0.4
+    path_return_cap: float = 0.5
+    stopping: float = REWARD_STOP
+    oscillation: float = REWARD_OSCILLATION
+    time: float = 0.01
+
+    def validate(self) -> "RewardConfig":
+        for name, value in asdict(self).items():
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"reward.{name} must be finite and >= 0, got {value}")
+        if self.clearance_limit <= 0.0 or self.amr_clearance_limit <= 0.0:
+            raise ValueError("clearance limits must be > 0")
+        if self.path_deviation_limit <= 0.0:
+            raise ValueError("path_deviation_limit must be > 0")
+        if self.path_return_cap <= 0.0:
+            raise ValueError("path_return_cap must be > 0")
+        return self
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "RewardConfig":
+        cfg = cls()
+        if data:
+            for k, v in data.items():
+                if k in asdict(cfg) and isinstance(getattr(cfg, k), float):
+                    setattr(cfg, k, float(v))
+        return cfg.validate()
+
+
+DEFAULT_REWARD = RewardConfig().validate()
 
 
 def _norm_angle(a: float) -> float:
@@ -164,14 +270,45 @@ def _dist_to_segments(x: float, y: float, path: Sequence) -> float:
     return best if math.isfinite(best) else 0.0
 
 
+def _path_local(x, y, path: Sequence) -> tuple:
+    """Nearest-path-point features: ``(dist_m, nearest_point, signed_cross)``.
+
+    ``signed_cross`` is the perpendicular distance from the global path in
+    metres, positive to the LEFT of the direction of travel (cross(z) of the
+    segment direction with the offset vector). Deterministic; reused for the
+    observation traits *and* the path_deviation / path_return rewards.
+    """
+    if not path:
+        return 0.0, (x, y), 0.0
+    best = math.inf
+    near = (x, y)
+    sign = 0.0
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        vx, vy = bx - ax, by - ay
+        wx, wy = x - ax, y - ay
+        L2 = vx * vx + vy * vy
+        if L2 <= 1e-12:
+            continue
+        t = max(0.0, min(1.0, (wx * vx + wy * vy) / L2))
+        px, py = ax + t * vx, ay + t * vy
+        d = math.hypot(x - px, y - py)
+        if d < best:
+            best = d
+            near = (px, py)
+            sign = (vx * (y - ay) - vy * (x - ax)) / math.sqrt(L2)
+    dist = best if math.isfinite(best) else 0.0
+    return dist, near, sign * dist
+
+
 class _Agent:
     """Runtime bookkeeping for one robot in the environment."""
 
     __slots__ = ("state", "rl", "pipeline", "safety_guard", "path", "path_idx",
                  "goal", "reached", "collided", "done", "metrics",
-                 "prev_goal_dist", "prev_steer",
+                 "prev_goal_dist", "prev_steer", "prev_cross",
                  "stuck_steps", "last_obs", "last_action", "last_override",
-                 "trajectory", "oscillations", "policy")
+                 "trajectory", "oscillations", "policy",
+                 "min_obs_c", "min_amr_c", "last_path_return")
 
     def __init__(self, spec, rl: bool):
         self.state = RobotState(
@@ -192,9 +329,12 @@ class _Agent:
         self.metrics = {
             "distance": 0.0, "waiting_time": 0.0, "path_deviation": 0.0,
             "safety_overrides": 0, "oscillations": 0, "stuck_steps": 0,
+            "min_clearance": LIDAR_RANGE, "mean_clearance": 0.0,
+            "clearance_steps": 0, "path_return_steps": 0,
         }
         self.prev_goal_dist = math.hypot(self.goal[0] - spec.x, self.goal[1] - spec.y)
         self.prev_steer = 0.0
+        self.prev_cross = _path_local(spec.x, spec.y, self.path)[2]
         self.stuck_steps = 0
         self.last_obs = None
         self.last_action = np.zeros(2, dtype=np.float32)
@@ -211,10 +351,12 @@ class AMRCollisionEnv(gym.Env):
 
     def __init__(self, scenario: Optional[dict] = None, *, seed: Optional[int] = None,
                  dt: float = DT, safety: str = "guard",
-                 opponents: Optional[list] = None):
+                 opponents: Optional[list] = None,
+                 reward: Optional[dict] = None):
         super().__init__()
         from rl.scenarios import _clamp_scenario
         self.cfg = _clamp_scenario(scenario or {})
+        self.reward = RewardConfig.from_dict(reward)
         self.seed_initial = int(seed) if seed is not None else 0
         self.dt = dt
         self.safety_mode = safety          # 'off' | 'guard' (peers) | 'strict'
@@ -328,7 +470,6 @@ class AMRCollisionEnv(gym.Env):
         # ---- 4. Resolve contacts / goal arrivals & collect observations.
         self._update_episode_status()
         self._count_near_collisions()
-        self._step_metrics()
         self._time += self.dt
         self.step_count += 1
 
@@ -345,6 +486,10 @@ class AMRCollisionEnv(gym.Env):
             agent_truncs.append(bool(trunc))
             for k, v in rcomps.items():
                 comps.setdefault(k, []).append(v)
+
+        # Consume this step's clearance / path features (set during the reward
+        # pass) into the per-agent run metrics.
+        self._step_metrics()
 
         timeout = self.step_count >= self.max_steps
         if timeout:
@@ -406,8 +551,8 @@ class AMRCollisionEnv(gym.Env):
 
     def _apply_rl_action(self, ag: _Agent, fleet, act) -> None:
         s = ag.state
-        throttle = float(np.clip(act[0], -1.0, 1.0))
-        steer = float(np.clip(act[1], -1.0, 1.0))
+        throttle = _finite_num(np.clip(act[0], -1.0, 1.0))
+        steer = _finite_num(np.clip(act[1], -1.0, 1.0))
         ag.last_action = np.array([throttle, steer], dtype=np.float32)
 
         v = throttle * s.max_speed if throttle >= 0 else throttle * REVERSE_SCALE * s.max_speed
@@ -569,6 +714,8 @@ class AMRCollisionEnv(gym.Env):
         goal_ang = math.atan2(goal_dy, goal_dx) - s.heading
         _, peers = self._peers(ag)
         des = self._desired_heading(ag) - s.heading
+        _dev, near, signed_cross = _path_local(s.x, s.y, ag.path)
+        path_ang = math.atan2(near[1] - s.y, near[0] - s.x) - s.heading
         obs = np.concatenate([
             rays,
             [goal_dist],
@@ -576,8 +723,11 @@ class AMRCollisionEnv(gym.Env):
             [s.vx / max(1e-6, s.max_speed), s.vy / max(1e-6, s.max_speed)],
             [float(np.min(rays))],
             [math.sin(des), math.cos(des)],
+            [float(np.clip(signed_cross / CROSS_TRACK_SCALE, -1.0, 1.0)),
+             math.sin(path_ang), math.cos(path_ang)],
             peers,
-        ]).astype(np.float32)
+        ])
+        obs = _sanitize_obs(obs)
         ag.last_obs = obs
         return obs
 
@@ -590,12 +740,51 @@ class AMRCollisionEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
 
+    def _clearances(self, ag: _Agent) -> tuple[float, float]:
+        """Physical clearance to (static+dynamic) geometry and to peers.
+
+        Measured at the robot's own radius (not the lidar's OBS_INFLATE), so
+        the penalty scale maps to the real gap between surfaces — a value of 0
+        means the body is touching. Scans the same 36 heading rays with the
+        shared geometry helpers; deterministic.
+        """
+        s = ag.state
+        inflate = float(s.radius)
+        min_obs = math.inf
+        min_amr = math.inf
+        for i in range(LIDAR_RAYS):
+            ang = s.heading + (2.0 * math.pi * i) / LIDAR_RAYS
+            dx, dy = math.cos(ang), math.sin(ang)
+            for r in self.obstacle_rects:
+                t = _ray_rect(0, s.x, s.y, dx, dy, r, inflate)
+                if t < min_obs:
+                    min_obs = t
+            for dv in self._dynamic:
+                rr = Rect(dv.x, dv.y, dv.width, dv.height)
+                t = _ray_rect(0, s.x, s.y, dx, dy, rr, inflate)
+                if t < min_obs:
+                    min_obs = t
+            for p in self.agents:
+                if p.state.id == s.id or not p.state.online:
+                    continue
+                t = _ray_circle(s.x, s.y, dx, dy, p.state.x, p.state.y,
+                                p.state.radius + inflate)
+                if t < min_amr:
+                    min_amr = t
+        if not math.isfinite(min_obs):
+            min_obs = float(LIDAR_RANGE)
+        if not math.isfinite(min_amr):
+            min_amr = float(LIDAR_RANGE)
+        return max(0.0, min(min_obs, LIDAR_RANGE)), max(0.0, min(min_amr, LIDAR_RANGE))
+
     def _reward_for(self, ag: _Agent, idx: int):
+        rw = self.reward
         s = ag.state
         goal_dist = math.hypot(ag.goal[0] - s.x, ag.goal[1] - s.y)
         comps = {k: 0.0 for k in
-                 ("progress", "goal", "collision", "danger", "stopping",
-                  "path_deviation", "oscillation")}
+                 ("progress", "goal", "collision", "near_collision",
+                  "clearance", "amr_clearance", "path_deviation",
+                  "path_return", "stopping", "oscillation", "time")}
         terminated = False
         truncated = False
 
@@ -607,48 +796,68 @@ class AMRCollisionEnv(gym.Env):
                 return 0.0, comps, True, False
             ag.done = True
             if ag.collided:
-                comps["collision"] = (REWARD_COLLISION_ROBOT if ag.state.blocked
-                                      else REWARD_COLLISION_OBSTACLE)
+                comps["collision"] = -(
+                    rw.collision_robot if ag.state.blocked
+                    else rw.collision_obstacle)
                 terminated = True
-                total = sum(comps.values())
-                return total, comps, terminated, truncated
-            comps["goal"] = REWARD_GOAL
+                total = _finite_num(sum(comps.values()))
+                return float(total), comps, terminated, truncated
+            comps["goal"] = rw.goal
             terminated = True
-            total = sum(comps.values())
-            return total, comps, terminated, truncated
+            total = _finite_num(sum(comps.values()))
+            return float(total), comps, terminated, truncated
 
         # progress
         delta = ag.prev_goal_dist - goal_dist
-        comps["progress"] = float(np.clip(REWARD_PROGRESS * delta, -2.0, 2.0))
+        comps["progress"] = float(np.clip(rw.progress * delta, -2.0, 2.0))
         ag.prev_goal_dist = goal_dist
 
-        # danger (nearest ray + nearest peer)
-        min_ray = float(np.min(ag.last_obs[:LIDAR_RAYS])) * LIDAR_RANGE
-        nearest = min_ray
-        for p in self.agents:
-            if p.state.id == s.id:
-                continue
-            nearest = min(nearest, math.hypot(p.state.x - s.x, p.state.y - s.y))
-        if nearest < REWARD_DANGER_DIST:
-            comps["danger"] = -REWARD_DANGER * (REWARD_DANGER_DIST - nearest)
+        # continuous physical clearance (obstacle vs AMR handled separately so
+        # neither dominates; quadratic -> stronger penalty just above contact)
+        min_obs, min_amr = self._clearances(ag)
+        ag.min_obs_c = min_obs
+        ag.min_amr_c = min_amr
+        near = min(min_obs, min_amr)
+        if near < NEAR_COLLISION_DIST:
+            comps["near_collision"] = -rw.near_collision * (
+                1.0 - near / NEAR_COLLISION_DIST)
+        if min_obs < rw.clearance_limit:
+            q = 1.0 - min_obs / rw.clearance_limit
+            comps["clearance"] = -rw.clearance * q * q
+        if min_amr < rw.amr_clearance_limit:
+            q = 1.0 - min_amr / rw.amr_clearance_limit
+            comps["amr_clearance"] = -rw.amr_clearance * q * q
 
         # stopping
         if s.speed < 0.08 and goal_dist > 0.8:
-            comps["stopping"] = -REWARD_STOP
+            comps["stopping"] = -rw.stopping
 
-        # path deviation
-        dev = _dist_to_segments(s.x, s.y, ag.path)
-        comps["path_deviation"] = -REWARD_DEVIATION * min(dev, 4.0)
+        # path deviation + learnable path return (positive while converging;
+        # zero while holding station off-route, so parking-adjacent strategies
+        # get no return credit and deviation still bleeds)
+        _dev, _near_pt, signed_cross = _path_local(s.x, s.y, ag.path)
+        cross = abs(signed_cross)
+        comps["path_deviation"] = -rw.path_deviation * min(cross, rw.path_deviation_limit)
+        ag.last_path_return = 0.0
+        if ag.prev_cross >= rw.path_return_threshold and \
+                cross < ag.prev_cross - 1e-4:
+            gain = min(ag.prev_cross - cross, rw.path_return_cap)
+            comps["path_return"] = rw.path_return * gain
+            ag.last_path_return = float(comps["path_return"])
+        ag.prev_cross = cross
 
         # oscillation
         if s.speed > 0.1:
             steer = float(ag.last_action[1])
             if steer * ag.prev_steer < 0:
-                comps["oscillation"] = -REWARD_OSCILLATION
+                comps["oscillation"] = -rw.oscillation
                 ag.oscillations += 1
             ag.prev_steer = steer
         else:
             ag.prev_steer = float(ag.last_action[1])
+
+        # time: every elapsed second bleeds a little reward
+        comps["time"] = -rw.time * self.dt
 
         # stuck detection -> truncated
         if goal_dist > 1.0:
@@ -659,7 +868,8 @@ class AMRCollisionEnv(gym.Env):
             if ag.stuck_steps >= STUCK_STEPS:
                 truncated = True
 
-        total = sum(comps.values())
+        comps = {k: _finite_num(v) for k, v in comps.items()}
+        total = _finite_num(sum(comps.values()))
         return float(total), comps, terminated, truncated
 
     # ------------------------------------------------------------------
@@ -698,12 +908,18 @@ class AMRCollisionEnv(gym.Env):
                                            ag.goal[1] - ag.state.y)
             ag.stuck_steps = 0
             ag.prev_steer = 0.0
+            ag.prev_cross = _path_local(ag.state.x, ag.state.y, ag.path)[2]
+            ag.min_obs_c = float(LIDAR_RANGE)
+            ag.min_amr_c = float(LIDAR_RANGE)
+            ag.last_path_return = 0.0
             ag.trajectory = [(ag.state.x, ag.state.y)]
             ag.last_override = {"overridden": False, "reason": None, "guard": "none"}
             ag.done = False
             ag.metrics = {
                 "distance": 0.0, "waiting_time": 0.0, "path_deviation": 0.0,
                 "safety_overrides": 0, "oscillations": 0, "stuck_steps": 0,
+                "min_clearance": LIDAR_RANGE, "mean_clearance": 0.0,
+                "clearance_steps": 0, "path_return_steps": 0,
             }
         self.episode_near_collisions = 0
 
@@ -721,6 +937,15 @@ class AMRCollisionEnv(gym.Env):
                 ag.metrics["waiting_time"] += self.dt
             dev = _dist_to_segments(s.x, s.y, ag.path)
             ag.metrics["path_deviation"] += float(min(dev, 4.0)) * self.dt
+            if ag.rl:
+                c = min(ag.min_obs_c, ag.min_amr_c)
+                ag.metrics["min_clearance"] = min(ag.metrics["min_clearance"], c)
+                n = ag.metrics["clearance_steps"] + 1
+                ag.metrics["clearance_steps"] = n
+                ag.metrics["mean_clearance"] = (
+                    ag.metrics["mean_clearance"] * (n - 1) + c) / n
+                if ag.last_path_return > 0.0:
+                    ag.metrics["path_return_steps"] += 1
 
     def _count_near_collisions(self) -> None:
         """Count RL-agents near misses (close approach without contact)."""
@@ -799,6 +1024,8 @@ class AMRCollisionEnv(gym.Env):
         rays, endpoints = self._lidar(s0)
         obs = s0.last_obs
         obs_list = obs.tolist() if obs is not None else None
+        _dev, near_pt, signed_cross = _path_local(s0.state.x, s0.state.y, s0.path)
+        des = self._desired_heading(s0) - s0.state.heading
         return {
             "type": "snapshot",
             "step": self.step_count,
@@ -824,5 +1051,20 @@ class AMRCollisionEnv(gym.Env):
             },
             "observation": obs_list,
             "action": s0.last_action.tolist(),
+            "action_executed": [round(float(s0.state.vx), 3),
+                                round(float(s0.state.vy), 3)],
             "safety": s0.last_override,
+            "path": {
+                "cross_track": round(float(signed_cross), 3),
+                "cross_track_norm": round(float(
+                    np.clip(signed_cross / CROSS_TRACK_SCALE, -1.0, 1.0)), 3),
+                "nearest": [float(near_pt[0]), float(near_pt[1])],
+                "desired_heading": round(float(des), 4),
+            },
+            "clearances": {
+                "obstacle": round(float(s0.min_obs_c), 3),
+                "amr": round(float(s0.min_amr_c), 3),
+                "min": round(float(min(s0.min_obs_c, s0.min_amr_c)), 3),
+            },
+            "reward_cfg": self.reward.to_dict(),
         }

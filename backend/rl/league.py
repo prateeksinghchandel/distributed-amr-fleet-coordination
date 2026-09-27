@@ -236,8 +236,8 @@ class LeagueTrainer:
             self.promote()   # baseline member so early scenes have variety
         self.trainer.start()
         self._manager = threading.Thread(
-            target=self._drive_until_stopped, name="league-manager",
-            args=(report_every,), daemon=True)
+            target=self._drive, name="league-manager",
+            kwargs={"report_every": report_every}, daemon=True)
         with self._lock:
             self.running = True
         self._manager.start()
@@ -258,7 +258,14 @@ class LeagueTrainer:
                                            "type": "league", "event": "stop"})
         return {"ok": True, **self.status()}
 
-    def _drive_until_stopped(self, report_every: float) -> None:
+    def _drive(self, report_every: float,
+               steps_target: Optional[int] = None) -> None:
+        """Single scheduling loop, shared by the manager thread and ``run``.
+
+        ``steps_target`` (set only by the headless ``run`` entrypoint) stops
+        the loop once the trainer has reached that many sim steps; otherwise
+        the loop runs until ``self._manager_stop`` is set.
+        """
         t_start = time.time()
         last_report = time.time()
         try:
@@ -294,16 +301,25 @@ class LeagueTrainer:
                     self.trainer.emit_event("league", {
                         **self.status(), "type": "league",
                         "event": "status", "metrics": m, "step_rate": rate})
+                if steps_target is not None and \
+                        self.trainer.total_steps >= steps_target:
+                    break
         finally:
             with self._lock:
                 self.running = False
-            print(f"[league] schedule stopped @ {self.trainer.total_steps} "
-                  f"steps, {self.generations} generations", flush=True)
+
+    def _drive_until_stopped(self, report_every: float) -> None:
+        """Backward-compatible manager entrypoint (delegates to ``_drive``)."""
+        self._drive(report_every, steps_target=None)
 
     def run(self, steps: int = 20000, pool_every: int = 3000,
             report_every: float = 5.0, vs_pool_episodes: int = 3) -> None:
-        """Single-shot headless run: train, promote every ``pool_every`` sim
-        steps, then pause, freeze the final champion and shutdown."""
+        """Single-shot headless run, driven by the same ``_drive`` loop.
+
+        Trains, promotes every ``pool_every`` sim steps, then stops the loop,
+        freezes the final champion and shuts down. Mirrors the manager-driven
+        schedule exactly — a single source for the promotion cadence.
+        """
         self._manager_stop.clear()
         with self._lock:
             self.pool_every = max(1, int(pool_every))
@@ -313,39 +329,13 @@ class LeagueTrainer:
             self.promote()   # baseline member so early scenes have variety
         self.trainer.start()
         t_start = time.time()
-        last_report = time.time()
-        try:
-            while True:
-                self.trainer._wake.set()
-                time.sleep(0.05)
-                if self.trainer.state() == TrainerState.ERROR:
-                    raise RuntimeError(
-                        f"league training crashed: "
-                        f"{self.trainer.status().get('error')}")
-                if (self.trainer.total_steps > 0 and
-                        self.trainer.total_steps - self.last_promotion >= pool_every):
-                    self.promote()
-                    vs = self.champion_vs_pool(vs_pool_episodes)
-                    s = vs["summary"]
-                    print(f"[league] generation {self.generations} @ "
-                          f"{self.trainer.total_steps} steps: "
-                          f"vs pool avg success {s['avg_success_rate']}% "
-                          f"({s['opponents']} opponents)", flush=True)
-                if time.time() - last_report > report_every:
-                    last_report = time.time()
-                    m = self.trainer.metrics_brief()
-                    rate = int(self.trainer.total_steps /
-                               max(time.time() - t_start, 1e-6))
-                    print(f"[league] steps={self.trainer.total_steps} "
-                          f"episodes={m['episodes']} win={m['success_rate']}% "
-                          f"gen={self.generations} rate={rate} step/s",
-                          flush=True)
-                if self.trainer.total_steps >= steps:
-                    break
-            print(f"[league] target reached: {self.trainer.total_steps} steps "
-                  f"in {time.time() - t_start:.1f}s, "
-                  f"{self.generations} generations", flush=True)
-            self.promote()   # freeze the final champion too
-        finally:
-            self.trainer.pause()
-            self.trainer.shutdown()
+        self._drive(report_every, steps_target=int(steps))
+        if self._error:
+            raise RuntimeError(
+                f"league training crashed: {self._error}")
+        print(f"[league] target reached: {self.trainer.total_steps} steps "
+              f"in {time.time() - t_start:.1f}s, "
+              f"{self.generations} generations", flush=True)
+        self.promote()   # freeze the final champion too
+        self.trainer.pause()
+        self.trainer.shutdown()
