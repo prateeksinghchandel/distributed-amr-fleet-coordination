@@ -57,7 +57,7 @@ PYTHONPATH=. python3 -m fleet_manager
 
 ## 4. Running the Test Suites
 
-### Backend Unit Tests (176 tests):
+### Backend Unit Tests (340 tests):
 ```bash
 cd backend
 python -m pytest tests/ -v
@@ -188,7 +188,118 @@ terminal): the Vite dev/preview server exposes `/_studio/rl-launch`,
 (stdout/stderr → `.rl-server.log.txt` at the repo root). The toggle flips back
 to STOP when the process is up; **STOP SERVER** kills it.
 
-### 7d. Checkpoints & Tests
+### 7d. Training the Final Policy (recommended process)
+
+The current campaign uses a **71-dim observation** (`obs_version: 2`, adds three
+local path traits) and an **11-component reward**. Both are already live in the UI
+path — no flags needed for defaults.
+
+> **Start from fresh weights.** All obs-v1 (68-dim) checkpoints are rejected at
+> load time (`rl_policy.py:372` raises on `obs_dim` mismatch). Clear
+> `backend/rl/checkpoints/*.pt` from the previous campaign first, or the league
+> pool logic will try to load them and fail.
+
+#### Phase 0 — Pre-flight
+```bash
+cd backend
+../.venv/bin/python -m pytest tests/ -q        # expect 340 passed
+cd ../dashboard && npm run build && npm run lint
+```
+
+#### Phase 1 — Curriculum warmup (fresh weights, no self-play)
+
+Launch at level 1 and advance one level at a time. Do **not** start at level 8:
+the path-return and clearance shaping only emerge on scenes where the robot is
+genuinely squeezed.
+
+```bash
+cd dashboard
+npm run rl-server -- --level 1 --n-envs 24 --safety guard --save-every 5000
+```
+(Second terminal: `npm run dev`, open the studio, press START.)
+
+Move up with the ScenarioPanel level buttons (`change_scenario`) — weights
+persist across switches. Proposed gates:
+
+| Level | Scene | Advance when |
+|---|---|---|
+| 1 `simple` | straight corridor | success >90%, collision ~0 |
+| 2 `obstacle_avoidance` | static obstacles | success >80% |
+| 3 `two_robot` | one peer | success >70%, near-collision <15% |
+| 4 random 4-robot | mixed | success >65% |
+| 5 `narrow_corridor` | tight | success >60% |
+| 6 `intersection` | crossing | success >55% |
+| 7 corridor, opposite edges | oncoming | success >50% |
+| 8 `dense_traffic` | full density | success >50%, no NaN recoveries |
+
+Watch these three signals per level (all visible in the studio):
+- **Min clearance** (Metrics) should *decrease* with difficulty, never sit at 0.
+- **Override rate** (Metrics) should stay near 0 with `--safety guard`. A rising
+  rate means the policy is leaning on the safety layer instead of having learned
+  avoidance — step back a level.
+- **Cross-track** (Debug) should hover near 0 on straight segments. Sustained
+  drift means `path_return` is not overcoming `path_deviation`.
+
+Run at MAX speed for throughput; drop to 1x only when inspecting a manoeuvre.
+
+#### Phase 2 — Evaluation gate (before self-play)
+
+Evaluate a specific checkpoint from the studio's **Evaluation** panel: set
+*Controller* = `rl`, paste the checkpoint name in the *Checkpoint* field, keep the
+default seeds `42 43 44 45 46`, and press **EVALUATE RL**. Use **EVALUATE BOTH** to
+get the algorithmic baseline on the same seeds for a side-by-side table.
+
+In headless, `--eval` evaluates the policy *being trained in that process* after
+the step budget is reached — it is not an arbitrary-checkpoint evaluator:
+```bash
+cd backend
+../.venv/bin/python -m rl.headless --scenario dense_traffic --level 8 \
+  --steps 60000 --n-envs 24 --eval --eval-episodes 20 --save-every 5000
+```
+
+Promotion criteria: success ≥50%, collision rate ≤5%, **avg min clearance ≥0.3 m**,
+and `path_return_steps > 0` (proves the return-to-path shaping is actually being
+used rather than ignored).
+
+#### Phase 3 — Self-play league
+
+```bash
+cd dashboard
+npm run rl-server:league    # --league --pool-size 4 --pool-every 3000
+```
+Second terminal: `npm run dev` → **Self-Play** tab (or the SELF-PLAY launchers in
+the header/startup screen). Champions freeze into a pool; the champion then plays
+the pool. This is what hardens the policy against adversarial traffic rather than
+fixed scripted peers.
+
+If `Oscillation` / `Stopping` components climb while success stalls, the champion
+is thrashing: lower entropy (`--ent-coef 0.005`) or lengthen the rollout.
+
+#### Phase 4 — Final policy selection
+
+- Select on the Phase-2 **evaluation** result, not on training reward (training
+  reward is inflated by the `progress` term).
+- Re-evaluate the chosen checkpoint on **unseen seeds** to avoid selection bias.
+- Confirm its `meta.obs_dim == 71` and that `meta.reward` matches what you intend
+  to ship — the reward config travels inside the checkpoint.
+
+#### Reward tuning (optional)
+
+Defaults live in `RewardConfig` (`rl/env.py:167`). To deviate, pass a JSON merge
+at launch:
+
+```bash
+npm run rl-server -- --reward-json '{"clearance": 5, "path_return": 1.2}'
+```
+```bash
+cd backend
+../.venv/bin/python -m rl.headless --reward-json '{"clearance": 5}'
+```
+Omitted keys keep their default. There is **no runtime `set_reward` command**, so
+changing weights mid-run means restarting the server (or loading a checkpoint,
+which restores the reward stored in its meta).
+
+### 7e. Checkpoints & Tests
 
 - Model files live in `backend/rl/checkpoints/` by default. Every save/load/delete is a trainer command issued from the Checkpoints panel.
 - Backend RL tests (including autosave and self-play):

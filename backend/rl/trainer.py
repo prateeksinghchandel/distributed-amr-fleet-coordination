@@ -62,7 +62,7 @@ class RLTrainer:
                  n_envs: int = 8, safety: str = "guard",
                  rollout_steps: int = 512, lr: float = 3e-4,
                  gamma: float = 0.99, lam: float = 0.95, clip: float = 0.2,
-                 ent_coef: float = 0.01, val_coef: float = 0.5,
+                 ent_coef: float = 0.002, val_coef: float = 0.5,
                  update_epochs: int = 4, minibatch: int = 64,
                  hidden: int = 128,
                  device: Optional[str] = None, speed: float = 1.0,

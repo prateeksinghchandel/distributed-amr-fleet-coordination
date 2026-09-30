@@ -322,7 +322,7 @@ def main() -> None:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lam", type=float, default=0.95)
     parser.add_argument("--clip", type=float, default=0.2)
-    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--ent-coef", type=float, default=0.002)
     parser.add_argument("--val-coef", type=float, default=0.5)
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--minibatch", type=int, default=64)

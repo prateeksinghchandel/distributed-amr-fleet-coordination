@@ -100,6 +100,24 @@ def test_pool_promote_evicts_oldest_and_freezes(league_trainer, tmp_path) -> Non
     assert all(torch.equal(before[k], after[k]) for k in before)
 
 
+def test_promoted_opponents_are_deterministic(league_trainer) -> None:
+    """Pool members must not re-sample: that injects noise into training scenes.
+
+    Matches load_policy(), which already freezes seeded opponents
+    deterministically, so promoted and seeded pools behave the same.
+    """
+    league = LeagueTrainer(league_trainer, pool_size=2)
+    league.promote("gen1")
+    clone = league.pool[0][1]
+    assert clone.play_deterministic is True
+
+    # A deterministic opponent gives an identical action for identical obs.
+    obs = np.zeros((1, OBS_DIM), dtype=np.float32)
+    first = clone.play_action(obs)
+    for _ in range(5):
+        assert np.array_equal(clone.play_action(obs), first)
+
+
 def test_champion_vs_pool_reports_per_opponent(league_trainer) -> None:
     league = LeagueTrainer(league_trainer, pool_size=2)
     for g in (1, 2, 3):

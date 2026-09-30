@@ -91,7 +91,11 @@ class LeagueTrainer:
             save_path = str(self.checkpoint_dir / "champion.pt")
 
             def _freeze():
-                clone = self.trainer.agent.clone_for_play(deterministic=False)
+                # Deterministic, matching load_policy() and the seeded pool: a
+                # stochastic opponent re-samples its action every step, which
+                # injects throttle noise into the training scene and makes a
+                # given seed replay differently on each run.
+                clone = self.trainer.agent.clone_for_play(deterministic=True)
                 try:
                     self.trainer.agent.save(save_path)
                 except Exception as exc:

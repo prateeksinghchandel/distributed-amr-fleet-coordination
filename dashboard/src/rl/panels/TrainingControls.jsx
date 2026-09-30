@@ -26,7 +26,16 @@ function formatAgent(agent) {
     if (agent.obs_dim != null && agent.action_dim != null) parts.push(`obs ${agent.obs_dim} → act ${agent.action_dim}`);
     if (agent.updates != null) parts.push(`${agent.updates} updates`);
     if (agent.params != null) parts.push(`${agent.params.toLocaleString()} params`);
-    if (agent.log_std != null) parts.push(`log_std ${Number(agent.log_std).toFixed(2)}`);
+    if (agent.log_std != null) {
+        // The backend reports the effective (clamped) sampling std here, so
+        // this stays correct when the raw log_std parameter has drifted above
+        // the ceiling; show the raw value too when it differs.
+        const eff = Number(agent.log_std);
+        parts.push(agent.max_action_std != null ? `σ ${eff.toFixed(2)}` : `log_std ${eff.toFixed(2)}`);
+        if (agent.log_std_raw != null && Math.abs(Number(agent.log_std_raw) - eff) > 0.01) {
+            parts.push(`raw ${Number(agent.log_std_raw).toFixed(2)}`);
+        }
+    }
     if (agent.device) parts.push(agent.device);
     return parts.join(' · ') || 'policy';
 }

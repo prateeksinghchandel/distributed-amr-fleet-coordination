@@ -29,6 +29,20 @@ import math
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Action-distribution limits. ``log_std`` is free to drift upward, and the
+# entropy bonus pushes it that way on every update (for a Normal,
+# d(entropy)/d(log_std) is a constant +1 per dim), so without a ceiling a long
+# campaign inflates it until the sampled action is near-saturated noise. The
+# action space is Box(-1, 1)^2, so pre-tanh std of ~0.86 means throttle is
+# effectively random full-forward/full-reverse every step, which trips the
+# steering-sign-flip oscillation penalty almost continuously. MAX_ACTION_STD
+# bounds the std actually used for sampling, which also corrects checkpoints
+# trained before the clamp existed.
+MAX_ACTION_STD = 0.35
+# softplus(INIT_LOG_STD) + 1e-3 == 0.342, i.e. a fresh agent and a reset agent
+# start with the same exploration noise.
+INIT_LOG_STD = -0.9
+
 
 def _finite(value, default: float = 0.0) -> float:
     """Coerce ``value`` to a finite float, else ``default`` (NaN/inf/±-proof)."""
@@ -67,7 +81,7 @@ class PPOConfig:
     gamma: float = 0.99
     lam: float = 0.95
     clip: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.002
     val_coef: float = 0.5
     update_epochs: int = 4
     minibatch: int = 64
@@ -120,7 +134,7 @@ class ActorCritic(nn.Module):
         )
         self.mu = nn.Linear(hidden // 2, action_dim)
         self.value = nn.Linear(hidden // 2, 1)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.full((action_dim,), INIT_LOG_STD))
         self._obs_dim = obs_dim
         self._action_dim = action_dim
 
@@ -137,6 +151,12 @@ class ActorCritic(nn.Module):
         # that follows can recover clean weights.
         mu = torch.nan_to_num(mu, nan=0.0, posinf=1.0, neginf=-1.0)
         std = torch.nan_to_num(std, nan=1e-2, posinf=1e2, neginf=1e-2)
+        # Ceiling applied after sanitising, so a NaN still falls through to the
+        # 1e-2 default above rather than being absorbed by the clamp. This is
+        # the only consumer of log_std, so bounding here is what actually caps
+        # sampling noise — including for checkpoints whose log_std was trained
+        # before the clamp existed.
+        std = std.clamp(max=MAX_ACTION_STD)
         base = Normal(mu, std)
         return TransformedDistribution(base, [TanhTransform(cache_size=1)])
 
@@ -360,7 +380,10 @@ class PPOAgent:
             "obs_dim": self.obs_dim,
             "action_dim": self.action_dim,
             "device": self.device,
-            "ppo": self.cfg.to_dict(),       # training configuration
+            # The live/effective config, not whatever the last load happened to
+            # read off disk: this is what the weights below were actually
+            # trained under, so it must stay truthful across a resume.
+            "ppo": self.cfg.to_dict(),
             "meta": meta,                    # caller-supplied run metadata
             "net_state": self.net.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
@@ -368,17 +391,31 @@ class PPOAgent:
         }, path)
 
     def load(self, path: str) -> dict:
+        """Load weights + optimizer state from ``path``.
+
+        Hyperparameters are deliberately *not* adopted from the checkpoint.
+        They stay as configured for this run (CLI flags, inline overrides), so
+        resuming a campaign with, say, a lowered ``ent_coef`` actually keeps
+        that value instead of silently reverting to whatever the file recorded.
+        This is intentionally the opposite of the reward config, which
+        ``RLTrainer.load_checkpoint`` restores from ``meta`` to reproduce an
+        experiment; the run's PPO settings are an operator choice about how to
+        keep training, not a property of the saved weights. The file's copy is
+        still read back as ``ppo_on_disk`` for provenance.
+        """
         data = torch.load(path, map_location=self.device)
         if data.get("obs_dim") != self.obs_dim or \
            data.get("action_dim") != self.action_dim:
             raise ValueError("checkpoint obs/action dims do not match env")
-        if data.get("ppo"):
-            self.cfg = PPOConfig.from_dict(data["ppo"])
         self.meta = data.get("meta")
         self.net.load_state_dict(data["net_state"])
         self.optimizer.load_state_dict(data["optimizer_state"])
+        # load_state_dict replaces the whole param group, so the learning rate
+        # must be re-applied or it silently reverts to the file's value.
+        for g in self.optimizer.param_groups:
+            g["lr"] = self.lr
         self.updates = int(data.get("updates", 0))
-        return data
+        return {**data, "ppo_on_disk": data.get("ppo")}
 
     def reset_weights(self) -> None:
         for m in self.net.modules():
@@ -387,10 +424,21 @@ class PPOAgent:
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         with torch.no_grad():
-            self.net.log_std.fill_(-0.9)
+            self.net.log_std.fill_(INIT_LOG_STD)
         self.updates = 0
         for g in self.optimizer.param_groups:
             g["lr"] = self.lr
+
+    def effective_std(self) -> float:
+        """Mean std actually used for sampling, after the MAX_ACTION_STD clamp.
+
+        Reported instead of the raw ``log_std`` because the parameter is free to
+        drift above the ceiling; the dashboard displays this value, so it has
+        to be the one describing the policy's real action noise.
+        """
+        return _finite(float(torch.clamp(
+            torch.nn.functional.softplus(self.net.log_std.detach()) + 1e-3,
+            max=MAX_ACTION_STD).mean()), MAX_ACTION_STD)
 
     def summary(self) -> dict:
         return {
@@ -399,8 +447,10 @@ class PPOAgent:
             "device": self.device,
             "updates": self.updates,
             "params": sum(p.numel() for p in self.net.parameters()),
-            "log_std": _finite(float(np.exp(
+            "log_std": round(self.effective_std(), 4),
+            "log_std_raw": _finite(float(np.exp(
                 self.net.log_std.detach().cpu().numpy()).mean()), 1.0),
+            "max_action_std": MAX_ACTION_STD,
             "skipped_minibatches": self.skipped_minibatches,
             "weights_finite": bool(all(p.isfinite().all().item()
                                        for p in self.net.parameters())),
